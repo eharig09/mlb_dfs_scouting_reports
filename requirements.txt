@@ -1,0 +1,19 @@
+beautifulsoup4
+fpdf2
+lxml
+matplotlib
+MLB-StatsAPI
+numpy
+openpyxl
+pandas
+# pandas 3.x stores strings as PyArrow-backed by default, so the cached report payloads
+# in .cache/report_data cannot be unpickled without it.
+pyarrow
+pybaseball
+requests
+scikit-learn
+scipy
+seaborn
+selenium
+tqdm
+webdriver-manager
