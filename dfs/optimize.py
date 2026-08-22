@@ -6,29 +6,48 @@ stack rules persist between runs. Command-line flags always override the file.
 
 import argparse
 import json
+import math
 import os
 from datetime import datetime
 
 import pandas as pd
 
 from .optimizer import (
+    STACK_EXPOSURE_AT,
     CONFLICT_MIN_HITTERS, CONFLICT_PENALTY, CORRELATED_OBJECTIVES, DEFAULT_MAX_OVERLAP,
-    DEFAULT_RANDOMNESS, MIN_GAMES_REPRESENTED, OptimizerError, ROSTER_SIZE, optimize,
+    DEFAULT_RANDOMNESS, MIN_GAMES_REPRESENTED, OptimizerError, ROSTER, ROSTER_SIZE, optimize,
     stack_shapes,
 )
+from .exposure import format_exposure, player_exposure, team_exposure
 from .naming import OUTPUT_ROOT, latest, resolve
 from .pool import pool_path, read_pool, resolve_exposure, write_pool
+from .profiling import format_report, profiler
 from .salaries import canon_team
 from .schedule import describe_postponed
 from .scoring import DK_SALARY_CAP as DK_CAP
-from .slate import build_slate, started_players
+# drop_started now lives in dfs.slate so the candidate, field, contest and
+# portfolio paths get the same filtering. Re-exported here because it was part
+# of this module's surface.
+from .slate import build_slate, drop_started
 from .upload import (
     OUTPUT_PREFIX, SWAP_PREFIX, TEMPLATE_DIR, UploadError, build_upload, find_template,
-    lineup_teams, parse_selection, read_lineups, read_template, write_upload,
+    lineup_teams, parse_selection, parse_template, read_lineups, read_template,
+    template_from_salaries, write_upload,
 )
 
 CONFIG_PATH = os.path.join("dfs_daily_files", "optimizer.json")
 OUTPUT_DIR = "dfs_boards"
+
+# How many times --stack-shape may cycle its team pairings to fill the requested count. The
+# loop stops early the moment a full sweep adds nothing new, so this only bounds the
+# pathological case where every pairing keeps returning lineups already seen.
+MAX_SHAPE_SWEEPS = 25
+
+# How many teams --stack-shape considers stacking, best first. Six keeps a two-stack shape
+# tractable (30 orderings), but a one-stack shape has only as many combinations as teams, so
+# widening it there is nearly free -- and the measurement in docs/benchmarks.md §13 says the
+# ceiling comes from *some* team being stacked, not from it being a pre-anointed one.
+DEFAULT_STACK_TEAMS = 6
 
 
 def _split(value):
@@ -46,6 +65,42 @@ def _parse_stacks(value):
             raise OptimizerError(f"bad --stack entry '{part}' (expected TEAM:COUNT)")
         stacks[canon_team(team)] = int(count)
     return stacks
+
+
+def _parse_team_exposure(value, n_lineups):
+    """'NYY:0-40,TOR:20-60' -> {'NYY': (0, 8), 'TOR': (4, 12)} for a 20-lineup set.
+
+    Bounds are percentages of the set, matching how player exposure is written in a pool
+    file, and are converted to lineup counts here so the optimizer only ever deals in
+    counts. Either side may be blank -- 'NYY:-40' caps without a floor, 'TOR:20-' floors
+    without a cap -- because the common cases are one-sided.
+    """
+    limits = {}
+    for part in _split(value):
+        team, _, span = part.partition(":")
+        if not span.strip():
+            raise OptimizerError(
+                f"bad --team-exposure entry '{part}' (expected TEAM:MIN-MAX as percentages)")
+        low_text, _, high_text = span.partition("-")
+
+        def pct(text, default):
+            text = text.strip().rstrip("%")
+            if not text:
+                return default
+            try:
+                return float(text)
+            except ValueError:
+                raise OptimizerError(f"bad --team-exposure percentage '{text}' in '{part}'")
+
+        low, high = pct(low_text, 0.0), pct(high_text, 100.0)
+        if not 0 <= low <= 100 or not 0 <= high <= 100 or low > high:
+            raise OptimizerError(
+                f"--team-exposure '{part}' must be 0-100 with MIN <= MAX")
+        # Ceil the floor and floor the cap, so a stated bound is never quietly exceeded in
+        # either direction by rounding.
+        limits[canon_team(team)] = (int(math.ceil(low / 100.0 * n_lineups)),
+                                    int(math.floor(high / 100.0 * n_lineups)))
+    return limits
 
 
 def load_config(path):
@@ -86,7 +141,12 @@ def run_swap(date, objective, path=None, slate=None, overwrite=False):
     from .lateswap import SwapError, format_report, swap_file
 
     try:
-        out_rows, report = swap_file(date, path, objective=objective)
+        # `slate` has to reach swap_file, not just the output path below. Without it a
+        # night with two DK exports resolved the *swap* against an ambiguous slate while
+        # still naming the output after the one that was asked for -- so `--slate early
+        # --swap` failed with "several DK exports match", which is exactly the thing the
+        # flag was passed to prevent.
+        out_rows, report = swap_file(date, path, objective=objective, slate=slate)
     except (SwapError, UploadError, OptimizerError) as error:
         print(f"[!] late swap: {error}")
         return None
@@ -103,55 +163,6 @@ def run_swap(date, objective, path=None, slate=None, overwrite=False):
     if note:
         print(f"  [i] {note}")
     return out_path
-
-
-def drop_started(players, meta, date, allow=False):
-    """Drop players whose game has already begun -- they cannot be drafted at all.
-
-    The slate removes postponed games but knows nothing about start times, so a run late in
-    the evening would otherwise build around a player who is already batting and hand back
-    an entry DK will not take.
-
-    Resolved per game, not per team: on a doubleheader the opener can be in progress while
-    the nightcap -- the game the main slate is priced on -- is hours away and completely
-    draftable.
-
-    A slate where *every* game has started is a review or backtest, not a live build, so
-    nothing is dropped there: filtering would empty the pool and fail with a message about
-    the wrong thing. (`dfs.review` calls the optimizer directly and never comes through
-    here, which is why that path is untouched by any of this.)
-    """
-    if allow:
-        return players, []
-    locked, elsewhere, error = started_players(players, meta, date)
-    if error:
-        return players, [f"[!] could not check start times: {error}. Players from games "
-                         f"already under way may still be in the pool — check before entering."]
-    if locked.all():
-        return players, []              # nothing live at all: a review or backtest
-
-    notes = []
-    if elsewhere.any():
-        # Worth naming individually. This one looks like a bargain rather than a mistake --
-        # a top-salary arm with a full projection whose game, per DK, has not started.
-        for name in players[elsewhere]["Name"]:
-            notes.append(f"[!] {name} removed — already pitching the earlier game of a "
-                         f"doubleheader. DK prices the whole staff against the nightcap, so "
-                         f"he is listed as available and would score nothing.")
-    if locked.any():
-        gone = sorted(set(players[locked]["Game"].dropna()))
-        notes.append(f"[!] {int(locked.sum())} player(s) removed — "
-                     f"{', '.join(gone)} already under way and cannot be drafted.")
-    drop = locked | elsewhere
-    if not drop.any():
-        return players, notes
-
-    remaining = players[~drop]
-    games = remaining["Game"].dropna().nunique() if "Game" in remaining.columns else 0
-    if games < MIN_GAMES_REPRESENTED:
-        notes.append(f"    Only {games} game(s) left on the board; DK needs "
-                     f"{MIN_GAMES_REPRESENTED}. Use --allow-started to build anyway.")
-    return remaining.copy(), notes
 
 
 def main():
@@ -172,7 +183,22 @@ def main():
     parser.add_argument("--lock", help="Comma-separated players who must appear.")
     parser.add_argument("--exclude", help="Comma-separated players to never use.")
     parser.add_argument("--stack", help="Explicit stacks, e.g. 'CWS:4,HOU:3'.")
-    parser.add_argument("--stack-shape", help="Explore shapes instead, e.g. '4-3' or '5-3'.")
+    parser.add_argument("--stack-shape", help="Explore shapes instead, e.g. '5' (one 5-stack, "
+                                              "team free) or '4-3'. Comma-separate several to "
+                                              "spread lineups evenly across them: '5-3,5-2,5'.")
+    parser.add_argument("--stack-teams", type=int, default=DEFAULT_STACK_TEAMS,
+                        help=f"How many teams --stack-shape may stack, best first "
+                             f"(default {DEFAULT_STACK_TEAMS}; 0 = every team on the slate).")
+    parser.add_argument("--team-exposure", metavar="SPEC",
+                        help="Cap or floor how much of the SET stacks each team, as "
+                             "percentages: 'NYY:0-40,TOR:20-60'. Either side may be blank "
+                             "('NYY:-40' caps only). A team counts as stacked when it "
+                             f"supplies {STACK_EXPOSURE_AT}+ hitters, the same threshold the "
+                             "exposure report uses. Caps limit clustering, not the players: "
+                             "individual hitters from a capped team stay available.")
+    parser.add_argument("--stack-at", type=int, default=STACK_EXPOSURE_AT, metavar="N",
+                        help=f"Hitters from one team that count as a stack for "
+                             f"--team-exposure (default {STACK_EXPOSURE_AT}).")
     parser.add_argument("--focus-teams", help="Build stacks only from these teams, e.g. "
                                               "'CIN,NYY,SD'. Other teams still fill the "
                                               "leftover slots and pitchers stay open.")
@@ -208,6 +234,9 @@ def main():
                              "ceiling/proj objectives).")
     parser.add_argument("--save-config", action="store_true",
                         help="Write the resolved settings back to the config file.")
+    parser.add_argument("--exposure-top", type=int, default=20, metavar="N",
+                        help="How many players the exposure summary prints (default 20; "
+                             "0 prints every one). The csv always holds the full set.")
     parser.add_argument("--upload", nargs="?", const="all", metavar="SELECTION",
                         help="Also write a DK upload file. Bare flag takes every lineup; "
                              "pass a selection like '1,3,5-8'.")
@@ -223,8 +252,20 @@ def main():
                              f"{OUTPUT_ROOT}/<date>/swap_<slate>.csv.")
     parser.add_argument("--overwrite", action="store_true",
                         help="Replace existing files instead of writing a new .rN version.")
+    parser.add_argument("--profile", action="store_true",
+                        help="Time each pipeline stage and write docs/benchmarks/profile_*.json.")
     args = parser.parse_args()
 
+    with profiler.session("optimize", date=args.date, slate=args.slate,
+                          enabled=args.profile, n=args.n, objective=args.objective):
+        _run(args)
+    if args.profile:
+        print("\n=== pipeline profile ===")
+        print(format_report(profiler.last_report))
+        print(f"  -> {profiler.last_report.get('path')}")
+
+
+def _run(args):
     # Swapping without uploading is the evening command: check what broke and refill it.
     # Generation is skipped outright rather than done and discarded -- re-running the
     # optimizer would overwrite the lineup file that records what is actually entered.
@@ -315,8 +356,23 @@ def main():
         print(f"pool {path}: {len(pool_locks)} locked, {len(pool_excludes)} excluded, "
               f"{len(boosts)} boosted ({ranged} ranged), {len(exposure)} exposure-capped")
 
+    team_exposure_spec = args.team_exposure or config.get("team_exposure")
+    team_limits = _parse_team_exposure(team_exposure_spec, n_lineups) \
+        if team_exposure_spec else {}
+    # Carried across the stack-shape loop's separate solves, same as player appearances.
+    team_stacks = {team: 0 for team in team_limits}
+    if team_limits:
+        print("team stack exposure: " + ", ".join(
+            f"{team} {low}-{high} of {n_lineups}" for team, (low, high) in
+            sorted(team_limits.items())) + f"  (stack = {args.stack_at}+ hitters)")
+
     stacks = _parse_stacks(args.stack) if args.stack else config.get("stack") or None
     shape = args.stack_shape or config.get("stack_shape")
+    stack_teams = args.stack_teams
+    if stack_teams == DEFAULT_STACK_TEAMS and config.get("stack_teams") is not None:
+        stack_teams = int(config["stack_teams"])
+    # 0 means "every team on the slate"; stack_shapes takes that as an uncapped slice.
+    stack_teams = None if stack_teams is not None and stack_teams <= 0 else stack_teams
     focus_teams = _split(args.focus_teams) or config.get("focus_teams") or []
     if focus_teams:
         # Checked here rather than left to the solver: a mistyped code would otherwise just
@@ -356,31 +412,94 @@ def main():
 
     try:
         if shape and not stacks:
-            combos = stack_shapes(players, shape, focus_teams=focus_teams)
+            combos = stack_shapes(players, shape, top_teams=stack_teams,
+                                  focus_teams=focus_teams)
+            if not focus_teams:
+                free = sorted({ROSTER_SIZE - ROSTER["P"] - sum(combo.values())
+                               for combo in combos})
+                slots = (f"{free[0]}" if len(free) == 1
+                         else f"{free[0]}–{free[-1]}")
+                print(f"stack shape '{shape}': {len(combos)} team "
+                      f"{'combination' if len(combos) == 1 else 'combinations'} over "
+                      f"{len({t for combo in combos for t in combo})} teams — "
+                      f"the solver picks which, and the remaining {slots} hitter "
+                      f"{'slot' if free[-1] == 1 else 'slots'} plus both pitchers stay open.")
             lineups = []
             # Spread the requested lineups across shape combinations so the set explores
             # different stack pairings rather than re-solving the single best one.
             per_combo = max(1, n_lineups // max(1, min(len(combos), n_lineups)))
-            for combo in combos:
+            # Exposure is satisfied over the whole set, not within one pairing, so the
+            # running counts travel between solves. Without this each solve believes it is
+            # the last chance to meet every minimum and forces the entire exposure list into
+            # one lineup -- which on a pool of five capped pitchers is simply impossible, and
+            # failed thirty times in a row without a word.
+            appearances = {name: 0 for name in exposure}
+            combo_errors = {}
+            seen = set()
+            # Cycle the pairings rather than making a single pass. One pass gives exactly
+            # one lineup per combination -- 30 lineups for a request of 50 -- and, worse,
+            # ends before the exposure shortfall ever becomes urgent, so minimums are simply
+            # never met. Repeating until the request is filled fixes both.
+            for sweep in range(MAX_SHAPE_SWEEPS):
                 if len(lineups) >= n_lineups:
                     break
-                try:
-                    built, _, _ = optimize(
-                        players, n_lineups=per_combo, objective=objective, locks=locks,
-                        excludes=excludes, stacks=combo, max_overlap=max_overlap,
-                        min_proj=args.min_proj, max_bust=args.max_bust,
-                        max_hitters_per_team=max_from_team, randomness=randomness,
-                        seed=args.seed, stack_bonus=stack_bonus,
-                        exposure=exposure, boosts=boosts,
-                        conflict_penalty=conflict_penalty,
-                        conflict_min_hitters=conflict_min_hitters,
-                        focus_teams=focus_teams,
-                        max_ownership=args.max_ownership,
-                    )
-                    lineups.extend(built)
-                except OptimizerError:
-                    continue        # this pairing is infeasible; try the next
+                progressed = False
+                for index, combo in enumerate(combos):
+                    if len(lineups) >= n_lineups:
+                        break
+                    try:
+                        built, _, _ = optimize(
+                            players, n_lineups=min(per_combo, n_lineups - len(lineups)),
+                            objective=objective, locks=locks,
+                            excludes=excludes, stacks=combo, max_overlap=max_overlap,
+                            min_proj=args.min_proj, max_bust=args.max_bust,
+                            max_hitters_per_team=max_from_team, randomness=randomness,
+                            # Re-solving the same pairing with the same seed returns the same
+                            # lineup, so each sweep gets its own.
+                            seed=(None if args.seed is None
+                                  else args.seed + sweep * 1009 + index),
+                            stack_bonus=stack_bonus,
+                            exposure=exposure, boosts=boosts,
+                            conflict_penalty=conflict_penalty,
+                            conflict_min_hitters=conflict_min_hitters,
+                            focus_teams=focus_teams,
+                            max_ownership=args.max_ownership,
+                            total_lineups=n_lineups, prior_appearances=appearances,
+                            prior_lineups=len(lineups),
+                            team_exposure=team_limits, stack_at=args.stack_at,
+                            # Stack counts have to carry across pairings for the same reason
+                            # player appearances do: each solve sees only its own slice, so
+                            # without this every pairing starts from zero and a cap that
+                            # should bind over the set never binds at all.
+                            prior_team_stacks=team_stacks,
+                        )
+                    except OptimizerError as error:
+                        combo_errors[str(error)] = combo_errors.get(str(error), 0) + 1
+                        continue        # this pairing is infeasible; try the next
+                    for lineup in built:
+                        key = tuple(sorted(lineup["players"]["Name"]))
+                        if key in seen:
+                            continue        # same pairing re-solved to the same ten
+                        seen.add(key)
+                        lineups.append(lineup)
+                        progressed = True
+                        for name in lineup["players"]["Name"]:
+                            if name in appearances:
+                                appearances[name] += 1
+                        roster = lineup["players"]
+                        taken = roster[roster["Roster"] != "P"]["Team"] \
+                            .map(canon_team).value_counts()
+                        for team in team_stacks:
+                            if int(taken.get(team, 0)) >= args.stack_at:
+                                team_stacks[team] += 1
+                if not progressed:
+                    break               # nothing new is reachable; stop rather than spin
             lineups = lineups[:n_lineups]
+            # Every pairing failing is a fact about the constraints, not about the shape.
+            if not lineups and combo_errors:
+                print(f"[!] all {len(combos)} stack pairings for '{shape}' were infeasible:")
+                for message, count in sorted(combo_errors.items(), key=lambda kv: -kv[1])[:3]:
+                    print(f"    {count}x  {message}")
             missing = {"locks": [], "excludes": []}
         else:
             lineups, _, missing = optimize(
@@ -394,6 +513,7 @@ def main():
                 conflict_min_hitters=conflict_min_hitters,
                 focus_teams=focus_teams,
                 max_ownership=args.max_ownership,
+                team_exposure=team_limits, stack_at=args.stack_at,
             )
     except OptimizerError as error:
         print(f"[!] {error}")
@@ -403,6 +523,16 @@ def main():
         print(f"[!] lock '{name}' is not on this slate — ignored.")
     for name in missing.get("excludes", []):
         print(f"[!] exclude '{name}' is not on this slate — ignored.")
+
+    # Unmet Min% values used to be reported here. They now belong to the exposure report at
+    # the end of the run, which says the same thing against the delivered share and the rest
+    # of the set -- printing it twice, once before the lineups and once after, only taught
+    # the reader to skip both.
+    if exposure and lineups and len(lineups) < n_lineups:
+        print(f"\n[!] the set stopped at {len(lineups)} of the {n_lineups} requested, so "
+              f"Min% targets were scaled to a set that never finished.")
+        print(f"    Ask for fewer lineups, or loosen what is limiting the pool "
+              f"(stack shape, excludes, incomplete slate).")
 
     if not lineups:
         print("[!] No feasible lineup. Loosen locks, stacks, or thresholds.")
@@ -455,6 +585,28 @@ def main():
     if note:
         print(f"  [i] {note}")
 
+    # Exposure is a property of the whole set, so it can only be read here -- no single
+    # lineup, and nothing during the solve, can show which players the set actually
+    # committed to or which Min%/Max% requests survived.
+    player_table = player_exposure(lineups, exposure=exposure, players=players)
+    team_table = team_exposure(lineups)
+    if not player_table.empty:
+        print()
+        print(format_exposure(player_table, team_table, len(lineups),
+                              top=args.exposure_top))
+        exposure_path, exposure_note = resolve("exposure", args.date, label,
+                                               OUTPUT_ROOT, args.overwrite)
+        # Both tables in one file: they answer the same question at different grain, and a
+        # second file per night is another thing to find. The blank line and second header
+        # keep it readable, and pandas reads either half back with skiprows.
+        with open(exposure_path, "w", newline="", encoding="utf-8-sig") as handle:
+            player_table.to_csv(handle, index=False, lineterminator="\n")
+            handle.write("\n")
+            team_table.to_csv(handle, index=False, lineterminator="\n")
+        print(f"\nexposure -> {exposure_path}")
+        if exposure_note:
+            print(f"  [i] {exposure_note}")
+
     if args.upload is not None:
         # Re-read what was just written so the upload is built from the file on disk --
         # the same path `python -m dfs.upload` takes, rather than a second code path that
@@ -462,15 +614,36 @@ def main():
         try:
             built = read_lineups(args.date, path)
             selection = parse_selection(args.upload, built.keys())
-            template_path = find_template(args.template, date=args.date,
-                                          teams=lineup_teams(built, selection))
-            template, kind, slot_start, index = read_template(template_path)
+            try:
+                template_path = find_template(args.template, date=args.date,
+                                              teams=lineup_teams(built, selection))
+                template, kind, slot_start, index = read_template(template_path)
+                source = f"template {os.path.basename(template_path)}"
+            except UploadError as error:
+                # No template for tonight is not a dead end. DK's bulk template is a fixed
+                # frame around the draft group's player list, and the salary export this
+                # board was priced from *is* that player list -- same ids, same slate. So
+                # rebuild the frame rather than making the night's lineups unenterable.
+                # An explicit --template that failed is a different matter: the user named
+                # a file, and quietly substituting something else would hide the mistake.
+                salary_file = meta.get("salary_file")
+                if args.template or not salary_file:
+                    raise
+                template, kind, slot_start, index = parse_template(
+                    template_from_salaries(salary_file),
+                    source=os.path.basename(salary_file),
+                )
+                source = f"rebuilt from {os.path.basename(salary_file)}"
+                print(f"  [i] no DK template for {args.date} — {error}")
+                print(f"  [i] rebuilding one from {os.path.basename(salary_file)}; its ids "
+                      f"are DK's own for this slate. Bulk entry only — late swap still "
+                      f"needs the real entries export.")
             out_rows, _ = build_upload(template, kind, slot_start, index, built, selection,
                                        date=args.date)
             upload_path, upload_note = resolve("upload", args.date, label,
                                                OUTPUT_ROOT, args.overwrite)
             out_path = write_upload(out_rows, upload_path)
-            print(f"{len(selection)} lineup(s) -> {out_path}  (template {os.path.basename(template_path)})")
+            print(f"{len(selection)} lineup(s) -> {out_path}  ({source})")
             if upload_note:
                 print(f"  [i] {upload_note}")
             if args.swap:
@@ -492,6 +665,7 @@ def main():
             resolved["stack"] = stacks
         if shape:
             resolved["stack_shape"] = shape
+            resolved["stack_teams"] = 0 if stack_teams is None else stack_teams
         if focus_teams:
             resolved["focus_teams"] = focus_teams
         os.makedirs(os.path.dirname(args.config) or ".", exist_ok=True)

@@ -11,7 +11,24 @@ import re
 
 import pandas as pd
 
+from .ros import load as load_ros
 from .scoring import DK_HITTER, DK_PITCHER, hitter_points, pitcher_points
+
+# Bumped whenever a change here would move a projection. Snapshots and backtests record it,
+# so a metric computed under one version is never silently compared against another.
+#
+#   1  original event-rate model
+#   2  weather read from environment["forecast"] as well as ["weather"], enclosed roofs
+#      neutralised (the old code was inert on 93 of 142 cached games)
+#   3  (unreleased)
+#   4  sample-size regression on both sides of the ball. Starter rate stats were read raw
+#      off the season line, so a three-inning FIP was treated as true talent; hitter rates
+#      regressed to league average regardless of track record, so a 40-PA call-up was
+#      treated as an average major leaguer. Both now shrink by sample size -- pitchers
+#      toward league via REG_SP, hitters toward a per-player rest-of-season prior (dfs.ros)
+#      falling back to league. Team run projections are damped before being split across a
+#      lineup (TEAM_RUN_DAMPING).
+MODEL_VERSION = 4
 
 # Ceiling settings. CEILING_Z targets roughly a 90th-percentile outcome -- the score you
 # need for a tournament, not the score you expect. Backtested at 10.0% exceedance for
@@ -113,6 +130,41 @@ SLOT_RBI_WEIGHT = {1: 0.094, 2: 0.104, 3: 0.119, 4: 0.126, 5: 0.120, 6: 0.110, 7
 # Share of runs that come with an RBI attached (the rest are unearned, wild pitches, etc).
 RBI_PER_RUN = 0.95
 
+# Damping on the team run projection before it is split across the lineup.
+#
+# `Exp Runs` drives every hitter's R and RBI, which is about 2 of a typical 6.7-point
+# projection, and it was applied at full strength. Walk-forward residuals say that is too
+# much: the correlation between the team run projection and (actual - projected) is negative
+# in *every* salary tier (-0.083, -0.125, -0.129, -0.100, -0.101), which is the signature of
+# a term the model leans on harder than it deserves. The same pattern shows up on the season
+# rate line, so this is the run-environment half of a broader over-extrapolation.
+#
+# Shrinking toward the league average keeps the ordering of games intact -- a 5.5-run team
+# still projects above a 3.5-run team -- while narrowing a spread the results do not support.
+# Only the run/RBI split and the lineup-turnover multiplier see the damped number; the
+# `Team Runs` field the board and the stacker read stays the raw scorecard value.
+TEAM_RUN_DAMPING = 0.65
+
+# The replacement-level prior for hitters; see `_replacement_baseline`. A bat with no track
+# record is treated as ~12% below league average, sliding up to league average by the time he
+# has a half-season of plate appearances behind him.
+REPLACEMENT_SHARE = 0.88
+REPLACEMENT_PA_FULL = 300.0
+
+# How a rest-of-season projection is used, when one exists for the hitter.
+#
+#   "target"  regress his in-season line toward the ROS rate
+#   "direct"  take the ROS rate as the estimate and skip the in-season regression
+#
+# "direct" is the correct reading and the measured one. A ROS projection is not a prior --
+# it is a *posterior* that already contains the player's in-season line, plus prior seasons,
+# minor-league history and aging that this model never sees. Regressing his season rate
+# toward it therefore counts the same season twice, and the walk-forward diff showed exactly
+# that signature: bias got worse precisely in the tiers full of established regulars
+# (premium -0.253 -> -0.501, expensive -0.019 -> -0.156) whose season line and ROS line agree
+# and were being stacked, while the thin-sample tier it was meant to help improved.
+ROS_MODE = "direct"
+
 # Regression strength (in PA / batters faced) for each blended source.
 REG = {
     "season": 200,
@@ -121,6 +173,39 @@ REG = {
     "sp_ip": 6,        # in starts
     "opp_k": 120,
 }
+
+# Regression strength for a STARTER's own rate stats, in season innings pitched.
+#
+# The hitter path has always regressed its rate line to league by sample size; the pitcher
+# path did not, and read FIP / ERA / WHIP / K% / BB% straight off the season line. The `LG`
+# defaults below only fire when a value is *missing*, so an arm with three innings of work
+# was projected as though its three-inning FIP were true talent. Walk-forward bias by season
+# innings showed exactly the regression-to-the-mean failure that implies:
+#
+#     <20 IP  +4.27      40-80 IP  +0.53
+#     20-40   +2.97      80-130    -0.24
+#
+# and it produced projections no starter can post -- Casey Mize at -9.52 DK points off a
+# 3.3-inning line (he scored 17.30), Scherzer at 1.17 off an injury return (18.50). The
+# damage lands almost entirely in the cheap tiers, because that is who DK prices off a short
+# or ugly line, which is why the min-priced tier was the worst segment in the report.
+#
+# Ordered by how fast each stat stabilises: strikeout rate is a skill that shows up almost
+# immediately, walk rate takes longer, and the run-prevention numbers are slowest because
+# they carry batted-ball luck. Values are the usual stabilisation points converted from
+# batters faced at ~4.3 BF per inning.
+REG_SP = {
+    "k": 16,      # ~70 BF
+    "bb": 40,     # ~170 BF
+    "whip": 70,   # ~300 BF, BABIP-driven and slow
+    "fip": 70,    # built from K/BB/HR, so faster than ERA
+    "era": 110,   # slowest of all; the ERA/FIP blend leans on FIP for this reason
+}
+
+# What an unknown starter regresses toward. A pitcher nobody has seen is not a league-average
+# starter -- he is up because someone got hurt -- so run prevention regresses to a shade worse
+# than league while the rate skills regress to league proper.
+REPLACEMENT_PENALTY = 0.20   # runs of FIP/ERA added to the regression target
 
 # How hard each factor is allowed to push. Matchup edges are real but the tails of
 # these ratios are almost always small-sample noise.
@@ -196,6 +281,53 @@ def _regress(value, sample, league_value, k):
 
 
 # ---------------------------------------------------------------------------
+# Row lookup
+#
+# Every per-player lookup here used to be `frame[frame["Name"] == name].iloc[0]`, run once
+# per player against the same frame. Profiling a 15-game slate put 1.30s of 1.86s of
+# projection time in four of those -- a full boolean scan plus a row materialisation, ~270
+# times each, to answer a dictionary question. Building the dictionary once per frame gives
+# byte-identical output roughly 4x faster.
+#
+# The cache is keyed on object identity and *verified* against the frame it was built from,
+# because id() is recycled after garbage collection. It is cleared at the top of every
+# project_game so it cannot grow with the slate.
+# ---------------------------------------------------------------------------
+
+_INDEX_CACHE = {}
+
+
+def _build_index(frame, key_column, strip_hand=False):
+    """{key: {column: value}} for a report frame. First row wins, matching .iloc[0]."""
+    if not isinstance(frame, pd.DataFrame) or frame.empty or key_column not in frame.columns:
+        return {}
+    columns = [str(c) for c in frame.columns]
+    if strip_hand:
+        # Platoon frames suffix every column with the hand faced ("OPS vs R"). Stripping it
+        # can collide two columns onto one name; dict(zip(...)) keeps the last, which is what
+        # the original dict comprehension did.
+        columns = [re.sub(r"\s+vs\s+[LR]$", "", c) for c in columns]
+    values = frame.to_numpy(dtype=object)
+    index = {}
+    for position, key in enumerate(frame[key_column].astype(str)):
+        if key not in index:
+            index[key] = dict(zip(columns, values[position]))
+    return index
+
+
+def _indexed(frame, key_column, strip_hand=False):
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return {}
+    cache_key = (id(frame), key_column, strip_hand)
+    cached = _INDEX_CACHE.get(cache_key)
+    if cached is not None and cached[0] is frame:
+        return cached[1]
+    built = _build_index(frame, key_column, strip_hand)
+    _INDEX_CACHE[cache_key] = (frame, built)
+    return built
+
+
+# ---------------------------------------------------------------------------
 # Game-level context
 # ---------------------------------------------------------------------------
 
@@ -207,15 +339,47 @@ def _park_factors(environment):
     }
 
 
+# Roofs that are shut over the field. A closed roof means still air and a controlled
+# temperature, so neither term should move -- and "retractable" is not one of them, because
+# a retractable roof in July is almost always open.
+ENCLOSED_ROOFS = {"cover", "fixed", "closed", "dome"}
+
+
+def _weather_inputs(environment):
+    """(temperature F, wind text, enclosed) from whichever source has it.
+
+    Two sources exist and they are not interchangeable. `environment["weather"]` is
+    StatsAPI's live report -- `temp` as a string, wind as "8 mph, L To R" -- and it only
+    appears close to first pitch: 49 of the 142 cached payloads carry it. Open-Meteo's
+    `environment["forecast"]` carries `temp_f`, `wind` and `roof` on 118 of them.
+
+    This used to read `weather` alone, so on 93 of 142 games the temperature and wind terms
+    silently collapsed to 1.0 -- a missing key looks exactly like neutral weather. A 96F
+    afternoon in Oakland got no carry adjustment at all. Live reading wins where it exists,
+    since it is the measurement rather than the forecast.
+    """
+    weather = environment.get("weather") or {}
+    forecast = environment.get("forecast") or {}
+
+    temp = _num(weather.get("temp"))
+    if temp is None:
+        temp = _num(forecast.get("temp_f"))
+
+    wind = str(weather.get("wind") or forecast.get("wind") or "")
+    enclosed = str(forecast.get("roof") or "").strip().lower() in ENCLOSED_ROOFS
+    return temp, wind, enclosed
+
+
 def _weather_hr_factor(environment):
     """Temperature and wind nudge on home runs. Deliberately small."""
-    weather = environment.get("weather") or {}
+    temp, wind, enclosed = _weather_inputs(environment)
+    if enclosed:
+        return 1.0
+
     factor = 1.0
-    temp = _num(weather.get("temp"))
     if temp is not None:
         factor *= 1.0 + (temp - 72.0) * 0.0022      # ~+2% per 10 degrees
 
-    wind = str(weather.get("wind") or "")
     speed = _num((re.match(r"\s*(\d+)", wind) or [None, None])[1] if re.match(r"\s*(\d+)", wind) else None, 0.0) or 0.0
     direction = wind.lower()
     if "out to" in direction:
@@ -226,10 +390,7 @@ def _weather_hr_factor(environment):
 
 
 def _scorecard_row(scorecard, team):
-    if not isinstance(scorecard, pd.DataFrame) or scorecard.empty:
-        return {}
-    match = scorecard[scorecard["Team"].astype(str) == str(team)]
-    return match.iloc[0].to_dict() if not match.empty else {}
+    return _indexed(scorecard, "Team").get(str(team), {})
 
 
 def _win_probability(scorecard_row):
@@ -252,21 +413,12 @@ def _bullpen_factor(bullpen_df):
 # ---------------------------------------------------------------------------
 
 def _platoon_row(splits_df, name):
-    if not isinstance(splits_df, pd.DataFrame) or splits_df.empty or "Name" not in splits_df:
-        return {}
-    match = splits_df[splits_df["Name"].astype(str) == str(name)]
-    if match.empty:
-        return {}
-    row = match.iloc[0].to_dict()
-    # Columns are suffixed with the hand faced ("OPS vs R"); strip it for uniform access.
-    return {re.sub(r"\s+vs\s+[LR]$", "", str(key)): value for key, value in row.items()}
+    # Columns are suffixed with the hand faced ("OPS vs R"); stripped for uniform access.
+    return _indexed(splits_df, "Name", strip_hand=True).get(str(name), {})
 
 
 def _arsenal_row(arsenal_df, name):
-    if not isinstance(arsenal_df, pd.DataFrame) or arsenal_df.empty or "Name" not in arsenal_df:
-        return {}
-    match = arsenal_df[arsenal_df["Name"].astype(str) == str(name)]
-    return match.iloc[0].to_dict() if not match.empty else {}
+    return _indexed(arsenal_df, "Name").get(str(name), {})
 
 
 def _team_pa_multiplier(exp_runs, is_home, home_win_prob):
@@ -335,22 +487,74 @@ def _hitter_factors(row, platoon, arsenal, ctx):
     return factors, supports, cautions
 
 
-def _hitter_rate_line(row, platoon):
-    """Blend season and platoon rate stats, regressed to league."""
+def _replacement_baseline(season_pa):
+    """Multiple of league average that a hitter's rate line should regress toward.
+
+    The rate line regressed to league average regardless of how much of a track record
+    backed it, which quietly treats a 40-plate-appearance call-up as an average major
+    leaguer. He is not: he is up because someone got hurt, and a bat with no history is
+    far likelier to be organisational depth than an average regular. Walk-forward bias by
+    season PA says exactly that --
+
+        <50 PA   -1.28      120-250  -0.47      400+  +0.41
+        50-120   -1.03      250-400  -0.07
+
+    -- monotone across 3,489 hitter-games, with the two thin buckets significant on a
+    bootstrap. Regressing toward league was the mechanism: it is the only part of the model
+    that treats those hitters as average, and it is applied hardest exactly where the track
+    record is thinnest.
+
+    The prior slides with playing time rather than switching at a threshold, so nothing
+    jumps at a cutoff, and a settled regular is untouched -- his own line already carries
+    almost all the weight, and by `REPLACEMENT_PA_FULL` the target is league average anyway.
+    """
+    weight = min(1.0, max(0.0, (season_pa or 0.0) / REPLACEMENT_PA_FULL))
+    return REPLACEMENT_SHARE + (1.0 - REPLACEMENT_SHARE) * weight
+
+
+def _hitter_rate_line(row, platoon, ros=None):
+    """Blend season and platoon rate stats, regressed toward a per-player prior.
+
+    `ros` is one hitter's rest-of-season composite from `dfs.ros`, or None. When it is
+    present it *replaces* the league-average-times-replacement target; the sample-size
+    weighting around it is unchanged. A projection system has already done the aging and
+    minor-league regression this model cannot, so it is a better answer to "what do we
+    believe about a hitter we have barely seen" than a flat constant is.
+    """
     season_pa = _num(row.get("PA"), 0.0) or 0.0
     platoon_pa = _num(platoon.get("PA"), 0.0) or 0.0
     weight = platoon_pa / (platoon_pa + REG["platoon"]) if platoon_pa else 0.0
+    # Set by the player's full season, not the split: how established he is is a fact about
+    # him, not about the hand he happens to be facing tonight. Only used as the fallback
+    # prior now, for hitters the projection files do not cover.
+    replacement = _replacement_baseline(season_pa)
 
-    def blend(season_key, platoon_key, league_key):
+    def target_for(league_key, ros_key):
+        value = (ros or {}).get(ros_key)
+        return LG[league_key] * replacement if value is None else value
+
+    def blend(season_key, platoon_key, league_key, ros_key=None):
         season_value = _num(row.get(season_key))
         platoon_value = _num(platoon.get(platoon_key))
-        base = _regress(season_value, season_pa, LG[league_key], REG["season"])
+        target = target_for(league_key, ros_key)
+        ros_value = (ros or {}).get(ros_key) if ros_key else None
+        if ros_value is not None and ROS_MODE == "direct":
+            # The projection system has already regressed this player; re-regressing his
+            # season line toward it would count that season twice.
+            base = ros_value
+        else:
+            base = _regress(season_value, season_pa, target, REG["season"])
         if platoon_value is None:
             return base
-        return base * (1 - weight) + _regress(platoon_value, platoon_pa, LG[league_key], REG["season"]) * weight
+        # The platoon split still applies on top: it is the one thing a full-season
+        # projection averages away, and it is specific to tonight's opposing hand.
+        return base * (1 - weight) + _regress(platoon_value, platoon_pa, target, REG["season"]) * weight
 
-    avg = blend("AVG", "AVG", "avg")
-    iso = blend("ISO", "ISO", "iso")
+    # Only the bat-quality rates carry the replacement prior. Walk and strikeout rates are
+    # left on the league target: they are plate-discipline traits that do not track roster
+    # status nearly as cleanly, and moving them would double-count the same adjustment.
+    avg = blend("AVG", "AVG", "avg", "avg")
+    iso = blend("ISO", "ISO", "iso", "iso")
     bb_rate = _regress(
         (_num(platoon.get("BB%")) or 0) / 100.0 if _num(platoon.get("BB%")) else None,
         platoon_pa, LG["bb_rate"], REG["platoon"],
@@ -362,20 +566,23 @@ def _hitter_rate_line(row, platoon):
 
     hr = _num(row.get("HR"), 0.0) or 0.0
     ab = _num(row.get("AB"), 0.0) or 0.0
-    hr_per_ab = _regress(hr / ab if ab > 0 else None, ab, LG["hr_per_ab"], 250)
+    ros_hr = (ros or {}).get("hr_per_ab")
+    if ros_hr is not None and ROS_MODE == "direct":
+        hr_per_ab = ros_hr
+    else:
+        hr_per_ab = _regress(hr / ab if ab > 0 else None, ab,
+                             target_for("hr_per_ab", "hr_per_ab"), 250)
 
     return {"avg": avg, "iso": iso, "bb_rate": bb_rate, "k_rate": k_rate, "hr_per_ab": hr_per_ab}
 
 
 def _steal_rate(baserunning_df, name, season_pa):
     """Season steals per PA, regressed. Speed is sticky, so regression is light."""
-    if not isinstance(baserunning_df, pd.DataFrame) or baserunning_df.empty or "Name" not in baserunning_df:
+    row = _indexed(baserunning_df, "Name").get(str(name))
+    if not row or not season_pa or season_pa <= 0:
         return 0.0
-    match = baserunning_df[baserunning_df["Name"].astype(str) == str(name)]
-    if match.empty or not season_pa:
-        return 0.0
-    steals = _num(match.iloc[0].get("SB"), 0.0) or 0.0
-    return (steals / (season_pa + 120)) if season_pa > 0 else 0.0
+    steals = _num(row.get("SB"), 0.0) or 0.0
+    return steals / (season_pa + 120)
 
 
 def project_hitters(side, payload):
@@ -399,12 +606,22 @@ def project_hitters(side, payload):
     team_row = _scorecard_row(scorecard, team)
     home_row = _scorecard_row(scorecard, args[15])
 
-    exp_runs = _num(team_row.get("Exp Runs"), LG["runs_per_team_game"]) or LG["runs_per_team_game"]
+    reported_runs = _num(team_row.get("Exp Runs"), LG["runs_per_team_game"]) \
+        or LG["runs_per_team_game"]
+    # Damped for the math, raw for the board -- see TEAM_RUN_DAMPING.
+    exp_runs = LG["runs_per_team_game"] \
+        + (reported_runs - LG["runs_per_team_game"]) * TEAM_RUN_DAMPING
     opp_starter = (args[9] if home else args[2]) or {}
     opp_starter_name = str(opp_starter.get("Name") or "TBD")
+    # Carried through so evaluation can segment by handedness matchup. The platoon split is
+    # already applied to the rate line; this is the label, not a second application of it.
+    opp_starter_hand = str(opp_starter.get("Throws") or "")[:1].upper()
 
     composite = ctx.get("hitter_composite")
     arsenal_df = ctx.get("home_batter_arsenal" if home else "away_batter_arsenal")
+    # Cached in dfs.ros, so this is a dict lookup after the first game of a slate. Empty when
+    # no exports are on disk, which falls the rate line back to the league-average prior.
+    ros_rates = load_ros()[0]["H"]
 
     game_ctx = {
         "opp_sp_fip": _num(opp_starter.get("FIP")),
@@ -413,6 +630,7 @@ def project_hitters(side, payload):
     }
     pa_mult = _team_pa_multiplier(exp_runs, home, _win_probability(home_row))
     weather_hr = _weather_hr_factor(environment)
+    _, wind_text, _ = _weather_inputs(environment)
 
     lineup = lineup_df.copy()
     if isinstance(composite, pd.DataFrame) and not composite.empty:
@@ -449,7 +667,9 @@ def project_hitters(side, payload):
         platoon = _platoon_row(splits_df, name)
         arsenal = _arsenal_row(arsenal_df, name)
         factors, supports, cautions = _hitter_factors(row, platoon, arsenal, game_ctx)
-        rates = _hitter_rate_line(row, platoon)
+        mlbam = _num(row.get("ID"))
+        rates = _hitter_rate_line(row, platoon,
+                                  ros_rates.get(int(mlbam)) if mlbam else None)
 
         total = factors["total"]
         pa = SLOT_PA[slot] * pa_mult
@@ -496,7 +716,7 @@ def project_hitters(side, payload):
         elif park["hr"] <= 0.94:
             cautions.append(f"park HR {park['hr']:.2f}")
         if weather_hr >= 1.04:
-            supports.append(f"wind {str((environment.get('weather') or {}).get('wind') or '').strip()}")
+            supports.append(f"wind {wind_text.strip()}" if wind_text.strip() else "warm air")
         elif weather_hr <= 0.97:
             cautions.append("wind holds it in")
         lineup_conf = str(row.get("Lineup Confidence") or "")
@@ -518,9 +738,10 @@ def project_hitters(side, payload):
             "MLBAM": _num(row.get("ID")),
             "Type": "H",
             "Opp SP": opp_starter_name,
+            "Opp SP Hand": opp_starter_hand,
             "Lineup": str(row.get("Lineup Confidence") or ""),
             "PA": round(pa, 2),
-            "Team Runs": round(exp_runs, 2),
+            "Team Runs": round(reported_runs, 2),
             "Proj": round(points, 2),
             "Ceiling": round(ceiling, 2),
             "Floor": round(floor_points(points, "H"), 2),
@@ -528,6 +749,21 @@ def project_hitters(side, payload):
             "HR": round(hr, 3),
             "SB": round(steals, 3),
             "Matchup": round(total, 3),
+            # Expected event counts, published rather than collapsed into Proj. The
+            # simulator draws components and converts with dfs.scoring, so it needs the
+            # rates the mean was built from; without them it would have to invert a point
+            # total, which cannot recover the mix. `E_` prefixed so nothing collides with
+            # the DK salary columns or the existing HR/SB summary fields.
+            "E_PA": round(pa, 3),
+            "E_1B": round(singles, 4),
+            "E_2B": round(doubles, 4),
+            "E_3B": round(triples, 4),
+            "E_HR": round(hr, 4),
+            "E_BB": round(pa * bb_rate, 4),
+            "E_HBP": round(pa * hbp_rate, 4),
+            "E_R": round(runs, 4),
+            "E_RBI": round(rbi, 4),
+            "E_SB": round(steals, 4),
             "Supports": supports,
             "Cautions": cautions,
         })
@@ -555,6 +791,51 @@ def _opponent_k_rate(splits_df):
             return float(value), float(combined.iloc[:, 1].sum())
     value = rates.mean()
     return (LG["k_rate"] if pd.isna(value) else float(value)), 0.0
+
+
+# How much of a lineup's arsenal K edge shows up in the starter's actual strikeout rate,
+# and in how deep he goes. Fitted on 2024-25 starts and re-estimated on 2026, which came
+# back higher on both (0.68 and 6.5), so these are the conservative end of the range.
+#
+# Note the asymmetry with the hitter-side arsenal factor above, which is damped to zero.
+# The individual hitter number is noise -- 118,422 hitter-games put its effect on DK points
+# at t = 1.5 with no walk-forward gain. Averaged over nine hitters that noise cancels and
+# what is left predicts the starter's line at t = -8.1, surviving pitcher fixed effects.
+# Same measurement, opposite verdict, because the aggregate is the part that is real.
+ARSENAL_K_PASSTHROUGH = 0.45     # d(K rate) / d(lineup K edge), both as fractions
+ARSENAL_IP_PASSTHROUGH = 2.77    # d(IP) / d(lineup K edge)
+ARSENAL_IP_CLIP = 0.25           # innings this factor may move a projection, either way
+
+
+def lineup_arsenal_k_edge(arsenal_df, lineup_df):
+    """Mean arsenal K edge across the lineup the starter faces, weighted by plate appearances.
+
+    Returns (edge, hitters) with the edge as a fraction of PA. `None` when the arsenal
+    table is missing or too few hitters have a usable baseline, which is common early in a
+    season and for a lineup full of call-ups.
+    """
+    if not isinstance(arsenal_df, pd.DataFrame) or arsenal_df.empty:
+        return None, 0
+    if "K Edge" not in arsenal_df.columns:
+        return None, 0
+
+    slots = {}
+    if isinstance(lineup_df, pd.DataFrame) and "Name" in lineup_df.columns:
+        for index, row in lineup_df.reset_index(drop=True).iterrows():
+            slot = _num(row.get("Spot"), index + 1) or index + 1
+            slots[str(row.get("Name") or "").strip()] = max(1, min(9, int(slot)))
+
+    edges, weights = [], []
+    for _, row in arsenal_df.iterrows():
+        edge = _num(row.get("K Edge"))
+        if edge is None:
+            continue
+        edges.append(edge / 100.0)   # the table reports percentage points
+        weights.append(SLOT_PA[slots.get(str(row.get("Name") or "").strip(), 5)])
+    if len(edges) < 5:
+        return None, len(edges)
+    total = sum(weights) or 1.0
+    return sum(e * w for e, w in zip(edges, weights)) / total, len(edges)
 
 
 def _recent_start_ip(starter, last_n=5):
@@ -639,11 +920,26 @@ def project_pitcher(side, payload):
     team_row = _scorecard_row(scorecard, team)
     opp_row = _scorecard_row(scorecard, opponent)
 
-    fip = _num(starter.get("FIP"), LG["fip"]) or LG["fip"]
-    era = _num(starter.get("ERA"), fip) or fip
-    whip = _num(starter.get("WHIP"), 1.30) or 1.30
-    k_pct = _num(starter.get("K%"), LG["k_rate"]) or LG["k_rate"]
-    bb_pct = _num(starter.get("BB%"), 0.080) or 0.080
+    # Season workload is the sample backing every rate below. Relief innings count here on
+    # purpose: they are innings the arm actually threw, and they tell us as much about his
+    # strikeout rate as a start does.
+    season_innings = _num(starter.get("IP"), 0.0) or 0.0
+    mlbam = _num(args[5] if home else args[12])
+    ros = load_ros()[0]["P"].get(int(mlbam)) if mlbam else None
+
+    def rate(season_key, ros_key, league_value, regression):
+        """The starter's rate: the projection system's when it has him, else his own line
+        shrunk toward league by how many innings back it."""
+        projected = (ros or {}).get(ros_key)
+        if projected is not None and ROS_MODE == "direct":
+            return projected
+        return _regress(_num(starter.get(season_key)), season_innings, league_value, regression)
+
+    fip = rate("FIP", "fip", LG["fip"] + REPLACEMENT_PENALTY, REG_SP["fip"])
+    era = rate("ERA", "era", LG["era"] + REPLACEMENT_PENALTY, REG_SP["era"])
+    whip = rate("WHIP", "whip", 1.30, REG_SP["whip"])
+    k_pct = rate("K%", "k_rate", LG["k_rate"], REG_SP["k"])
+    bb_pct = rate("BB%", "bb_rate", 0.080, REG_SP["bb"])
 
     opener = _is_opener(ctx.get(f"{side}_opener_profile"))
     ip_proj, _ = _project_innings(starter)
@@ -657,6 +953,27 @@ def project_pitcher(side, payload):
     opp_k, opp_k_pa = _opponent_k_rate(opp_splits)
     opp_k_regressed = _regress(opp_k, opp_k_pa, LG["k_rate"], REG["opp_k"])
     k_rate = _clip(_log5(k_pct, opp_k_regressed, LG["k_rate"]), (0.08, 0.42))
+
+    # On top of the lineup's overall K tendency: does it strike out more or less than usual
+    # against *these* pitch shapes specifically? This is the one arsenal number that
+    # survived a three-season test, and only at lineup level.
+    opp_lineup = args[7] if home else args[0]
+    opp_arsenal = ctx.get("away_batter_arsenal" if home else "home_batter_arsenal")
+    arsenal_edge, arsenal_hitters = lineup_arsenal_k_edge(opp_arsenal, opp_lineup)
+    if arsenal_edge:
+        k_rate = _clip(k_rate + ARSENAL_K_PASSTHROUGH * arsenal_edge, (0.08, 0.42))
+        # A lineup that cannot touch his shapes also lets him go deeper. Small, but it was
+        # the second-strongest channel in the study and it compounds with the K rate.
+        innings_shift = max(-ARSENAL_IP_CLIP,
+                            min(ARSENAL_IP_CLIP, ARSENAL_IP_PASSTHROUGH * arsenal_edge))
+        ip_proj = max(3.2, ip_proj + innings_shift)
+        if opener:
+            ip_proj = min(ip_proj, 2.0)
+        if abs(arsenal_edge) >= 0.010:
+            text = (f"{opponent} K {arsenal_edge * 100:+.1f} pts vs his shapes "
+                    f"({arsenal_hitters} hitters)")
+            (supports if arsenal_edge > 0 else cautions).append(text)
+
     if abs(k_rate - k_pct) >= 0.012:
         if opp_k_regressed > LG["k_rate"]:
             supports.append(f"{opponent} K-prone ({opp_k * 100:.1f}% K)")
@@ -727,6 +1044,7 @@ def project_pitcher(side, payload):
         "MLBAM": _num(args[5] if home else args[12]),
         "Type": "P",
         "Opp SP": "",
+        "Opp SP Hand": str(starter.get("Throws") or "")[:1].upper(),   # his own hand
         "Lineup": "Confirmed",
         "PA": round(batters_faced, 1),
         "Team Runs": round(_num(team_row.get("Exp Runs"), LG["runs_per_team_game"]) or 0.0, 2),
@@ -739,6 +1057,17 @@ def project_pitcher(side, payload):
         "W%": round(win_probability * 100, 1),
         "ER": round(earned_runs, 2),
         "Matchup": round(offense_factor, 3),
+        "Arsenal K Edge": round(arsenal_edge * 100, 2) if arsenal_edge else 0.0,
+        # See the hitter block: expected events, for the simulator.
+        "E_BF": round(batters_faced, 4),
+        "E_IP": round(ip_proj, 4),
+        "E_K": round(strikeouts, 4),
+        "E_BB": round(walks, 4),
+        "E_H": round(hits, 4),
+        "E_HBP": round(hbp, 4),
+        "E_ER": round(earned_runs, 4),
+        "E_W": round(win_probability, 4),
+        "E_KRATE": round(k_rate, 4),
         "Supports": supports,
         "Cautions": cautions,
     }
@@ -746,6 +1075,9 @@ def project_pitcher(side, payload):
 
 def project_game(payload):
     """All projectable players from one cached game payload."""
+    # Row indexes are built per frame and only ever reused within one game, so they are
+    # dropped here rather than allowed to accumulate across a slate.
+    _INDEX_CACHE.clear()
     rows = []
     for side in ("away", "home"):
         pitcher = project_pitcher(side, payload)

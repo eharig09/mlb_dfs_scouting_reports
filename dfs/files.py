@@ -15,6 +15,14 @@ from datetime import datetime
 from .naming import KINDS, OUTPUT_ROOT, VERSION_RE, night_dir
 
 
+# Pipeline order, not alphabetical: this is the order the files are produced in, so a gap in
+# the middle is what a missing step looks like. Anything in KINDS but not named here is
+# appended rather than dropped -- a hardcoded tuple silently hid the exposure report from
+# this listing the day it was added, which is the one place you go to find out what exists.
+_ORDER = ("board", "slate", "stacks", "pool", "lineups", "exposure", "upload", "swap", "review")
+PIPELINE_ORDER = _ORDER + tuple(k for k in KINDS if k not in _ORDER)
+
+
 def _describe(path):
     stat = os.stat(path)
     size = stat.st_size
@@ -62,9 +70,7 @@ def main():
     print(f"{directory}/")
     for slate in sorted(found):
         print(f"\n  slate: {slate}")
-        # Pipeline order, not alphabetical: this is the order the files are produced in, so
-        # a gap in the middle is what a missing step looks like.
-        for kind in ("board", "slate", "stacks", "pool", "lineups", "upload", "swap", "review"):
+        for kind in PIPELINE_ORDER:
             entries = found[slate].get(kind)
             if not entries:
                 continue

@@ -14,11 +14,12 @@ ambiguity this is meant to remove.
 """
 
 import csv
+import filecmp
 import os
 import re
 import shutil
 
-from .naming import slate_slug, slug_from_contents, slug_from_filename
+from .naming import label_slates, slate_slug, slug_from_contents, slug_from_filename
 from .salaries import canon_team, describe_slate, is_salary_file, list_salary_files
 
 # Searched automatically before a run. Project folders only: a file inside the repo is one
@@ -147,6 +148,7 @@ def find_strays(date, search_dirs=None):
                 "kind": "salary",
                 "target": os.path.join(SALARY_HOME, f"DKSalaries_{date}_{label}.csv"),
                 "slate": label,
+                "info": info,
                 "why": (f"{len(info['games'])} games, {info['players']} players"
                         if info.get("games") else f"{info['players']} players"),
             })
@@ -163,14 +165,57 @@ def find_strays(date, search_dirs=None):
             target_name = f"DKTemplate_{date}_{label}_{layout}.csv"
             if name == target_name:
                 continue
+            target = os.path.join(TEMPLATE_HOME, target_name)
+            # A browser can leave the just-downloaded generic file beside the copy already
+            # filed under our convention. Exact duplicates are not conflicts. Keep both
+            # untouched here; template discovery collapses them and prefers the filed name.
+            if os.path.exists(target):
+                try:
+                    if filecmp.cmp(path, target, shallow=False):
+                        continue
+                except OSError:
+                    pass
             strays.append({
                 "path": path,
                 "kind": "template",
-                "target": os.path.join(TEMPLATE_HOME, target_name),
+                "target": target,
                 "slate": label,
                 "why": f"DK upload template ({layout})",
             })
+
+    _relabel_salary_strays(strays, date)
     return strays
+
+
+def _relabel_salary_strays(strays, date):
+    """Re-decide stray salary labels against the whole night, in place.
+
+    One download at a time cannot tell a turbo from the main slate -- both are evening
+    blocks -- so adopting them separately files the second on top of the first. Labelling
+    them alongside the exports already on disk is what separates them.
+    """
+    salary = [s for s in strays if s["kind"] == "salary"]
+    if not salary:
+        return
+
+    peers, seen = [], set()
+    for info in list_salary_files(date) + [s["info"] for s in salary]:
+        real = os.path.normcase(os.path.abspath(info["path"]))
+        if real in seen:
+            continue
+        seen.add(real)
+        peers.append(info)
+
+    # Keyed on the real path: the same file reached through two directories carries two
+    # path strings, and the stray's is not necessarily the one that survived the dedup.
+    labels = {os.path.normcase(os.path.abspath(path)): label
+              for path, label in label_slates(peers, date).items()}
+    for stray in salary:
+        real = os.path.normcase(os.path.abspath(stray["info"]["path"]))
+        label = labels.get(real, stray["slate"])
+        stray["slate"] = label
+        stray["target"] = os.path.join(SALARY_HOME, f"DKSalaries_{date}_{label}.csv")
+        del stray["info"]
 
 
 def template_slate(path, date):
@@ -189,8 +234,9 @@ def template_slate(path, date):
     if not priced:
         return UNKNOWN_SLATE
 
+    exports = list_salary_files(date)
     best, best_overlap = None, 0
-    for info in list_salary_files(date):
+    for info in exports:
         teams = set()
         for game in info.get("games") or []:
             teams |= {canon_team(part) for part in str(game).split("@")}
@@ -200,11 +246,11 @@ def template_slate(path, date):
         # Exact agreement is the answer; otherwise the closest export wins, so a template
         # downloaded before a postponement still lands under the right slate.
         if teams == priced:
-            return slate_for(info, date=date)
+            return slate_for(info, date=date, peers=exports)
         overlap = len(teams & priced)
         if overlap > best_overlap:
             best, best_overlap = info, overlap
-    return slate_for(best, date=date) if best else UNKNOWN_SLATE
+    return slate_for(best, date=date, peers=exports) if best else UNKNOWN_SLATE
 
 
 def adopt(stray, dry_run=False):

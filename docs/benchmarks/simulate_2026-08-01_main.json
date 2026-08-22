@@ -1,0 +1,112 @@
+{
+  "generated_utc": "2026-08-03T12:00:40+00:00",
+  "date": "2026-08-01",
+  "slate": "main",
+  "seed": 7,
+  "elapsed_s": 3.818,
+  "config": {
+    "slate_sigma": 0.05,
+    "game_sigma": 0.16,
+    "team_sigma": 0.06,
+    "order_sigma": 0.03,
+    "player_sigma": 0.48,
+    "order_block": 3,
+    "run_dispersion": 4.0,
+    "hr_elasticity": 1.7,
+    "hit_elasticity": 1.0,
+    "bb_elasticity": 0.35,
+    "pa_elasticity": 0.45,
+    "short_game_rate": 0.18,
+    "short_game_share": 0.35,
+    "ip_sigma": 0.2,
+    "ip_run_penalty": 0.22,
+    "k_dispersion": 1.0,
+    "er_share": 0.86,
+    "win_slope": 0.42,
+    "calibrate": false,
+    "calibration": [
+      [
+        "H",
+        0.872,
+        0.578
+      ],
+      [
+        "P",
+        0.667,
+        4.862
+      ]
+    ]
+  },
+  "report": {
+    "n_sims": 10000,
+    "n_players": 198,
+    "marginals": {
+      "hitters": {
+        "n": 178,
+        "proj_mean": 6.801,
+        "sim_mean": 6.853,
+        "mean_gap": 0.053,
+        "sim_sd_mean": 6.569,
+        "p_zero": 0.1893,
+        "p_bust": 0.3858,
+        "ceiling_vs_sim_p90": -0.524
+      },
+      "pitchers": {
+        "n": 20,
+        "proj_mean": 13.425,
+        "sim_mean": 14.462,
+        "mean_gap": 1.036,
+        "sim_sd_mean": 9.174,
+        "p_zero": 0.0572,
+        "p_bust": 0.1201,
+        "ceiling_vs_sim_p90": 1.441
+      }
+    },
+    "correlations": [
+      {
+        "relationship": "teammate hitters",
+        "expected": "positive",
+        "mean r": 0.1142,
+        "pairs": 704
+      },
+      {
+        "relationship": "  adjacent in the order (<=2 apart)",
+        "expected": "most positive",
+        "mean r": 0.1165,
+        "pairs": 295
+      },
+      {
+        "relationship": "  distant in the order",
+        "expected": "less positive",
+        "mean r": 0.1126,
+        "pairs": 409
+      },
+      {
+        "relationship": "opposing hitters, same game",
+        "expected": "slightly positive",
+        "mean r": 0.0536,
+        "pairs": 792
+      },
+      {
+        "relationship": "pitcher vs the hitters he faces",
+        "expected": "NEGATIVE",
+        "mean r": -0.2326,
+        "pairs": 178
+      },
+      {
+        "relationship": "hitters in different games",
+        "expected": "~zero",
+        "mean r": 0.0046,
+        "pairs": 14257
+      }
+    ],
+    "observed": {
+      "n": 187,
+      "mean": 8.175,
+      "sd": 7.722,
+      "p_zero": 0.2086,
+      "p_bust": 0.3209,
+      "p90": 18.4
+    }
+  }
+}

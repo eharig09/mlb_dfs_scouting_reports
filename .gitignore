@@ -33,3 +33,27 @@ scripts/top_5_stuff_plus_per_pitch_type.*
 .env
 .env.*
 !.env.example
+
+autosnap.log
+
+# NFL slate reports (generated)
+nfl/nfl_reports/
+nfl/nfl_dfs/
+
+.streamlit/secrets.toml
+
+# ---------------------------------------------------------------------------
+# Generated analysis output. `dfs_analysis/` alone is 120 MB and holds a single
+# 103 MB file, past GitHub's hard per-file limit; all of it is reproducible by
+# re-running the pipeline.
+# ---------------------------------------------------------------------------
+dfs_analysis/
+logs/
+
+# Third-party data pulled from elsewhere: projections, PFF grades, snap counts
+# and strength-of-schedule tables. Inputs, not source, and not ours to publish.
+ROS_projections/
+SOS/
+pff/
+pff_coverage_data/
+snap_counts/

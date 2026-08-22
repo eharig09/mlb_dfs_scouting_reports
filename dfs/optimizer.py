@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import Bounds, LinearConstraint, milp
 
+from .profiling import profiler
 from .salaries import canon_team
 from .scoring import DK_SALARY_CAP
 
@@ -47,6 +48,12 @@ OBJECTIVES = {"ceiling": "Ceiling", "proj": "Proj", "floor": "Floor",
 # ways, so it is no help to a floor build (a stack busts together too).
 STACK_BONUS = {2: 0.06, 3: 0.16, 4: 0.30, 5: 0.44}
 CORRELATED_OBJECTIVES = {"ceiling", "proj", "leverage"}
+
+# Hitters from one team that make a lineup "stacked" for exposure purposes. Matches
+# dfs.exposure.STACK_AT on purpose: a cap you set is checked against the same definition the
+# post-run report prints, so asking for "CWS in at most 40%" and reading back "Stk3+ 40%"
+# are the same statement rather than two thresholds that happen to share a name.
+STACK_EXPOSURE_AT = 3
 
 # With focus teams named, everyone else is held below stack size. Two is deliberate: it is
 # the largest group the bonus table still calls incidental, so a non-focus pairing that
@@ -204,7 +211,7 @@ def _pitcher_conflicts(pool):
 
 def _constraints(pool, lock_idx, stacks, max_hitters_per_team, min_games, stack_teams,
                  conflicts=(), conflict_min=CONFLICT_MIN_HITTERS, pins=None,
-                 focus=None, off_focus_max=None, max_ownership=None):
+                 focus=None, off_focus_max=None, max_ownership=None, slot_groups=None):
     """Constraint rows over [player-slot vars | stack-level vars].
 
     Returns (rows, selector) where each row is (coefficients, lb, ub) sized to the full
@@ -279,6 +286,18 @@ def _constraints(pool, lock_idx, stacks, max_hitters_per_team, min_games, stack_
         row[0, index * s + SLOTS.index(slot)] = 1
         rows.append((pad(row), 1, 1))
 
+    # Require that a roster slot be filled by somebody from a named candidate group. This
+    # is the paired-strategy backtest primitive: e.g. SS must come from the pay-up group,
+    # while every other slot remains free to re-optimize. A player-slot constraint matters
+    # for multi-position hitters; a generic player lock could put the candidate at 2B and
+    # leave SS filled by the opposite strategy group.
+    for slot, (indices, lower, upper) in (slot_groups or {}).items():
+        row = np.zeros((1, n * s))
+        column = SLOTS.index(slot)
+        for index in indices:
+            row[0, index * s + column] = 1
+        rows.append((pad(row), lower, upper))
+
     # DK requires players from at least two games. Capping any single game's share of the
     # roster keeps this linear and is equivalent for a 10-player lineup.
     if min_games >= 2 and "Game" in pool.columns:
@@ -330,13 +349,43 @@ def _eligibility_bounds(pool):
     return Bounds(np.zeros(n * s), upper)
 
 
+# The ten individual seats, so eligibility can be matched against them one by one.
+SEATS = [slot for slot, count in ROSTER.items() for _ in range(count)]
+
+
+def _fits_seats(slot_sets, seats=SEATS):
+    """True when every candidate can be given a distinct roster seat.
+
+    Counting forced players as "so many pitchers and so many hitters" is not the question
+    DK asks: three shortstops are three hitters and still cannot be rostered together. The
+    exposure pace forces players in before the solver ever sees them, so it has to check
+    eligibility as an actual matching or it will hand the solver an impossible set.
+    """
+    match = {}
+
+    def assign(candidate, seen):
+        for seat, slot in enumerate(seats):
+            if seat in seen or slot not in slot_sets[candidate]:
+                continue
+            seen.add(seat)
+            if seat not in match or assign(match[seat], seen):
+                match[seat] = candidate
+                return True
+        return False
+
+    return all(assign(i, set()) for i in range(len(slot_sets)))
+
+
 def optimize(players, n_lineups=1, objective="ceiling", locks=None, excludes=None,
              stacks=None, max_overlap=None, min_proj=None, max_bust=None,
              max_hitters_per_team=MAX_HITTERS_PER_TEAM, min_games=MIN_GAMES_REPRESENTED,
              randomness=DEFAULT_RANDOMNESS, seed=None, stack_bonus=None,
              exposure=None, boosts=None, conflict_penalty=CONFLICT_PENALTY,
              conflict_min_hitters=CONFLICT_MIN_HITTERS, focus_teams=None, pins=None,
-             focus_exclusive=True, max_ownership=None):
+             focus_exclusive=True, max_ownership=None,
+             total_lineups=None, prior_appearances=None, prior_lineups=0,
+             slot_groups=None, team_exposure=None, stack_at=STACK_EXPOSURE_AT,
+             prior_team_stacks=None):
     """Generate up to `n_lineups` distinct DK Classic lineups.
 
     max_overlap caps how many players a lineup may share with any earlier one. randomness
@@ -355,9 +404,25 @@ def optimize(players, n_lineups=1, objective="ceiling", locks=None, excludes=Non
 
     pins is {player name: roster slot} and holds a player to that exact slot, leaving the
     rest of the roster free -- the late-swap case, where most of a lineup must stay put.
+
+    team_exposure is {team: (min_lineups, max_lineups)} and limits how many lineups in the
+    SET may stack that team -- where "stack" means `stack_at` or more of its hitters, the
+    same threshold `dfs.exposure` reports against. It is the team-level twin of `exposure`
+    and is enforced the same way: a team at its cap is held below stack size in later solves,
+    and a team behind its minimum's pace is forced to stack in the next one. Ordinary
+    non-stack hitters from a capped team are never blocked -- the cap is on *clustering*, not
+    on the players.
     """
     if objective not in OBJECTIVES:
         raise OptimizerError(f"objective must be one of {sorted(OBJECTIVES)}")
+
+    # Fold stack team codes the same way focus teams and the hitter masks are folded, so a
+    # typed 'CHW' finds the hitters the slate files under CWS. `dfs.optimize` already does
+    # this when parsing --stack; doing it only there left the library entry point behaving
+    # differently from the CLI, and an unfolded code reads as "only 0 CHW hitters" rather
+    # than working.
+    if stacks:
+        stacks = {canon_team(team): count for team, count in stacks.items()}
 
     # A pinned player has to survive pool filtering to be pinnable, so pins imply a lock.
     # Leaving that to the caller would fail as an infeasible solve with nothing to read.
@@ -412,12 +477,33 @@ def optimize(players, n_lineups=1, objective="ceiling", locks=None, excludes=Non
         pin_idx[found[0]] = slot
     missing["pins"] = missing_pins
 
+    slot_group_idx = {}
+    for slot, specification in (slot_groups or {}).items():
+        slot = str(slot or "").strip().upper()
+        if slot not in ROSTER:
+            raise OptimizerError(f"cannot constrain unknown roster slot '{slot}'")
+        if isinstance(specification, dict):
+            names = specification.get("names") or []
+            lower = float(specification.get("min", 1))
+            upper = float(specification.get("max", np.inf))
+        else:
+            names, lower, upper = specification, 1.0, np.inf
+        if lower < 0 or upper < lower or (np.isfinite(upper) and upper > ROSTER[slot]):
+            raise OptimizerError(
+                f"invalid {slot} candidate-group bounds {lower:g}-{upper:g}")
+        found, missing_group = _match(pool, names)
+        eligible = sorted({index for index in found if slot in eligible_positions(pool.loc[index])})
+        if not eligible and lower > 0:
+            detail = f"; missing: {', '.join(missing_group)}" if missing_group else ""
+            raise OptimizerError(f"no supplied players can fill constrained slot {slot}{detail}")
+        slot_group_idx[slot] = (eligible, lower, upper)
+
     rows, selector = _constraints(pool, lock_idx, stacks, max_hitters_per_team,
                                   min_games, stack_teams, conflicts, conflict_min_hitters,
                                   pin_idx, focus=focus,
                                   off_focus_max=(OFF_FOCUS_MAX_HITTERS if focus and focus_exclusive
                                                  else None),
-                                  max_ownership=max_ownership)
+                                  max_ownership=max_ownership, slot_groups=slot_group_idx)
     n_x = len(pool) * len(SLOTS)
     n_z = len(stack_teams) * len(levels)
     width = n_x + n_z + len(conflicts)
@@ -440,13 +526,50 @@ def optimize(players, n_lineups=1, objective="ceiling", locks=None, excludes=Non
 
     rng = np.random.default_rng(seed)
     lineups, chosen_sets = [], []
+    # Minimums the pace ran out of room for. Reported with the finished set rather than
+    # raised, so an oversubscribed board still hands back the lineups it did build.
+    unmet = set()
 
     # Exposure is a property of the SET of lineups, not of any one lineup, so it is
-    # enforced by counting appearances as we go and hard-excluding anyone who has hit
-    # their cap. Minimums are handled at the end by forcing the shortfall in.
+    # enforced by counting appearances as we go: anyone who has hit their cap is barred
+    # from the next solve, and anyone behind their minimum's pace is forced into it.
     exposure = exposure or {}
     name_to_index = {name: i for i, name in enumerate(pool["Name"])}
     appearances = {name: 0 for name in exposure}
+    # A caller that builds one set across several solves -- the stack-shape loop does, one
+    # solve per team pairing -- has to say so. Minimums are satisfied over the whole set, so
+    # judging "how many lineups are left" from this call alone makes every minimum look
+    # urgent on the first lineup and forces the entire exposure list in at once.
+    for name, used in (prior_appearances or {}).items():
+        if name in appearances:
+            appearances[name] = int(used)
+    budget = int(total_lineups if total_lineups else n_lineups)
+
+    # Team stack exposure. Folded to canonical codes like every other team input, and checked
+    # against the pool so a cap on a team with no hitters is reported rather than ignored.
+    stack_at = max(2, int(stack_at))
+    team_limits, missing_team_exposure = {}, []
+    for team, span in (team_exposure or {}).items():
+        key = canon_team(team)
+        if key not in team_masks:
+            missing_team_exposure.append(str(team))
+            continue
+        low, high = span
+        team_limits[key] = (0 if low is None else int(low),
+                            budget if high is None else int(high))
+    missing["team_exposure"] = missing_team_exposure
+    stacked_counts = {team: 0 for team in team_limits}
+    for team, used in (prior_team_stacks or {}).items():
+        key = canon_team(team)
+        if key in stacked_counts:
+            stacked_counts[key] = int(used)
+    unmet_teams = set()
+
+    # Fixed properties of the pool, read once: the pace consults them on every lineup.
+    types = pool["Type"].to_numpy()
+    salaries = pd.to_numeric(pool["Salary"], errors="coerce").fillna(0).to_numpy()
+    slot_sets = [eligible_positions(pool.iloc[i]) for i in range(len(pool))]
+    cheapest = float(salaries.min()) if len(salaries) else 0.0
 
     for lineup_number in range(n_lineups):
         if boosts:
@@ -470,20 +593,162 @@ def optimize(players, n_lineups=1, objective="ceiling", locks=None, excludes=Non
             row[0, :n_x] = mask @ selector
             extra.append((row, 0, max_overlap))
 
-        remaining = n_lineups - lineup_number
-        for name, (low, high) in exposure.items():
-            index = name_to_index.get(name)
-            if index is None:
-                continue
+        remaining = budget - prior_lineups - lineup_number
+        done = prior_lineups + lineup_number
+
+        # Minimums are held to a PACE rather than deferred to the end. A player wanted in
+        # 30 of 50 lineups should be in roughly 3 of the first 5; letting him drift and then
+        # forcing the whole shortfall in at once is what made a set that stops early miss its
+        # minimums entirely, and what forced five pitchers into two slots when the set was
+        # split across stack pairings.
+        def _row(index):
             mask = np.zeros(len(pool))
             mask[index] = 1
             row = np.zeros((1, width))
             row[0, :n_x] = mask @ selector
+            return row
+
+        def _team_row(mask):
+            """Constraint row counting how many of one team's hitters the lineup takes."""
+            row = np.zeros((1, width))
+            row[0, :n_x] = mask @ selector
+            return row
+
+        hitter_slots = ROSTER_SIZE - ROSTER["P"]
+        # Slots a forced stack has already spoken for. Under-counts when a forced player is
+        # himself part of the stack, which is the safe direction to be wrong in.
+        free_hitter_slots = max(0, hitter_slots - sum((stacks or {}).values()))
+
+        # --- team stack exposure -------------------------------------------------------
+        # Caps are hard constraints on this solve; minimums are paced the same way player
+        # minimums are, so a team wanted in half the set gets stacked steadily rather than
+        # all at once at the end. A forced stack is appended to `extra` rather than to
+        # `forced`, because it constrains a COUNT and not a named player -- there is nothing
+        # for the infeasibility fallback to pop, so it is kept satisfiable by construction:
+        # only one team is ever forced per lineup, and only when it can still fit.
+        forced_stack_team = None
+        stack_behind = []
+        for team, (low, high) in team_limits.items():
+            used = stacked_counts[team]
+            if used >= high:
+                # Held below stack size. Individual hitters from the team stay available.
+                extra.append((_team_row(team_masks[team]), 0, stack_at - 1))
+                continue
+            if low <= 0:
+                continue
+            target = (2 * low * (done + 1) + budget) // (2 * max(budget, 1))
+            last_chance = (low - used) >= remaining
+            if target - used > 0 or last_chance:
+                stack_behind.append((last_chance, (low - used) / max(remaining, 1), team))
+        stack_behind.sort(key=lambda item: (item[0], item[1], rng.random()), reverse=True)
+        for last_chance, _urgency, team in stack_behind:
+            # An explicit --stack already dictates this team's count, and the hitter slots a
+            # forced stack needs have to exist alongside it.
+            if (stacks or {}).get(team) or stack_at > free_hitter_slots:
+                if last_chance:
+                    unmet_teams.add(team)
+                continue
+            extra.append((_team_row(team_masks[team]), stack_at, hitter_slots))
+            forced_stack_team = team
+            break
+        for last_chance, _urgency, team in stack_behind:
+            if last_chance and team != forced_stack_team:
+                unmet_teams.add(team)
+
+        behind, short = [], []
+        for name, (low, high) in exposure.items():
+            index = name_to_index.get(name)
+            if index is None:
+                continue
             used = appearances[name]
             if used >= high:
-                extra.append((row, 0, 0))                       # cap reached: bar them
-            elif low - used >= remaining:
-                extra.append((row, 1, 1))                       # must appear from here on
+                extra.append((_row(index), 0, 0))               # cap reached: bar them
+                continue
+            if low <= 0:
+                continue
+            # Everyone still owed appearances, ranked by the share of the lineups left that
+            # they have to appear in. This is what the top-up below draws from.
+            if used < low:
+                short.append(((low - used) / max(remaining, 1), name, index))
+            # Nearest, not ceil and not floor -- both ends of the set are a trap.
+            # Ceil made every minimum due on the very first lineup (ceil(low * 1 / budget)
+            # is 1 for any minimum whatsoever), so 55 Min% players filled the whole ten-man
+            # roster in file order and left the solver nothing to decide. Floor has the
+            # mirror fault: it only reaches `low` on the final lineup, so every player's
+            # last owed appearance came due simultaneously at lineup 150 and the ten that
+            # did not fit finished one short. Rounding to nearest puts a player due half a
+            # lineup either side of his own rate, which leaves slack at both ends.
+            target = (2 * low * (done + 1) + budget) // (2 * max(budget, 1))
+            deficit = target - used
+            # Still kept as a backstop: if the lineups left are fewer than the shortfall,
+            # this is the last chance regardless of what the pace says.
+            last_chance = (low - used) >= remaining
+            if deficit > 0 or last_chance:
+                # Ranked by urgency -- the share of the lineups left that this player still
+                # has to appear in -- rather than by raw deficit. Deficit alone is biased
+                # towards big minimums: a player owed 10 of 100 remaining lineups outranks
+                # one owed 3 of the next 3, and it is the second who is about to become
+                # impossible. The random tiebreak matters too, since players tie constantly
+                # and a stable sort let whoever sat highest in the file win every race.
+                behind.append((last_chance, (low - used) / max(remaining, 1), name, index))
+
+        behind.sort(key=lambda item: (item[0], item[1], rng.random()), reverse=True)
+
+        forced, deferred = [], []
+
+        def _take(name, index, last_chance=False):
+            """Force this player if the resulting set can still be rostered for real."""
+            trial = [i for _, _, i in forced] + [index]
+            hitters = sum(1 for i in trial if types[i] != "P")
+            # Distinct seats for everyone, and enough cap left to fill the rest of the
+            # roster at all. Forcing a set that cannot be seated is what turned a
+            # satisfiable board into "constraints are contradictory".
+            if (hitters > free_hitter_slots
+                    or not _fits_seats([slot_sets[i] for i in trial])
+                    or salaries[trial].sum() + cheapest * (ROSTER_SIZE - len(trial))
+                    > DK_SALARY_CAP):
+                deferred.append((last_chance, name))
+                return False
+            forced.append((last_chance, name, index))
+            return True
+
+        for last_chance, _deficit, name, index in behind:
+            _take(name, index, last_chance)
+
+        # Top up to the rate the remaining minimums actually require. Pace alone leaves
+        # early lineups nearly unforced -- a player owed 5% of 150 is not "due" until lineup
+        # 19 -- so on a board whose minimums claim most of the slots the set banks a debt it
+        # cannot repay at the end, and 148 good lineups died for a residual shortfall of 55.
+        # Forcing the required rate from the first lineup spreads that debt evenly. It is
+        # self-limiting: when minimums are modest the rate is low and nothing extra is
+        # forced, so ordinary boards keep picking on merit.
+        owed = sum(max(0, low - appearances[name])
+                   for name, (low, _high) in exposure.items() if name in name_to_index)
+        # Aim to finish the minimums slightly before the set ends rather than exactly on the
+        # last lineup. Pacing at the bare average leaves no margin for the forcings the
+        # solver later refuses -- a forced set can collide with the overlap limit or the cap
+        # and get relaxed -- so the debt is never made up and the set lands a few
+        # appearances short. Reserving a tail absorbs that.
+        reserve = max(1, budget // 20)
+        rate = -(-owed // max(remaining - reserve, 1))           # ceil: appearances per lineup
+        if len(forced) < rate:
+            already = {index for _, _, index in forced}
+            short.sort(key=lambda item: (item[0], rng.random()), reverse=True)
+            for _urgency, name, index in short:
+                if len(forced) >= rate:
+                    break
+                if index in already:
+                    continue
+                _take(name, index)
+
+        # A player who cannot fit is a shortfall, not a contradiction. Raising here threw
+        # away every lineup already built -- 148 of 150 on the 8/1 board -- over minimums
+        # that were merely oversubscribed. The set is reported against the minimums when it
+        # finishes, so record it and keep building.
+        for last_chance, name in deferred:
+            if last_chance:
+                unmet.add(name)
+
 
 
         # Priced off the UNjittered value: the tax is a structural rule, not another thing
@@ -492,10 +757,42 @@ def optimize(players, n_lineups=1, objective="ceiling", locks=None, excludes=Non
         y_weights = np.array([-conflict_penalty * base_now[pitcher]
                               for pitcher, _ in conflicts])
         objective_vector = np.concatenate([weights @ selector, z_weights, y_weights])
-        constraints = [LinearConstraint(a, lb, ub) for a, lb, ub in rows + extra]
-        result = milp(c=-objective_vector, constraints=constraints,
-                      integrality=integrality, bounds=bounds)
+
+        # Forcing is a prediction about what will fit. Seat matching and the cap floor catch
+        # the clashes visible player-by-player, but a forced set can still collide with a
+        # stack, an overlap limit or the cap in combination -- so an infeasible solve hands
+        # back its least urgent pace nudge and tries again instead of condemning the whole
+        # board. `forced` is urgency-ordered, so popping the tail always gives up the
+        # cheapest nudge first and only touches a genuinely due minimum once nothing else
+        # is left; that minimum is then reported as unmet rather than ending the set.
+        attempt = list(forced)
+        while True:
+            forcing = [(_row(index), 1, 1) for _, _, index in attempt]
+            constraints = [LinearConstraint(a, lb, ub)
+                           for a, lb, ub in rows + extra + forcing]
+            with profiler.stage("solve", vars=width, players=len(pool)):
+                result = milp(c=-objective_vector, constraints=constraints,
+                              integrality=integrality, bounds=bounds)
+            if (result.success and result.x is not None) or not attempt:
+                break
+            last_chance, name, _index = attempt.pop()
+            if last_chance:
+                unmet.add(name)
+
         if not result.success or result.x is None:
+            # Running out part-way through a set is normal -- overlap limits and exposure
+            # caps legitimately exhaust the alternatives, and the lineups already built are
+            # good. Failing on the *first* is not: nothing was asked of the solver except
+            # the constraints themselves, so they are contradictory. Returning an empty list
+            # there let the stack-shape loop discard thirty infeasible solves in silence and
+            # report only "No feasible lineup".
+            if lineup_number == 0 and not lineups:
+                raise OptimizerError(
+                    "constraints are contradictory — no lineup satisfies them at all"
+                    + (f" (stacks {stacks})" if stacks else "")
+                    + (f", {len(exposure)} exposure rule(s)" if exposure else "")
+                    + (f", {len(lock_idx)} lock(s)" if lock_idx else "")
+                )
             break
 
         assignment = _decode(result.x[:n_x], len(pool))
@@ -506,8 +803,21 @@ def optimize(players, n_lineups=1, objective="ceiling", locks=None, excludes=Non
         for name in built["players"]["Name"]:
             if name in appearances:
                 appearances[name] += 1
+        if stacked_counts:
+            # Counted off the built lineup rather than the solver's own team rows, so the
+            # tally matches what dfs.exposure will report from the same finished set.
+            roster = built["players"]
+            taken = roster[roster["Roster"] != "P"]["Team"].map(canon_team).value_counts()
+            for team in stacked_counts:
+                if int(taken.get(team, 0)) >= stack_at:
+                    stacked_counts[team] += 1
         lineups.append(built)
 
+    # Minimums the roster could not make room for. The CLI recomputes the real shortfall
+    # from the finished set, but a library caller that does not gets the signal here.
+    missing["exposure_minimums"] = sorted(unmet)
+    missing["team_stack_minimums"] = sorted(unmet_teams)
+    missing["team_stacks_built"] = dict(stacked_counts)
     return lineups, pool, missing
 
 
@@ -559,19 +869,20 @@ def _assemble(pool, assignment, objective, conflict_min=CONFLICT_MIN_HITTERS):
     }
 
 
-def stack_shapes(players, shape, top_teams=6, focus_teams=None):
-    """Expand a shape like '4-3' into concrete team stack combinations.
+def _parse_shape(shape):
+    """'4-3' -> [4, 3], rejecting anything that is not a run of dashed integers.
 
-    Candidate teams are ordered by summed hitter ceiling, so the combinations explored are
-    the ones actually worth stacking rather than every arrangement on the slate.
-
-    focus_teams narrows the candidates to a hand-picked list. Every team named is used --
-    the top_teams cap is a way to keep an unguided search tractable, and an explicit choice
-    should not be silently trimmed by it.
+    This used to keep only the parts that passed `.isdigit()` and silently drop the rest,
+    which meant '5-3,5-2' split to ['5', '3,5', '2'], lost the middle, and came back as the
+    shape 5-2 without a word. Malformed input now raises instead of being quietly reinterpreted.
     """
-    counts = [int(part) for part in str(shape).split("-") if part.strip().isdigit()]
-    if not counts:
-        raise OptimizerError(f"could not read stack shape '{shape}' (expected e.g. 4-3)")
+    parts = [part.strip() for part in str(shape).split("-")]
+    if not all(part.isdigit() for part in parts) or not parts:
+        raise OptimizerError(
+            f"could not read stack shape '{shape}' (expected e.g. '4-3'; separate several "
+            f"shapes with commas, e.g. '5-3,5-2')"
+        )
+    counts = [int(part) for part in parts]
     hitter_slots = ROSTER_SIZE - ROSTER["P"]
     if sum(counts) > hitter_slots:
         raise OptimizerError(
@@ -581,6 +892,35 @@ def stack_shapes(players, shape, top_teams=6, focus_teams=None):
         raise OptimizerError(
             f"stack shape '{shape}' exceeds DK's {MAX_HITTERS_PER_TEAM}-hitter-per-team limit"
         )
+    return counts
+
+
+def stack_shapes(players, shape, top_teams=6, focus_teams=None):
+    """Expand a shape like '4-3' into concrete team stack combinations.
+
+    Several shapes may be given comma-separated -- '5-3,5-2,5'. The results are round-robin
+    interleaved rather than concatenated, because callers consume this list by cycling it and
+    the shapes produce wildly different counts: on a 20-team slate '5-3' is 380 combinations
+    and '5' is 20, so plain concatenation would give the one-stack shape 5% of the lineups
+    instead of a third of them. Interleaving makes position in the list mean "how many of
+    each shape so far", which is what the cycling caller actually wants.
+
+    Candidate teams are ordered by summed hitter ceiling, so the combinations explored are
+    the ones actually worth stacking rather than every arrangement on the slate.
+
+    focus_teams narrows the candidates to a hand-picked list. Every team named is used --
+    the top_teams cap is a way to keep an unguided search tractable, and an explicit choice
+    should not be silently trimmed by it.
+
+    top_teams=None lifts the cap entirely. It exists because the cost of widening depends on
+    the shape: a two-stack shape grows as permutations (6 teams -> 30 combinations, 20 -> 380),
+    but a one-stack shape like '5' grows linearly, so opening it to the whole slate is cheap
+    and leaves the choice of team to the solver rather than to a ceiling ranking made before
+    salary is considered.
+    """
+    shapes = [part for part in str(shape).split(",") if part.strip()]
+    if not shapes:
+        raise OptimizerError(f"could not read stack shape '{shape}' (expected e.g. 4-3)")
 
     hitters = players[(players["Type"] == "H") & players["Salary"].notna()].copy()
     hitters["Team"] = hitters["Team"].map(_team_key)
@@ -590,13 +930,39 @@ def stack_shapes(players, shape, top_teams=6, focus_teams=None):
     if focus_teams:
         wanted = {_team_key(team) for team in focus_teams}
         ranked = [team for team in ranked if team in wanted]
-        if len(ranked) < len(counts):
-            raise OptimizerError(
-                f"stack shape '{shape}' needs {len(counts)} teams; the focus list has "
-                f"{len(ranked)} on this slate"
-            )
     else:
         ranked = ranked[:top_teams]
 
-    from itertools import permutations
-    return [dict(zip(teams, counts)) for teams in permutations(ranked, len(counts))]
+    from itertools import permutations, zip_longest
+    per_shape = []
+    for one in shapes:
+        counts = _parse_shape(one)
+        if len(ranked) < len(counts):
+            raise OptimizerError(
+                f"stack shape '{one.strip()}' needs {len(counts)} teams; "
+                f"{'the focus list has' if focus_teams else 'the slate offers'} "
+                f"{len(ranked)}"
+            )
+        per_shape.append([dict(zip(teams, counts))
+                          for teams in permutations(ranked, len(counts))])
+
+    if len(per_shape) == 1:
+        return per_shape[0]
+
+    # Shorter shapes are cycled rather than exhausted. '5' has one combination per team (20)
+    # against 380 for '5-3', so dropping it once spent would leave a 150-lineup run at 13%
+    # one-stack instead of the third that was asked for. Repeats are harmless: the caller
+    # varies the seed per solve and skips lineups it has already seen, so the same team
+    # constraint yields a different lineup each time it comes round.
+    longest = max(len(group) for group in per_shape)
+    combos, seen = [], set()
+    for index in range(longest):
+        for group in per_shape:
+            combo = group[index % len(group)]
+            # Only a repeated shape can collide -- '5-2' and '5' produce different dicts even
+            # for the same team -- so this guards against '5-3,5-3' rather than a real overlap.
+            key = (index // len(group), tuple(sorted(combo.items())))
+            if key not in seen:
+                seen.add(key)
+                combos.append(combo)
+    return combos

@@ -147,7 +147,7 @@ comparable across types.
 ### Optimizer
 
 ```powershell
-python -m dfs.optimize --date 2026-07-27 --n 20 --objective ceiling --stack-shape 4-3
+python -m dfs.optimize --date 2026-07-27 --n 20 --objective ceiling --stack-shape 5 --stack-teams 0
 ```
 
 Exact MILP (scipy) over the priced slate. Enforces the DK Classic roster (2 P, C, 1B, 2B,
@@ -167,7 +167,8 @@ a single best lineup, pass `--randomness 0`.
 | `--objective ceiling\|proj\|floor` | ceiling = GPP, floor = cash, proj = balanced |
 | `--lock` / `--exclude` | Comma-separated names; accent- and case-insensitive |
 | `--stack "CWS:4,HOU:3"` | Explicit team stacks |
-| `--stack-shape "4-3"` | Explores that shape across the best stacking teams |
+| `--stack-shape "5"` | Requires a stack of that shape; the solver picks the team |
+| `--stack-teams N` | Teams a shape may stack, best first (default 6; `0` = every team) |
 | `--max-overlap N` | Cap shared players between lineups (default 6) |
 | `--randomness` | Jitters the objective (default 0.20); `0` for the single best lineup |
 | `--min-proj` / `--max-bust` | Prune the pool before solving |
@@ -279,6 +280,19 @@ offense index and hitter composite. Arsenal, similar-pitcher and BvP columns are
 over — they need the similarity engine — so a player newly in the lineup simply has no
 values there rather than wrong ones.
 
+**Re-running it is cheap.** The posted cards are read before anything is rebuilt, and when
+both already match the cache the payload is kept untouched and only the render happens —
+~20s per game down to ~1.4s. So there is no cost to running it again at each stage of the
+evening; it does the work on the run where the card actually moved and skips the rest.
+Anything ambiguous — a partly-posted card, a `Fallback` cache, a doubleheader — rebuilds.
+`--force-lineup-refresh` rebuilds unconditionally.
+
+**A game cached before the arsenal K-edge landed needs one non-`--fast` re-render.** The
+batter arsenal tables gained a `K Edge` column, which is the only arsenal number the DFS
+pitcher projection reads (see `docs/arsenal_study.md`). `--from-cache` without `--fast`
+rebuilds it once per cached game; with `--fast` the rebuild is skipped and the factor
+simply never fires, which looks the same as a neutral matchup.
+
 **Follow it with a plain re-render to make the highlighting consistent.** DFS tints are
 rebuilt from the whole slate at render time, but `--refresh-lineups` refreshes one game at
 a time — so the first game rendered is tinted against a pool in which every later game
@@ -318,6 +332,55 @@ python -m dfs.cli --date 2026-07-27
 python scouting_report.py --date 2026-07-27 --all-games --format xlsx
 ```
 
+### Historical salary and position analysis
+
+Analyze the archived DFS boards against the matching DraftKings contest results:
+
+```powershell
+python -m dfs.price_analysis --from 2026-07-27 --to 2026-08-08
+```
+
+The command keeps overlapping slates separate when measuring whether a position was cheap
+or weak, but counts each player only once per day for price history and correlations. It
+writes a Markdown report plus reusable CSV tables under
+`dfs_analysis/price_<from>_<to>/`: player price history and changes, outcome-defined
+performance tiers, empirically discovered salary breakpoints, position pay-up economics,
+slate-level position depth, weak-position slates, pitcher start-to-start changes, data
+coverage, and rank correlations. Missing contest results stay missing rather than becoming
+zeroes. Use `--slate main` or `--min-sample 20` to narrow or tune the analysis.
+
+Salary tiers are not fixed $1,000 buckets. A shallow regression tree finds the salary cuts
+that best separated actual scoring while requiring meaningful samples on both sides.
+Separately, the outcome-origin table starts with Elite/Solid/Useful results and reports the
+salary distribution they came from. Position pay-up tables show both absolute points per
+$1K and marginal points gained per additional $1K. The depth analysis counts upper-tier
+options within each slate and compares shallow, typical and deep pools.
+
+The position tables use DK roster eligibility, so a multi-position hitter contributes to
+each slot he could fill. Findings are descriptive; with a short archive, use the reported
+sample counts and 95% margins before turning a difference into an optimizer rule.
+
+The same command now runs a full-lineup opportunity-cost backtest. For each hitter slot it
+solves two otherwise-unconstrained lineups: one that must use the slate's upper-quartile
+salary pool at that exact roster position and one that cannot. The comparison reports what
+the extra position salary bought, what was lost across the other nine seats, and the net
+projection, ceiling and actual-score change. Shared players cancel in the actual comparison;
+every player who differs must have a known result, so missing results are never zero-filled.
+
+To refresh only the strategy layer or choose a cash-style objective:
+
+```powershell
+python -m dfs.position_strategy --from 2026-07-27 --to 2026-08-08
+python -m dfs.position_strategy --from 2026-07-27 --to 2026-08-08 --objective floor
+```
+
+`replacement_scarcity.csv` measures projection-based replacement level, viable alternatives,
+and whether the position is deep, weak/empty, or has one standout. These labels are
+walk-forward: only earlier slates define the current slate's historical percentiles.
+`walkforward_tiers.csv` applies the same discipline to learned salary tiers.
+`daily_strategy_card.csv` combines current-slate scarcity, the paired optimizer result, and
+prior comparable actual pairs into an actionable pay-up/value/flexible lean.
+
 ### Backtest
 
 ```powershell
@@ -340,6 +403,180 @@ hitter in one game. Real floor plays are pitchers.
 The model is matchup-adjusted expectation, not prediction. League baselines, factor
 damping, and the empirical floor/bust fits live at the top of `dfs/projections.py`;
 scoring lives in `dfs/scoring.py`.
+
+### Walk-forward evaluation
+
+`dfs.backtest` grades every date with today's code against payloads that have since been
+refreshed, which makes it a quick check rather than evidence. `dfs.evaluate` is the honest
+version: for each target date the floor/bust calibration is refit on **strictly earlier
+dates only**, and the result is scored on that date.
+
+```powershell
+python -m dfs.evaluate                    # every cached date
+python -m dfs.evaluate --from 2026-07-25  # a window
+```
+
+It adds quantile (pinball) loss, CRPS, probability-integral-transform diagnostics, Brier
+scores with skill against the base rate, and breakdowns by salary tier, batting order,
+handedness matchup, slate size, and confirmed-versus-projected lineup status. Output is
+also written as JSON under `docs/benchmarks/`.
+
+What it found on the current model (2,318 player-games over 9 dates):
+
+- The **ceiling band is honest** — exceeded 10.4% of the time against a 10% target.
+- The **per-player bust number barely beats the base rate** (Brier skill 0.032). `Bust%` is
+  a linear function of `Proj`, so it carries little player-specific information.
+- **Unconfirmed lineups are over-projected by 1.5 points.** Confirmed hitters have a bias of
+  −0.001; projected ones −1.489.
+- **Hitter distributions are too narrow at the bottom** — real blanks happen more often than
+  the published bands imply.
+
+## Slate snapshots
+
+`.cache/report_data/*.pkl` is rewritten in place by `--refresh-lineups`, so re-reading a
+past night gives you that payload *as it stands now*. Confirmed lineups and late scratches
+leak backwards, and a review ends up grading projections that never existed at lock.
+
+```powershell
+python -m dfs.snapshot --date 2026-08-01 --stage confirmed
+python -m dfs.snapshot --date 2026-08-01 --verify
+```
+
+A snapshot freezes the projections, the DK export, per-game weather / probables / batting
+orders, model and code versions, a data cutoff, and a sha256 of every payload it came from.
+Stages are `morning`, `t-2h`, `confirmed`, `final`; re-taking one writes `.r2` beside it and
+never replaces anything. `dfs.review` reads the newest snapshot automatically and says so.
+
+## Candidate pools and correlated simulation
+
+Generation is now separable from selection, and lineups can be scored against simulated
+slates rather than summed point projections.
+
+```powershell
+python -m dfs.candidates --date 2026-08-01 --slate main --n 1000 --seed 7
+python -m dfs.simulate --date 2026-08-01 --slate main --sims 20000 `
+    --candidates dfs_boards/2026-08-01/candidates_main
+```
+
+`dfs.candidates` builds hundreds or thousands of legal lineups with their metrics attached,
+at ~0.03 s each against the optimizer's 0.40 s. `dfs.simulate` draws whole nights through a
+hierarchy of shared shocks — slate, game, team, batting-order block, player — where a team's
+runs are drawn once and *allocated* across its nine hitters, so teammates compete for one
+pool and the opposing starter's earned runs come out of that same pool. Nothing predicts DK
+points directly; components are drawn and scored through `dfs/scoring.py`.
+
+Measured correlation structure on a 15-game slate: teammates **+0.30**, pitcher versus the
+hitters he faces **−0.31**, different games **+0.01**. None of it is imposed as a
+coefficient.
+
+The point of all this: on 2026-08-01, ranking 1,000 candidates by simulated 99th percentile
+disagreed with ranking them by summed ceiling **by a mean of 166 places**.
+
+Neither module changes any existing command. `dfs.optimize` behaves exactly as before.
+
+## Opponent field, contest EV, and joint portfolios
+
+The 10 DraftKings contest exports in `dk_results/` carry the full construction of **25,671
+real field lineups**, which makes the field directly observable rather than assumed. What
+they show is that a per-player ownership model cannot work for duplication:
+
+```
+P(teammate B | A rostered) / P(B)  =  2.62x
+P(B on another team  | A) / P(B)   =  0.75x
+pitcher pairs vs independence      =  1.01x
+```
+
+Teammates are 2.6x more likely to be rostered together than independence implies. `dfs.field`
+builds opponents the way the exports show real entrants building them — primary stack (54%
+are five-stacks), secondary conditional on it (5-2 is 27% of all entries), fill, two
+pitchers — and validates itself back against measured stack shapes, ownership, duplication,
+and the real score distribution.
+
+**The production shape** — the optimizer generates a wide constrained pool, the portfolio
+picks which ones you enter, and upload is unchanged:
+
+```powershell
+python -m dfs.optimize  --date 2026-08-01 --n 100 --pool --overwrite
+python -m dfs.portfolio --date 2026-08-01 --n 20 --from-optimizer --write-lineups
+python -m dfs.upload    --date 2026-08-01
+```
+
+`--from-optimizer` keeps everything the optimizer enforced — the editable pool file,
+exposure minimums, ranged boosts, explicit stacks, the conflict tax and the started-game
+filter — and adds correlation-aware selection on top. `--write-lineups` writes the chosen
+set back in the optimizer's own CSV format, so `dfs.upload` cannot tell the difference.
+
+Measured on 2026-08-01, 20 entries chosen from 100:
+
+| source | effective lineups | best-of-set mean |
+| --- | ---: | ---: |
+| optimizer 100 → portfolio 20 | **3.73** | 147.8 |
+| optimizer 100 → top 20 by ceiling | 2.25 | 145.8 |
+
+Or explore the slate without entering anything:
+
+```powershell
+python -m dfs.field   --date 2026-08-01 --slate main --contest twenty-max
+python -m dfs.contest --date 2026-08-01 --slate main --contest twenty-max
+```
+
+`dfs.contest` scores every candidate against that field through a payout curve. Duplication
+needs no separate model: identical lineups tie, and DK's tie rule already splits the prizes
+for the positions they occupy.
+
+`dfs.portfolio` picks the whole entry set jointly. The headline result:
+
+| method | best-of-set mean | effective lineups | distinct stacks |
+| --- | ---: | ---: | ---: |
+| joint portfolio | **155.6** | **5.91** | 15 |
+| highest P(win) | 151.4 | 3.88 | 7 |
+| random | 146.2 | 6.06 | 11 |
+| **highest ceiling** (current default) | 143.4 | **2.07** | 4 |
+
+**Ranking twenty lineups by summed ceiling produces a set worth 2.07 independent bets.**
+`effective_lineups` is `n / (1 + (n-1)r)` computed from simulated score correlations — what
+`--max-overlap` has always been approximating by counting shared players.
+
+> **Calibrated, with a documented residual.** The contest probabilities were traced against
+> 7 contests whose real standings are on disk. The model believed our candidate pool beat
+> the field by +1.3 points when it had actually *lost* to the real field by −5.3 — the pool
+> is generated for coverage so its average member is deliberately mediocre, and the
+> simulated field runs ~5 points soft. One parameter (`FIELD_EDGE_CORRECTION`) corrects that
+> gap. After it, **P(cash) is calibrated to within 5%**; P(top 1%) and P(win) still run
+> ~1.5× high. `docs/benchmarks.md` §7A has the whole investigation, including the several
+> things that did not work. Portfolio comparisons are unaffected — every method there is
+> scored on the same simulated slates.
+>
+> An earlier claim here — that simulated mean out-ranks summed ceiling (+0.214 vs +0.157) —
+> **was one slate and does not replicate.** Across 7 contests, within-contest discrimination
+> is +0.177 for raw projection, +0.170 for summed ceiling and +0.150 for simulated mean, all
+> within noise. The simulator earns its place by producing *distributions*, which duplication
+> and portfolio correlation require and a point estimate cannot supply — not by ranking
+> players better.
+
+None of these modules changes an existing command. `dfs.optimize` behaves exactly as before.
+
+## Documentation
+
+| File | What it holds |
+| ---- | ------------- |
+| [`CHEATSHEET.md`](CHEATSHEET.md) | Every command and flag |
+| [`docs/current_architecture.md`](docs/current_architecture.md) | Module map, data flow, measured profile, known correctness gaps |
+| [`docs/simulation_and_portfolio_plan.md`](docs/simulation_and_portfolio_plan.md) | Where the optimizer is going, and in what order |
+| [`docs/benchmarks.md`](docs/benchmarks.md) | Every measured result, including the changes that did not help |
+
+## Tests
+
+```powershell
+python -m pytest tests/ -q
+```
+
+354 tests covering DK scoring, roster validity, stack and exposure and overlap constraints,
+doubleheaders, started-game filtering, snapshot immutability, simulation reproducibility and
+correlation behaviour, ownership normalisation, field legality and structure,
+payout tie-splitting, portfolio diversification, the optimizer→portfolio bridge,
+started-game filtering, and the calibration metrics. All seeded;
+`integration`-marked tests skip themselves on a clean checkout.
 
 ## Current Notes
 

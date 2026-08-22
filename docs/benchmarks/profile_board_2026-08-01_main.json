@@ -1,0 +1,58 @@
+{
+  "run": {
+    "label": "board",
+    "date": "2026-08-01",
+    "slate": "main",
+    "started_utc": "2026-08-03T00:15:44+00:00",
+    "python": "3.14.4",
+    "platform": "Windows-11-10.0.26200-SP0"
+  },
+  "profile": {
+    "stage": "board",
+    "cumulative_s": 2.232841,
+    "self_s": 0.945006,
+    "calls": 1,
+    "meta": {
+      "games": 15,
+      "players": 300
+    },
+    "children": [
+      {
+        "stage": "normalize",
+        "cumulative_s": 0.306141,
+        "self_s": 0.306141,
+        "calls": 15
+      },
+      {
+        "stage": "project",
+        "cumulative_s": 0.454324,
+        "self_s": 0.454324,
+        "calls": 15
+      },
+      {
+        "stage": "acquire",
+        "cumulative_s": 0.408608,
+        "self_s": 0.408608,
+        "calls": 1,
+        "meta": {
+          "source": "schedule"
+        }
+      },
+      {
+        "stage": "ownership",
+        "cumulative_s": 0.019342,
+        "self_s": 0.019342,
+        "calls": 1
+      },
+      {
+        "stage": "render",
+        "cumulative_s": 0.09942,
+        "self_s": 0.09942,
+        "calls": 1,
+        "meta": {
+          "players": 198
+        }
+      }
+    ]
+  }
+}

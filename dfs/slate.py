@@ -3,6 +3,7 @@
 import glob
 import os
 import pickle
+import tempfile
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -10,12 +11,13 @@ import pandas as pd
 
 from .naming import UNKNOWN_SLATE, slate_for
 from .ownership import attach_actual_ownership, estimate_ownership
+from .profiling import profiler
 from .projections import project_game
 from .results import contest_summary, match_contest
 from .salaries import (
     AmbiguousSlate, attach_salaries, canon_team, describe_slate, find_salary_file,
-    load_salaries, normalize_name, postponed_in_export, slate_date, slate_game_times,
-    slate_games,
+    list_salary_files, load_salaries, normalize_name, postponed_in_export, slate_date,
+    slate_game_times, slate_games,
 )
 from .schedule import postponed_teams
 
@@ -57,6 +59,33 @@ def game_number(path):
 def _load(path):
     with open(path, "rb") as handle:
         return pickle.load(handle)
+
+
+def _persist_payload(path, payload):
+    """Atomically replace a report cache after a local-only calibration refresh."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    handle, temporary = tempfile.mkstemp(
+        prefix=f".{os.path.basename(path)}.", suffix=".calibration.tmp", dir=directory
+    )
+    try:
+        with os.fdopen(handle, "wb") as stream:
+            pickle.dump(payload, stream, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def refresh_game_calibration(payload, path):
+    """Ensure a cached game uses the current report-model artifact before projection."""
+    # Lazy import keeps ordinary dfs module imports light and avoids making the large
+    # report module part of slate discovery. It is loaded only when a board is built.
+    from scouting_report import refresh_payload_model_calibration
+
+    payload, changed, provenance = refresh_payload_model_calibration(payload)
+    if changed:
+        _persist_payload(path, payload)
+    return payload, changed, provenance
 
 
 def _start_minutes_et(payload):
@@ -172,6 +201,63 @@ def started_players(players, meta, date):
     return locked, elsewhere, None
 
 
+MIN_GAMES_REPRESENTED = 2
+
+
+def drop_started(players, meta, date, allow=False):
+    """Drop players whose game has already begun -- they cannot be drafted at all.
+
+    The slate removes postponed games but knows nothing about start times, so a run late in
+    the evening would otherwise build around a player who is already batting and hand back
+    an entry DK will not take.
+
+    Resolved per game, not per team: on a doubleheader the opener can be in progress while
+    the nightcap -- the game the main slate is priced on -- is hours away and completely
+    draftable.
+
+    A slate where *every* game has started is a review or backtest, not a live build, so
+    nothing is dropped there: filtering would empty the pool and fail with a message about
+    the wrong thing. (`dfs.review` calls the optimizer directly and never comes through
+    here, which is why that path is untouched by any of this.)
+
+    Lives here rather than in `dfs.optimize` because it is a *correctness* filter, not an
+    optimizer setting. It used to sit in the CLI, which meant the candidate, field, contest
+    and portfolio paths silently skipped it -- a portfolio built at 8pm would happily
+    include a player whose 7:05 game was in the third inning, with no warning.
+    """
+    if allow:
+        return players, []
+    locked, elsewhere, error = started_players(players, meta, date)
+    if error:
+        return players, [f"[!] could not check start times: {error}. Players from games "
+                         f"already under way may still be in the pool — check before entering."]
+    if locked.all():
+        return players, []              # nothing live at all: a review or backtest
+
+    notes = []
+    if elsewhere.any():
+        # Worth naming individually. This one looks like a bargain rather than a mistake --
+        # a top-salary arm with a full projection whose game, per DK, has not started.
+        for name in players[elsewhere]["Name"]:
+            notes.append(f"[!] {name} removed — already pitching the earlier game of a "
+                         f"doubleheader. DK prices the whole staff against the nightcap, so "
+                         f"he is listed as available and would score nothing.")
+    if locked.any():
+        gone = sorted(set(players[locked]["Game"].dropna()))
+        notes.append(f"[!] {int(locked.sum())} player(s) removed — "
+                     f"{', '.join(gone)} already under way and cannot be drafted.")
+    drop = locked | elsewhere
+    if not drop.any():
+        return players, notes
+
+    remaining = players[~drop]
+    games = remaining["Game"].dropna().nunique() if "Game" in remaining.columns else 0
+    if games < MIN_GAMES_REPRESENTED:
+        notes.append(f"    Only {games} game(s) left on the board; DK needs "
+                     f"{MIN_GAMES_REPRESENTED}. Use --allow-started to build anyway.")
+    return remaining.copy(), notes
+
+
 def _percentile(series):
     values = pd.to_numeric(series, errors="coerce")
     if values.notna().sum() <= 1:
@@ -259,7 +345,10 @@ def build_slate(date, salary_path=None, data_dir=REPORT_DATA_DIR, slate=None, ch
             "slate_label": slate_for(requested=slate) if slate else UNKNOWN_SLATE,
             "environment_error": None, "cached_but_unreadable": 0,
             "doubleheaders": [], "postponed": {}, "postponed_players": 0,
-            "schedule_error": None, "game_starts": {}}
+            "schedule_error": None, "game_starts": {},
+            "calibration_fingerprint": None, "calibration_created_at": None,
+            "calibration_feature_version": None, "calibration_refreshed_games": [],
+            "calibration_errors": [], "calibration_consistent": True}
 
     # The salary file is resolved up front because doubleheader disambiguation needs its
     # start times -- both games of a pairing would otherwise list every player twice.
@@ -278,8 +367,27 @@ def build_slate(date, salary_path=None, data_dir=REPORT_DATA_DIR, slate=None, ch
     rows = []
     for path, away, home in games:
         try:
-            payload = _load(path)
-            game_rows = project_game(payload)
+            with profiler.stage("normalize"):
+                payload = _load(path)
+                try:
+                    payload, calibration_changed, calibration = refresh_game_calibration(
+                        payload, path
+                    )
+                except Exception as error:
+                    raise RuntimeError(f"calibration refresh failed: {error}") from error
+            fingerprint = calibration.get("fingerprint")
+            if meta["calibration_fingerprint"] not in (None, fingerprint):
+                meta["calibration_consistent"] = False
+            meta["calibration_fingerprint"] = (
+                fingerprint if meta["calibration_fingerprint"] in (None, fingerprint)
+                else "mixed"
+            )
+            meta["calibration_created_at"] = calibration.get("created_at")
+            meta["calibration_feature_version"] = calibration.get("feature_version")
+            if calibration_changed:
+                meta["calibration_refreshed_games"].append(f"{away}@{home}")
+            with profiler.stage("project"):
+                game_rows = project_game(payload)
             # Tag the game so the optimizer can enforce DK's two-game minimum.
             for row in game_rows:
                 row["Game"] = f"{away}@{home}"
@@ -297,7 +405,17 @@ def build_slate(date, salary_path=None, data_dir=REPORT_DATA_DIR, slate=None, ch
             meta["environment_error"] = str(error)
             meta["skipped"].append(f"{away}@{home}: {error}")
         except Exception as error:                      # one bad payload shouldn't kill the slate
+            if "calibration" in str(error).casefold():
+                meta["calibration_errors"].append(f"{away}@{home}: {error}")
+                meta["calibration_consistent"] = False
             meta["skipped"].append(f"{away}@{home}: {error}")
+
+    # A partial board is especially dangerous here: it looks usable but silently omits
+    # the game whose cache could not be brought onto the current model artifact.  Fail
+    # closed so every consumer (optimizer, late swap, simulations, snapshots) gets the
+    # same all-or-nothing calibration guarantee.
+    if meta["calibration_errors"] or not meta["calibration_consistent"]:
+        return pd.DataFrame(), pd.DataFrame(), meta
 
     # Collapse the repeated identical message into one line.
     if meta["environment_error"] and len(meta["skipped"]) == len(games):
@@ -311,13 +429,17 @@ def build_slate(date, salary_path=None, data_dir=REPORT_DATA_DIR, slate=None, ch
     for column in ("Supports", "Cautions"):
         players[column] = players[column].apply(lambda r: r if isinstance(r, list) else [])
 
+    profiler.note(games=len(games), players=len(players))
     salaries = load_salaries(salary_file) if salary_file else None
     if salaries is not None and not salaries.empty:
         meta["salary_file"] = salary_file
         # Published so every writer downstream files its output under the same slate label.
         # Derived once here rather than per-CLI: two commands disagreeing about what tonight
         # is called would scatter one night's work across two sets of filenames.
-        meta["slate_label"] = slate_for(describe_slate(salary_file), requested=slate, date=date)
+        # Labelled against the night's other exports, not alone: a turbo and a main slate
+        # share a start-time bucket, and filing both as "main" overwrites one with the other.
+        meta["slate_label"] = slate_for(describe_slate(salary_file), requested=slate,
+                                        date=date, peers=list_salary_files(date))
         # A salary file from another date matches enough names to look plausible while
         # pricing the wrong slate entirely, so check it before anything else.
         meta["salary_date"] = slate_date(salary_file)
@@ -332,7 +454,8 @@ def build_slate(date, salary_path=None, data_dir=REPORT_DATA_DIR, slate=None, ch
     # file cannot show, so the live schedule is consulted as well as the file itself.
     postponed, schedule_error = ({}, None)
     if check_schedule:
-        postponed, schedule_error = postponed_teams(date)
+        with profiler.stage("acquire", source="schedule"):
+            postponed, schedule_error = postponed_teams(date)
     if salary_file:
         for team in postponed_in_export(salary_file):
             postponed.setdefault(team, "Postponed")
@@ -411,11 +534,18 @@ def build_slate(date, salary_path=None, data_dir=REPORT_DATA_DIR, slate=None, ch
     # Ownership before tiers: the Leverage tier is defined against what the field will do,
     # so it needs the field model to exist first.
     if has_salary:
-        players = estimate_ownership(players)
+        with profiler.stage("ownership"):
+            players = estimate_ownership(players)
         # A finished slate has measured ownership sitting in dk_results/. Real %Drafted beats
         # the model outright, so it replaces it wherever it exists -- which is what makes a
         # review of a past night honest rather than a critique of our own guess.
-        contest, overlap = match_contest(players)
+        #
+        # The night is passed in, not inferred: every export in dk_results/ is a plausible
+        # partial match for every other night, and the date is the only thing that rules the
+        # neighbours out.
+        label = meta.get("slate_label")
+        contest, overlap = match_contest(
+            players, date=date, slate=None if label == UNKNOWN_SLATE else label)
         if contest is not None:
             players = attach_actual_ownership(players, contest["ownership"])
             meta["ownership_source"] = os.path.basename(contest["path"])

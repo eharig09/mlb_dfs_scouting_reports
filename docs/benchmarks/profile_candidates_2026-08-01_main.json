@@ -1,0 +1,71 @@
+{
+  "run": {
+    "label": "candidates",
+    "date": "2026-08-01",
+    "slate": "main",
+    "started_utc": "2026-08-02T21:49:32+00:00",
+    "python": "3.14.4",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "n": 200
+  },
+  "profile": {
+    "stage": "candidates",
+    "cumulative_s": 5.852127,
+    "self_s": 0.527809,
+    "calls": 1,
+    "meta": {
+      "games": 15,
+      "players": 300
+    },
+    "children": [
+      {
+        "stage": "normalize",
+        "cumulative_s": 0.244537,
+        "self_s": 0.244537,
+        "calls": 15
+      },
+      {
+        "stage": "project",
+        "cumulative_s": 0.315608,
+        "self_s": 0.315608,
+        "calls": 15
+      },
+      {
+        "stage": "acquire",
+        "cumulative_s": 0.456731,
+        "self_s": 0.456731,
+        "calls": 1,
+        "meta": {
+          "source": "schedule"
+        }
+      },
+      {
+        "stage": "ownership",
+        "cumulative_s": 0.011852,
+        "self_s": 0.011852,
+        "calls": 1
+      },
+      {
+        "stage": "candidates",
+        "cumulative_s": 4.29559,
+        "self_s": 1.371694,
+        "calls": 1,
+        "meta": {
+          "pool": 84,
+          "target": 200
+        },
+        "children": [
+          {
+            "stage": "solve",
+            "cumulative_s": 2.923896,
+            "self_s": 2.923896,
+            "calls": 206,
+            "meta": {
+              "vars": 105
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -34,11 +34,18 @@ _MEMO = {}
 OFF_STATES = {"D", "C"}
 OFF_TEXT = re.compile(r"postponed|cancell?ed", re.IGNORECASE)
 
-# StatsAPI's abstractGameState collapses the dozen detailed states into three. "Preview"
-# covers Scheduled, Pre-Game and Warmup -- everything before first pitch. Anything else
-# means the game is under way or over, which is what DK locks on. Reading the abstract
-# state avoids parsing DK's "07/28/2026 10:10PM ET" strings and the timezone maths that
-# comes with them.
+# codedGameState is the authority on whether first pitch has happened. 'S' Scheduled,
+# 'P' Pre-Game -- and Pre-Game covers **Warmup**, which is the whole reason this is read
+# instead of abstractGameState.
+#
+# abstractGameState does NOT collapse the way it looks like it should: a game in Warmup
+# reports abstractGameState 'Live' while codedGameState is still 'P'. Trusting the abstract
+# state locked every player of a game roughly half an hour before it started -- observed
+# 2026-08-01, STL@TOR flagged "already under way" 18 minutes before first pitch, removing
+# 20 draftable players from the pool. Warmup is pre-game; DK takes entries throughout it.
+PREGAME_CODES = {"S", "P"}
+
+# Kept only as a fallback for a response with no codedGameState at all.
 NOT_STARTED = "Preview"
 
 
@@ -48,10 +55,14 @@ def _is_off(status):
 
 
 def _has_started(status):
-    state = str(status.get("abstractGameState") or "").strip()
-    # An empty state is treated as started: refusing to swap a player is recoverable,
-    # uploading a lineup DK rejects at the buzzer is not.
-    return state != NOT_STARTED
+    coded = str(status.get("codedGameState") or "").strip()
+    if coded:
+        # Any other known code -- In Progress, Final, Game Over, Suspended -- is past first
+        # pitch. Postponed and cancelled also land here and are masked off by `off`.
+        return coded not in PREGAME_CODES
+    # No coded state: fall back, and err toward started. Refusing to swap a player is
+    # recoverable; uploading a lineup DK rejects at the buzzer is not.
+    return str(status.get("abstractGameState") or "").strip() != NOT_STARTED
 
 
 def _start_et(game):

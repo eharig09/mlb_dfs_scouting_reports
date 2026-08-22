@@ -22,6 +22,7 @@ the error naming the player at fault, so it is worth catching here.
 
 import argparse
 import csv
+import filecmp
 import glob
 import os
 import re
@@ -259,17 +260,88 @@ def _player_index(rows):
     return by_pair, by_name, all_ids
 
 
-def read_template(path):
-    """Parse a DK upload file into (rows, kind, slot_start, player index)."""
-    with open(path, newline="", encoding="utf-8-sig") as handle:
-        rows = [list(row) for row in csv.reader(handle)]
+# The bulk template is a fixed frame around a player list: ten roster columns, five lines
+# of instructions, then the draft group's players from column 11 on. Reproduced verbatim
+# from DK's own download so a synthesized file is byte-comparable to a real one.
+BULK_INSTRUCTIONS = (
+    "1. Locate the player you want to select in the list below ",
+    "2. Copy the ID of your player (you can use the Name + ID column or the ID column) ",
+    "3. Paste the ID into the roster position desired ",
+    "4. You must include an ID for each player; you cannot use just the player's name ",
+    "5. You can create up to 500 lineups per file ",
+)
+
+# Columns 0-9 are the roster slots, 10 is a spacer, and the player list starts at 11.
+LIST_COLUMN = len(SLOT_ORDER) + 1
+
+# The player-list columns DK's template carries, in its order. A salary export is the same
+# list plus whatever else DK (or this project) has appended -- 'Status' and 'Starting' are
+# there now -- so the rows are projected onto these by name rather than copied across.
+LIST_COLUMNS = ("Position", "Name + ID", "Name", "ID", "Roster Position", "Salary",
+                "Game Info", "TeamAbbrev", "AvgPointsPerGame")
+
+
+def template_from_salaries(salary_path):
+    """Reconstruct a bulk upload template from the slate's DK salary export.
+
+    DK's bulk template and DK's salary export carry the *same* player list -- Position,
+    Name + ID, Name, ID, Roster Position, Salary, Game Info, TeamAbbrev -- because both are
+    generated from the draft group being entered. Everything that makes a template
+    slate-specific therefore already sits in the export, and the rest of the file is a
+    constant frame. So a night whose template was never downloaded is not actually missing
+    anything: the ids written are DK's own, for the right draft group, not invented.
+
+    Bulk only, and deliberately. An entries file also carries Entry ID, Contest ID and Entry
+    Fee, which DK issues per entry when you enter a contest -- nothing local can supply
+    those, so editing already-submitted entries (late swap) still needs the real download.
+    """
+    try:
+        with open(salary_path, newline="", encoding="utf-8-sig") as handle:
+            rows = [list(row) for row in csv.reader(handle)]
+    except OSError as error:
+        raise UploadError(f"cannot read {salary_path}: {error}") from None
+
+    rows = [row for row in rows if any(str(cell).strip() for cell in row)]
     if not rows:
-        raise UploadError(f"{path} is empty")
+        raise UploadError(f"{salary_path} is empty")
+    header = [str(cell).strip() for cell in rows[0]]
+    missing = [column for column in LIST_COLUMNS if column not in header]
+    if missing:
+        raise UploadError(
+            f"{os.path.basename(salary_path)} is missing {', '.join(missing)}, so it cannot "
+            f"stand in for an upload template"
+        )
+
+    # By name, not by position: the export carries columns the template does not, and
+    # copying it across verbatim would shift Game Info and the ids out from under anything
+    # reading the result by column.
+    picks = [header.index(column) for column in LIST_COLUMNS]
+    blanks = [""] * LIST_COLUMN
+
+    def listed(row):
+        return blanks + [row[i] if i < len(row) else "" for i in picks]
+
+    out = [list(SLOT_ORDER) + ["", "Instructions"]]
+    out.extend(blanks + [line] for line in BULK_INSTRUCTIONS)
+    out.append([" "])                                   # DK's own spacer row
+    out.extend(listed(row) for row in rows)
+    return out
+
+
+def parse_template(rows, source="template"):
+    """Rows of a DK upload file -> (rows, kind, slot_start, player index).
+
+    Split out from read_template so a synthesized template goes through exactly the same
+    validation and indexing as a downloaded one, rather than a parallel path that could
+    drift from it.
+    """
+    if not rows:
+        raise UploadError(f"{source} is empty")
 
     slot_start = _slot_start(rows[0])
     if slot_start is None:
         raise UploadError(
-            f"{path} is not a DK upload file — its header has no "
+            f"{source} is not a DK upload file — its header has no "
             f"{','.join(SLOT_ORDER)} columns"
         )
     kind = "entries" if str(rows[0][0]).strip() == "Entry ID" else "bulk"
@@ -277,14 +349,23 @@ def read_template(path):
     return rows, kind, slot_start, (by_pair, by_name, all_ids)
 
 
-def resolve_template_path(path, directory=TEMPLATE_DIR):
+def read_template(path):
+    """Parse a DK upload file into (rows, kind, slot_start, player index)."""
+    with open(path, newline="", encoding="utf-8-sig") as handle:
+        rows = [list(row) for row in csv.reader(handle)]
+    return parse_template(rows, source=path)
+
+
+def resolve_template_path(path, directory=TEMPLATE_DIR, date=None, teams=None):
     """Turn whatever the user typed for --template into a real path.
 
     DK's own filenames contain parentheses ("DKSalaries (3).csv"), which PowerShell splits
     on unless they are quoted exactly right -- so an exact-path-only flag turns a one-line
     command into a quoting puzzle. Accepted, in order: the path as given, the same name
     inside the template folder, and finally a unique case-insensitive substring of a
-    filename there.
+    filename there. Substring matches are narrowed by the requested date and lineup teams
+    before they are called ambiguous; a slate nickname such as ``turbo`` is commonly reused
+    every day and is not unique by itself.
     """
     if os.path.exists(path):
         return path
@@ -295,6 +376,32 @@ def resolve_template_path(path, directory=TEMPLATE_DIR):
     needle = os.path.splitext(os.path.basename(path))[0].lower()
     matches = [f for f in sorted(glob.glob(os.path.join(directory, "*.csv")))
                if needle and needle in os.path.basename(f).lower()]
+
+    if len(matches) > 1 and date:
+        dated = [(candidate, template_dates_for(candidate)) for candidate in matches]
+        matching = [candidate for candidate, dates in dated if str(date) in dates]
+        unknown = [candidate for candidate, dates in dated if not dates]
+        if matching:
+            matches = matching
+        elif unknown:
+            # Some hand-built templates have no embedded player list. They remain eligible,
+            # but a file that explicitly advertises another date never does.
+            matches = unknown
+        else:
+            listed = "\n".join(
+                f"    {candidate} ({', '.join(sorted(dates))})"
+                for candidate, dates in dated
+            )
+            raise UploadError(
+                f"--template '{path}' matches files, but none is for {date}:\n{listed}"
+            )
+
+    if len(matches) > 1 and teams:
+        covering = [candidate for candidate in matches
+                    if not _team_mismatch(candidate, teams)]
+        if covering:
+            matches = covering
+
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
@@ -314,6 +421,30 @@ def _team_mismatch(path, teams):
             f"it does not have {', '.join(sorted(teams - priced))}")
 
 
+def _dedupe_template_files(paths):
+    """Collapse byte-identical downloads, preferring the conventionally filed name."""
+    ordered = sorted(
+        paths,
+        key=lambda path: (
+            0 if os.path.basename(path).lower().startswith("dktemplate_") else 1,
+            os.path.basename(path).lower(),
+        ),
+    )
+    unique = []
+    for candidate in ordered:
+        duplicate = False
+        for kept in unique:
+            try:
+                if filecmp.cmp(candidate, kept, shallow=False):
+                    duplicate = True
+                    break
+            except OSError:
+                pass
+        if not duplicate:
+            unique.append(candidate)
+    return unique
+
+
 def _which_contest_hint(date, teams, directory, searched_downloads=False):
     """Name the contest whose template is missing, so it can be found on DK's site.
 
@@ -325,12 +456,13 @@ def _which_contest_hint(date, teams, directory, searched_downloads=False):
     from .salaries import list_salary_files
 
     lines = []
-    for info in list_salary_files(date):
+    exports = list_salary_files(date)
+    for info in exports:
         priced = set()
         for game in info.get("games") or []:
             priced |= {canon_team(part) for part in str(game).split("@")}
         if teams <= priced:
-            label = slate_for(info, date=date)
+            label = slate_for(info, date=date, peers=exports)
             lines.append(f"  You need the '{label}' slate's template "
                          f"({', '.join(info.get('games') or [])}).")
             break
@@ -353,7 +485,13 @@ def find_template(path=None, directory=TEMPLATE_DIR, date=None, teams=None,
     which surfaces much later as ten unresolvable ids and reads like a corrupted file.
     """
     if path:
-        found = resolve_template_path(path, directory)
+        found = resolve_template_path(path, directory, date=date, teams=teams)
+        found_dates = template_dates_for(found)
+        if date and found_dates and str(date) not in found_dates:
+            raise UploadError(
+                f"{os.path.basename(found)} is for {', '.join(sorted(found_dates))}, "
+                f"not the requested date {date}. Choose that date's template."
+            )
         problem = _team_mismatch(found, teams)
         if problem:
             raise UploadError(
@@ -381,7 +519,7 @@ def find_template(path=None, directory=TEMPLATE_DIR, date=None, teams=None,
         else:
             candidates.append(found)
 
-    candidates = candidates or entries_only
+    candidates = _dedupe_template_files(candidates or entries_only)
     if not candidates:
         raise UploadError(
             f"no DK upload template in {directory}/ — download one from the contest's "
@@ -621,6 +759,56 @@ def summarize(lineups):
     return "\n".join(lines)
 
 
+def resolve_template(date, slate=None, template=None, teams=None, searched_downloads=False):
+    """(rows, kind, slot_start, index, description) for tonight's upload template.
+
+    Prefers a real DK download, and rebuilds one from the slate's salary export when there
+    isn't one. A night whose template was never downloaded is not actually missing anything
+    for a *bulk* entry: DK's bulk template is a fixed frame wrapped around the draft group's
+    player list, and the salary export the board was priced from is that same player list --
+    same ids, same slate, issued by DK. `dfs.optimize --upload` has always done this; doing
+    it here too means the standalone path is not the one that dead-ends.
+
+    Two things it deliberately will not do:
+
+    * **Substitute for an explicit `--template`.** Naming a file that then failed is a
+      mistake worth surfacing, not one to paper over.
+    * **Stand in for an entries export.** Editing entries you have already submitted needs
+      Entry ID, Contest ID and Entry Fee, which DK issues per entry. Nothing local can
+      invent those, so late swap still needs the real download.
+    """
+    try:
+        path = find_template(template, date=date, teams=teams,
+                             searched_downloads=searched_downloads)
+        rows, kind, slot_start, index = read_template(path)
+        return rows, kind, slot_start, index, f"template {path} ({kind})"
+    except UploadError as error:
+        if template:
+            raise
+
+        from .salaries import AmbiguousSlate, find_salary_file
+        try:
+            salary_file = find_salary_file(date, slate=slate)
+        except AmbiguousSlate as choice:
+            names = ", ".join(candidate["name"] for candidate in choice.candidates)
+            raise UploadError(
+                f"{error}\n    Several DK exports match {date} ({names}), so a template "
+                f"cannot be rebuilt without knowing which contest. Pass --slate."
+            ) from None
+        if not salary_file:
+            raise
+
+        rows, kind, slot_start, index = parse_template(
+            template_from_salaries(salary_file), source=os.path.basename(salary_file))
+        print(f"[i] no DK template for {date} — {error}")
+        print(f"[i] rebuilding one from {os.path.basename(salary_file)}; its ids are DK's "
+              f"own for this slate.")
+        print("    Bulk entry only — editing entries you have already submitted (late "
+              "swap) still needs the real entries export.")
+        return (rows, kind, slot_start, index,
+                f"rebuilt from {os.path.basename(salary_file)} ({kind})")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Write selected optimizer lineups into a DraftKings upload file.")
@@ -667,10 +855,9 @@ def main():
             print(summarize(lineups))
             return
         selection = parse_selection(args.lineups, lineups.keys())
-        template_path = find_template(args.template, date=args.date,
-                                      teams=lineup_teams(lineups, selection),
-                                      searched_downloads=args.downloads)
-        rows, kind, slot_start, index = read_template(template_path)
+        rows, kind, slot_start, index, source = resolve_template(
+            args.date, slate=args.slate, template=args.template,
+            teams=lineup_teams(lineups, selection), searched_downloads=args.downloads)
         out_rows, notes = build_upload(rows, kind, slot_start, index, lineups, selection,
                                        contest=args.contest, date=args.date)
     except UploadError as error:
@@ -685,7 +872,7 @@ def main():
         out_path, version_note = resolve("upload", args.date, label, LINEUP_DIR, args.overwrite)
     write_upload(out_rows, out_path)
 
-    print(f"template {template_path} ({kind})")
+    print(source)
     for note in notes:
         print(f"  {note}")
     print(f"{len(selection)} lineup(s) -> {out_path}")

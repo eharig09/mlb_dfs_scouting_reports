@@ -1,0 +1,60 @@
+{
+  "generated_utc": "2026-08-03T00:45:55+00:00",
+  "date": "2026-08-01",
+  "slate": "main",
+  "seed": 7,
+  "elapsed_s": 0.63,
+  "report": {
+    "config": {
+      "name": "single-entry",
+      "entries": 300,
+      "entry_fee": 5.0,
+      "max_entries_per_user": 1,
+      "block_reuse": 0.0
+    },
+    "entries_built": 300,
+    "ownership": {
+      "target_mean": 6.233,
+      "simulated_mean": 5.051,
+      "mae": 2.626,
+      "correlation": 0.724,
+      "hitter_total": 800.0,
+      "pitcher_total": 200.0
+    },
+    "primary_size_share": {
+      "2": 0.0467,
+      "3": 0.1933,
+      "4": 0.2333,
+      "5": 0.5267
+    },
+    "primary_size_target": {
+      "1": 0.0094,
+      "2": 0.0961,
+      "3": 0.1242,
+      "4": 0.2338,
+      "5": 0.5365
+    },
+    "top_shapes": {
+      "5-2": 0.2833333333333333,
+      "5": 0.22,
+      "4-2": 0.11,
+      "3-2": 0.09666666666666666,
+      "4-3": 0.056666666666666664,
+      "4": 0.04666666666666667,
+      "3-3": 0.04,
+      "2-2": 0.03,
+      "3-2-2": 0.02666666666666667,
+      "5-3": 0.023333333333333334
+    },
+    "duplication": {
+      "unique_share": 0.9933,
+      "distinct_lineups": 299,
+      "max_duplicates": 2,
+      "mean_duplicates": 1.003
+    },
+    "salary": {
+      "mean": 49463,
+      "share_of_cap": 0.9893
+    }
+  }
+}

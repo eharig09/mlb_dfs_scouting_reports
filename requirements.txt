@@ -17,3 +17,10 @@ seaborn
 selenium
 tqdm
 webdriver-manager
+
+# Tests. Not needed to run the tools; needed to change them with confidence.
+pytest
+
+# Streamlit dashboard (added 2026-08-20)
+streamlit>=1.62
+altair>=6.2

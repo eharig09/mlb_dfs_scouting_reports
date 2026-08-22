@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import math
 import pickle
@@ -7,6 +8,7 @@ import os
 import datetime
 import sys
 import re
+from collections import deque
 
 # Running under the wrong interpreter is the most common failure here: plain `python` can
 # resolve to a system install ahead of .venv, and the only symptom is whichever dependency
@@ -42,6 +44,7 @@ from tqdm import tqdm
 from pybaseball import statcast_pitcher, pitching_stats, playerid_lookup, statcast_batter, batting_stats, statcast, playerid_reverse_lookup
 from models.stuff_model import calculate_stuff_plus
 from utils.cache import cached_dataframe_call, cached_json_request
+from utils.statcast_cache import load_statcast_range
 import statsapi
 import requests
 
@@ -481,13 +484,32 @@ def resolve_probable_pitcher(selected_game, side, team_abbr):
     print(f"⚠️ Falling back to current probable-pitchers page for {team_abbr}.")
     return None
 
-def resolve_probable_pitcher_v2(selected_game, side, team_abbr, exclude_ids=None):
+def _is_today(date):
+    """True when `date` could be today, in local or Eastern time.
+
+    Deliberately generous: the only caller uses it to *disable* a fallback, so the ambiguous
+    case (a date that is today somewhere) keeps the fallback rather than silently dropping a
+    starter the page really does know.
+    """
+    if not date:
+        return True
+    text = str(date)[:10]
+    return text in {datetime.now().strftime("%Y-%m-%d"),
+                    datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")}
+
+
+def resolve_probable_pitcher_v2(selected_game, side, team_abbr, exclude_ids=None, date=None):
     """Resolve a probable starter for the selected game and side with validation.
 
     exclude_ids: starters already committed to this team's other game today. On a
     doubleheader MLB often lists game 2 as TBD, and the fallback below scrapes a page that
     shows one starter per team per day -- so without this it confidently returns game 1's
     pitcher for game 2, which is impossible.
+
+    date: the game date. The page fallback has no date parameter -- it is *today's* board --
+    so for any other date it answers a different question and is skipped. Without this a
+    report two days out silently resolved every club to tonight's starter and reported it as
+    an announced probable, which is worse than not building the report at all.
     """
     exclude_ids = {int(p) for p in (exclude_ids or []) if p}
     pitchers = get_probable_pitchers_for_game(selected_game["game_id"])
@@ -500,6 +522,11 @@ def resolve_probable_pitcher_v2(selected_game, side, team_abbr, exclude_ids=None
         named_pitcher = lookup_player_id(remove_accents(probable_name))
         if named_pitcher:
             return named_pitcher
+
+    if not _is_today(date):
+        print(f"No probable posted for {team_abbr} on {date}; the probable-pitchers page "
+              f"only covers today, so it is not consulted.")
+        return None
 
     current_page_pitcher = get_pitchers_mlb(team_abbr)
     if current_page_pitcher and pitcher_belongs_to_team(current_page_pitcher, team_abbr):
@@ -517,6 +544,157 @@ def resolve_probable_pitcher_v2(selected_game, side, team_abbr, exclude_ids=None
 
     print(f"No validated probable pitcher found for {team_abbr}.")
     return None
+
+
+# ---------------------------------------------------------------------------------------
+# Starter resolution ladder
+#
+# MLB posts a probable when it feels like it, and until it does the report used to refuse to
+# build at all -- which is backwards, because the hours before a probable posts are exactly
+# when a board is being put together. Two sources fill the gap, in this order:
+#
+#   the DK salary file   DK's `Starting` column reads "P" for the arm a club is starting and
+#                        is usually populated well before MLB's feed. It is a statement about
+#                        tonight, not a model.
+#   the rotation model   `build_rotation` + `effective_starter`, already measured at 46.1%
+#                        walk-forward over 7,084 team-games against 17.5% for naming the
+#                        club's most frequent starter.
+#
+# Anything below `announced` is marked provisional and says so on the report. The point is
+# never to substitute a pitcher silently: a labelled guess is useful, an unlabelled one is
+# how a board becomes untrustworthy.
+# ---------------------------------------------------------------------------------------
+
+# What each `source` means in a sentence, for the line the report prints.
+STARTER_SOURCE_LABEL = {
+    "override": "manual override",
+    "announced": "announced probable",
+    "salary": "DraftKings salary file",
+    "rotation": "rotation model",
+    "bulk": "rotation model, bulk arm behind an opener",
+}
+
+
+def _roster_name_index(team_abbr, as_of_date=None):
+    """{normalized name: id} over the club's 40-man, for turning a DK spelling into an id.
+
+    Matching against the roster rather than a global name lookup does two jobs at once: it
+    resolves the id and it proves the arm is on this club, so a DK row carrying a traded
+    pitcher's old team cannot slip through.
+    """
+    index = {}
+    try:
+        entries = get_team_roster(team_abbr, "40Man", as_of_date=as_of_date) or []
+    except Exception as error:
+        print(f"⚠️ Roster unavailable for {team_abbr}: {error}")
+        return index
+    for entry in entries:
+        person = entry.get("person") or {}
+        pid, full = person.get("id"), person.get("fullName")
+        if pid and full:
+            index[_dk_normalize_name(full)] = int(pid)
+    return index
+
+
+def _dk_normalize_name(name):
+    """Fold a name the way the DK matcher does, so both sides of the join agree."""
+    try:
+        from dfs.salaries import normalize_name
+    except Exception:
+        return remove_accents(str(name or "")).lower().strip()
+    return normalize_name(name)
+
+
+def starter_from_salary_file(date, team_abbr, exclude_ids=None):
+    """The starter DraftKings has flagged for this club tonight, or None.
+
+    DK's export carries a `Starting` column reading "P" for the arm a club is starting, and
+    it is frequently populated hours before MLB posts a probable. Every slate for the date
+    is unioned: DK puts up several a night and any one game appears on a subset of them, so
+    reading only `main` misses most of the board (54 of 162 hitters on a checked date).
+
+    The flag also fires on a pitcher listed at RP, which is exactly what is wanted -- that
+    is an opener, and he is who the top of the order actually leads off against.
+    """
+    exclude_ids = {int(p) for p in (exclude_ids or []) if p}
+    try:
+        from dfs import salaries as dk_salaries
+    except Exception as error:
+        print(f"⚠️ DK salary lookup unavailable: {error}")
+        return None
+
+    try:
+        files = dk_salaries.list_salary_files(date=str(date))
+    except Exception as error:
+        print(f"⚠️ Could not list DK salary files for {date}: {error}")
+        return None
+    if not files:
+        return None
+
+    flagged = []
+    for info in files:
+        try:
+            frame = dk_salaries.load_salaries(info["path"])
+        except Exception:
+            continue
+        if frame is None or frame.empty or "DK Starting" not in frame.columns:
+            continue
+        mine = frame[frame["DK Starting"].fillna(False).astype(bool)
+                     & frame["DK Team"].eq(dk_salaries.canon_team(team_abbr))]
+        flagged.extend(str(n).strip() for n in mine["DK Name"] if str(n).strip())
+    if not flagged:
+        return None
+
+    # Prices are identical across a night's slates, but a club can be re-flagged between
+    # exports (a late scratch). The most common spelling wins, ties to the last file read.
+    names = {}
+    for name in flagged:
+        names[name] = names.get(name, 0) + 1
+    best = max(names, key=lambda n: names[n])
+    if len(names) > 1:
+        print(f"⚠️ DK salary files disagree on {team_abbr}'s starter "
+              f"({', '.join(sorted(names))}); taking {best}.")
+
+    roster = _roster_name_index(team_abbr, as_of_date=str(date))
+    pitcher_id = roster.get(_dk_normalize_name(best))
+    if not pitcher_id:
+        pitcher_id = lookup_player_id(remove_accents(best))
+        if pitcher_id and not pitcher_belongs_to_team(pitcher_id, team_abbr):
+            print(f"Warning: ignoring DK starter {best} for {team_abbr}; "
+                  f"current team does not match.")
+            return None
+    if not pitcher_id:
+        print(f"Warning: could not resolve DK starter '{best}' for {team_abbr} to a player id.")
+        return None
+    if int(pitcher_id) in exclude_ids:
+        print(f"Warning: ignoring DK starter {best} for {team_abbr}; "
+              f"already starting their other game today.")
+        return None
+    return int(pitcher_id)
+
+
+def starter_from_rotation(team_abbr, season, context_end, as_of_date=None, exclude_ids=None):
+    """`effective_starter` over this club's rotation -> (id, name, source, note) or Nones.
+
+    Wired here rather than inside `build_rotation` on purpose: the model is checked against
+    history on nights where a probable *was* posted, so it must never consult one.
+    """
+    exclude_ids = {int(p) for p in (exclude_ids or []) if p}
+    try:
+        rotation = build_rotation(team_abbr, season, context_end, as_of_date=as_of_date)
+    except Exception as error:
+        print(f"⚠️ Rotation model unavailable for {team_abbr}: {error}")
+        return None, None, None, ""
+    if exclude_ids:
+        rotation = dict(rotation)
+        rotation["candidates"] = [c for c in rotation.get("candidates") or []
+                                  if int(c.get("id", 0)) not in exclude_ids]
+        rotation["bulk_arms"] = [b for b in rotation.get("bulk_arms") or []
+                                 if int(b.get("id", 0)) not in exclude_ids]
+    pick = effective_starter(rotation)
+    if not pick or not pick.get("id"):
+        return None, None, None, (pick or {}).get("note", "")
+    return int(pick["id"]), pick.get("name"), pick.get("source"), pick.get("note", "")
 
 
 @lru_cache(maxsize=1024)
@@ -855,7 +1033,7 @@ def get_gmLI_from_fangraphs(id, season=2025):
 
 def calculate_entry_leverage_index(player_id, start_date, end_date):
     try:
-        df = cached_dataframe_call("statcast", statcast, start_date, end_date)
+        df = load_statcast_range(start_date, end_date)
         df = df[df['pitcher'] == player_id]
         if df.empty or 'home_win_exp' not in df.columns:
             return None
@@ -1097,16 +1275,110 @@ def get_recent_team_hitters(team_abbr, as_of_date=None):
     return hitters
 
 # ------------- HOT/COLD SCOUTING -------------
-def generate_hot_cold_hitters(team_abbr, days=14, end_date=None):
-    terminal_events = [
-        'single', 'double', 'triple', 'home_run', 'strikeout', 'strikeout_double_play',
-        'walk', 'intent_walk', 'hit_by_pitch', 'field_out', 'grounded_into_double_play',
-        'double_play', 'sac_fly', 'sac_bunt', 'force_out', 'other_out'
-    ]
+HOT_COLD_TERMINAL_EVENTS = [
+    'single', 'double', 'triple', 'home_run', 'strikeout', 'strikeout_double_play',
+    'walk', 'intent_walk', 'hit_by_pitch', 'field_out', 'grounded_into_double_play',
+    'double_play', 'sac_fly', 'sac_bunt', 'force_out', 'other_out', 'field_error',
+    'fielders_choice', 'fielders_choice_out',
+]
 
+# `estimated_woba_using_speedangle` is populated on strikeouts and walks as well as on
+# batted balls -- statcast fills in the wOBA value those outcomes are worth. So it is
+# already a per-plate-appearance quantity and adding walk weights on top double-counts
+# them. Verified on a full season: 479 of 493 plate appearances carry a value, including
+# every strikeout and walk.
+
+
+def _hot_cold_sorted(frame):
+    """Ordered by departure from the player's own season, which is what the panel is for."""
+    if frame is None or frame.empty:
+        return frame
+    key = ("ΔxwOBA" if "ΔxwOBA" in frame.columns and frame["ΔxwOBA"].notna().any()
+           else ("xwOBA" if "xwOBA" in frame.columns else None))
+    return frame.sort_values(key, ascending=False) if key else frame
+
+
+def _hot_cold_metrics(df):
+    """One hitter's line over whatever window `df` covers.
+
+    Split out so the recent window and the season baseline are computed by identical code:
+    a delta between two differently-computed numbers is not a delta.
+    """
+    if df is None or df.empty or 'events' not in df.columns:
+        return None
+    events = df['events'].astype('string')
+    terminal = df[events.isin(HOT_COLD_TERMINAL_EVENTS)]
+    pa = terminal[['game_pk', 'at_bat_number']].drop_duplicates().shape[0]
+    if not pa:
+        return None
+
+    hit_events = ['single', 'double', 'triple', 'home_run']
+    hits = int(events.isin(hit_events).sum())
+    total_bases = int((events == 'single').sum() + (events == 'double').sum() * 2
+                      + (events == 'triple').sum() * 3 + (events == 'home_run').sum() * 4)
+    # An at-bat is any terminal PA that is not a walk, HBP or sacrifice. Reaching on an
+    # error or a fielder's choice is an at-bat, and leaving those out inflated AVG.
+    non_ab = ['walk', 'intent_walk', 'hit_by_pitch', 'sac_fly', 'sac_bunt']
+    ab = int(events.isin(HOT_COLD_TERMINAL_EVENTS).sum() - events.isin(non_ab).sum())
+    walks = int(events.isin(['walk', 'intent_walk']).sum())
+    hbp = int((events == 'hit_by_pitch').sum())
+    strikeouts = int(events.isin(['strikeout', 'strikeout_double_play']).sum())
+
+    avg = hits / ab if ab else 0.0
+    obp = (hits + walks + hbp) / pa if pa else 0.0
+    slg = total_bases / ab if ab else 0.0
+
+    launch = pd.to_numeric(df.get('launch_speed'), errors='coerce')
+    batted = launch.notna()
+    hard_hit_pct = float((launch[batted] >= 95).sum() / batted.sum() * 100) if batted.sum() else 0.0
+
+    # Divided by plate appearances rather than by the count of priced rows, so the handful
+    # of PAs statcast never priced (catcher interference, untracked contact) are not quietly
+    # dropped from the denominator and inflating the rate.
+    priced = pd.to_numeric(df.get('estimated_woba_using_speedangle'), errors='coerce')
+    xwoba = float(priced.dropna().sum() / pa) if pa and priced.notna().any() else None
+
+    # Swing decisions. These stabilise in far fewer plate appearances than any rate built on
+    # batted-ball luck, so over a two-week window they are the part of the line that is
+    # actually measuring the hitter -- and a rising chase rate leads a slump rather than
+    # confirming it after the fact.
+    description = df['description'].astype('string') if 'description' in df.columns else pd.Series(dtype='string')
+    zone = pd.to_numeric(df.get('zone'), errors='coerce')
+    swings = description.isin(SWING_DESCRIPTIONS)
+    out_of_zone = zone >= 11
+    in_zone = zone.between(1, 9)
+    chases = int((swings & out_of_zone).sum())
+    chase_pct = chases / int(out_of_zone.sum()) * 100 if int(out_of_zone.sum()) else 0.0
+    zone_swings = int((swings & in_zone).sum())
+    zone_contact = int((swings & in_zone & ~description.isin(WHIFF_DESCRIPTIONS)).sum())
+    z_contact_pct = zone_contact / zone_swings * 100 if zone_swings else 0.0
+
+    return {
+        'PA': pa, 'AVG': avg, 'OBP': obp, 'SLG': slg, 'OPS': obp + slg,
+        'xwOBA': xwoba, 'HardHit%': hard_hit_pct,
+        'K%': strikeouts / pa * 100 if pa else 0.0,
+        'BB%': walks / pa * 100 if pa else 0.0,
+        'Chase%': chase_pct, 'Z-Con%': z_contact_pct,
+    }
+
+
+def generate_hot_cold_hitters(team_abbr, days=14, end_date=None):
+    """Recent form, measured against each hitter's own season rather than against .900 OPS.
+
+    **Why the baseline matters.** The old version called a hitter HOT at a .900 OPS over
+    fourteen days. For a .950-OPS bat that is a slump and for a .650 bat it is the best
+    fortnight of his career, so the flag was mostly re-reporting who the good hitters are --
+    the same confound the arsenal study had to control for (docs/arsenal_study.md). Status
+    now comes from the gap between the window and the player's own season to date.
+
+    **Why this is not more expensive.** Each hitter's season is pulled once and the recent
+    window is a slice of it, so the baseline is free and the whole function makes *fewer*
+    API calls than the previous per-window pull.
+    """
     today = datetime.strptime(end_date, "%Y-%m-%d") if end_date else datetime.today()
     start_date = (today - timedelta(days=days)).strftime('%Y-%m-%d')
     end_date = today.strftime('%Y-%m-%d')
+    season_start = _season_start_date(today.year)
 
     hitters = get_recent_team_hitters(team_abbr, as_of_date=end_date)
     data = []
@@ -1115,75 +1387,68 @@ def generate_hot_cold_hitters(team_abbr, days=14, end_date=None):
         name = hitter['name']
         player_id = hitter['id']
         try:
-            df = cached_dataframe_call("statcast_batter", statcast_batter, start_date, end_date, player_id)
-            if df.empty:
+            season = cached_dataframe_call("statcast_batter", statcast_batter,
+                                           season_start, end_date, player_id)
+            if season is None or season.empty:
+                continue
+            # The season pull starts March 1, which is spring training. Exhibition PAs in
+            # the baseline would move the very number the status flag is measured against.
+            if 'game_type' in season.columns:
+                season = season[season['game_type'].astype('string').eq('R')]
+            if season.empty:
+                continue
+            game_day = pd.to_datetime(season['game_date'], errors='coerce')
+            window = season[game_day >= pd.Timestamp(start_date)]
+
+            recent = _hot_cold_metrics(window)
+            baseline = _hot_cold_metrics(season)
+            if recent is None:
                 continue
 
-            pa = df[df['events'].isin(terminal_events)][['game_pk', 'at_bat_number']].drop_duplicates().shape[0]
+            delta = None
+            if baseline and recent['xwOBA'] is not None and baseline['xwOBA'] is not None:
+                delta = recent['xwOBA'] - baseline['xwOBA']
 
-            hit_events = ['single', 'double', 'triple', 'home_run']
-            hits = df['events'].isin(hit_events).sum()
-
-            total_bases = (
-                (df['events'] == 'single').sum() +
-                (df['events'] == 'double').sum() * 2 +
-                (df['events'] == 'triple').sum() * 3 +
-                (df['events'] == 'home_run').sum() * 4
-            )
-
-            out_events = ['field_out', 'strikeout', 'force_out', 'double_play', 'grounded_into_double_play', 'other_out']
-            ab = df['events'].isin(hit_events + out_events).sum()
-
-            walks = (df['events'] == 'walk').sum()
-            hbp = (df['events'] == 'hit_by_pitch').sum()
-
-            avg = hits / ab if ab else 0
-            obp = (hits + walks + hbp) / pa if pa else 0
-            slg = total_bases / ab if ab else 0
-            ops = obp + slg
-
-            batted_ball_events = {
-                'single', 'double', 'triple', 'home_run', 'field_out', 'force_out',
-                'grounded_into_double_play', 'double_play', 'field_error', 'sac_fly',
-                'fielders_choice', 'fielders_choice_out', 'other_out',
-            }
-            batted_balls = df[
-                df['events'].isin(batted_ball_events)
-                & pd.to_numeric(df.get('launch_speed'), errors='coerce').notna()
-            ]
-            hard_hit = (pd.to_numeric(batted_balls.get('launch_speed'), errors='coerce') >= 95).sum()
-            hard_hit_pct = (hard_hit / len(batted_balls)) * 100 if len(batted_balls) else 0
-            xwoba = df['estimated_woba_using_speedangle'].mean()
-
-            strikeouts = (df['events'] == 'strikeout').sum()
-            k_pct = (strikeouts / pa) * 100 if pa else 0
-            bb_pct = (walks / pa) * 100 if pa else 0
-
-            status = ""
-            if ops > 0.9 or (xwoba and xwoba > 0.370):
+            # Thresholds are in xwOBA points against a player's own norm. 40 points is
+            # roughly a standard deviation of a two-week window, so this flags a real
+            # departure rather than a good week.
+            if delta is None:
+                status = ""
+            elif delta >= 0.040:
                 status = "HOT"
-            elif ops < 0.6 or (xwoba and xwoba < 0.280):
+            elif delta <= -0.040:
                 status = "COLD"
+            else:
+                status = ""
 
             data.append({
                 'Name': name,
-                'PA': pa,
-                'AVG': round(avg, 3),
-                'OBP': round(obp, 3),
-                'SLG': round(slg, 3),
-                'OPS': round(ops, 3),
-                'xwOBA': round(xwoba, 3) if xwoba else None,
-                'HardHit%': round(hard_hit_pct, 2),
-                'K%': round(k_pct, 3),
-                'BB%': round(bb_pct, 3),
-                'Status': status
+                'PA': recent['PA'],
+                'AVG': round(recent['AVG'], 3),
+                'OBP': round(recent['OBP'], 3),
+                'SLG': round(recent['SLG'], 3),
+                'OPS': round(recent['OPS'], 3),
+                'xwOBA': round(recent['xwOBA'], 3) if recent['xwOBA'] is not None else None,
+                'Szn xwOBA': round(baseline['xwOBA'], 3) if baseline and baseline['xwOBA'] is not None else None,
+                'ΔxwOBA': round(delta, 3) if delta is not None else None,
+                'HardHit%': round(recent['HardHit%'], 1),
+                'Chase%': round(recent['Chase%'], 1),
+                'Z-Con%': round(recent['Z-Con%'], 1),
+                'K%': round(recent['K%'], 1),
+                'BB%': round(recent['BB%'], 1),
+                'Status': status,
             })
         except Exception as e:
             print(f"Failed for {name}: {e}")
             continue
-    df = pd.DataFrame(data).sort_values('OPS', ascending=False)
-    df = df[df['PA']>5]
-    return df
+    if not data:
+        return pd.DataFrame(columns=['Name', 'PA', 'AVG', 'OBP', 'SLG', 'OPS', 'xwOBA',
+                                     'Szn xwOBA', 'ΔxwOBA', 'HardHit%', 'Chase%',
+                                     'Z-Con%', 'K%', 'BB%', 'Status'])
+    df = pd.DataFrame(data)
+    df = df[df['PA'] > 5]
+    sort_col = 'ΔxwOBA' if df['ΔxwOBA'].notna().any() else 'OPS'
+    return df.sort_values(sort_col, ascending=False)
 
 # ------------- STARTING LINEUP + SEASON STATS -------------
 def get_hand_by_id(mlbam_id):
@@ -1929,13 +2194,6 @@ def get_starts_vs_team(pitcher_id, opponent_abbr, season, end_date=None):
     return game_logs
 
 
-def _utc_hour(iso_dt):
-    try:
-        return datetime.strptime(iso_dt, "%Y-%m-%dT%H:%M:%SZ").hour
-    except Exception:
-        return None
-
-
 def build_rest_schedule(team_abbr, team_id, starter_id, season, game_date, bullpen_df=None):
     """Rest + schedule-spot summary: team days rest, SP days rest, schedule note, bullpen availability."""
     columns = ["Team", "Rest", "SP Rest", "Note", "Pen A/T"]
@@ -1959,7 +2217,7 @@ def build_rest_schedule(team_abbr, team_id, starter_id, season, game_date, bullp
             rest_days = (gd - last).days
             team_rest = f"{rest_days}d"
             latest_game = max((g for g in finals if g["game_date"] == dset[-1]), key=lambda g: g.get("game_datetime", ""), default=None)
-            prior_hour = _utc_hour(latest_game.get("game_datetime", "")) if latest_game else None
+            prior_hour = _local_start(latest_game)[1] if latest_game else None
             # consecutive-game streak ending the day before
             streak, dd = 0, gd - timedelta(days=1)
             present = set(dset)
@@ -1975,11 +2233,14 @@ def build_rest_schedule(team_abbr, team_id, starter_id, season, game_date, bullp
     except Exception:
         pass
 
-    # Get-away day: night game yesterday, day game today.
+    # Get-away day: night game yesterday, day game today -- in venue-local time. Comparing
+    # UTC hours here called every Central/Mountain/Pacific night game a day game, so this
+    # note contradicted the Schedule Spot row beside it.
     try:
         today = statsapi.schedule(start_date=game_date, end_date=game_date, team=team_id)
-        today_hour = _utc_hour(today[0].get("game_datetime", "")) if today else None
-        if prior_hour is not None and today_hour is not None and prior_hour >= 23 and today_hour <= 21:
+        today_hour = _local_start(today[0])[1] if today else None
+        if (prior_hour is not None and today_hour is not None
+                and prior_hour >= DAY_GAME_BEFORE_HOUR and today_hour < DAY_GAME_BEFORE_HOUR):
             schedule_note = (schedule_note + "; get-away day") if schedule_note != "normal" else "get-away day"
     except Exception:
         pass
@@ -2134,6 +2395,88 @@ def _zone_abbr(zone_name, when):
         return local_noon.tzname() or "?"
     except (TypeError, ValueError, KeyError):
         return "?"
+
+
+# Schedule-spot bucketing, in one place.
+#
+# These rules are all about *local* time -- was yesterday a night game, is today a day game,
+# were there two games on one date -- and statsapi reports first pitch in UTC. A 7:10pm
+# Pacific start is 02:10 UTC the *next day*, so reading `.hour` and `.date()` off the UTC
+# stamp classified it as a day game on the wrong date. Measured over five dates of the 2026
+# schedule: 28% of games came out on the wrong side of day/night and 26% landed on the wrong
+# calendar date, which is why the note and the season table disagreed with each other and
+# both disagreed with reality.
+#
+# The season table and tonight's note used to implement these rules separately. They now
+# share `_schedule_spot`, because two copies of a six-branch precedence chain is the other
+# half of how they came to disagree.
+SCHEDULE_SPOTS = ["DH game 2", "Day after DH", "Extra rest (2+d)", "Get-away day",
+                  "Day after night", "Normal"]
+
+# Local first pitch before 5pm is a day game. MLB day games run 12:05-4:10 local and night
+# games start 6:05 or later, so nothing real sits near the boundary.
+DAY_GAME_BEFORE_HOUR = 17
+
+
+def _local_start(game):
+    """(local date, local hour) for one statsapi schedule row, or (None, None).
+
+    The date comes from `game_date` -- MLB's official date for the game, which is what the
+    standings and the doubleheader definition use -- and only the hour is derived from the
+    UTC stamp. That way a late start cannot roll the game onto the following date.
+    """
+    stamp = str(game.get("game_datetime") or "").strip()
+    official = str(game.get("game_date") or "")[:10]
+    try:
+        date = datetime.strptime(official, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None, None
+    zone = _venue_zone(game.get("venue_id"), game.get("home_id"))
+    try:
+        utc = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=ZoneInfo("UTC"))
+    except (TypeError, ValueError):
+        return date, None
+    if not zone:
+        return date, None
+    return date, utc.astimezone(ZoneInfo(zone)).hour
+
+
+def _local_starts(games):
+    """[(local date, local hour)] aligned with `games`, computed once per schedule pull."""
+    return [_local_start(game) for game in games]
+
+
+def _schedule_spot(games, starts, index, team_id, per_date):
+    """Which schedule-spot bucket `games[index]` falls in.
+
+    Doubleheader contexts are checked first: they are more specific than the rest spots
+    below and would otherwise be swallowed by "Day after night" or "Normal".
+    """
+    date, hour = starts[index]
+    if date is None:
+        return None
+    prev_date, prev_hour = starts[index - 1] if index > 0 else (None, None)
+
+    def opponent(game):
+        return game.get("away_id") if game.get("home_id") == team_id else game.get("home_id")
+
+    gap = (date - prev_date).days if prev_date else None
+    is_day = hour is not None and hour < DAY_GAME_BEFORE_HOUR
+    prev_night = prev_hour is not None and prev_hour >= DAY_GAME_BEFORE_HOUR
+    nxt = games[index + 1] if index + 1 < len(games) else None
+    series_ends = nxt is not None and opponent(nxt) != opponent(games[index])
+
+    if prev_date is not None and prev_date == date:
+        return "DH game 2"
+    if prev_date is not None and gap == 1 and per_date.get(prev_date, 0) >= 2:
+        return "Day after DH"
+    if gap is not None and gap >= 2:
+        return "Extra rest (2+d)"
+    if is_day and series_ends:
+        return "Get-away day"
+    if gap == 1 and prev_night and is_day:
+        return "Day after night"
+    return "Normal"
 
 
 def _league_regular_schedule_games(season, end_date):
@@ -2461,13 +2804,25 @@ def build_time_zone_context(
     }
 
 
+def _cached_team_schedule(start_date, end_date, team_id):
+    """Disk-cached `statsapi.schedule` for a team over a date range.
+
+    The library call is uncached network on every invocation; a full-season pull measured
+    ~20s, and two of them ran per report. The range carries the end date, so a new day
+    still busts the cache and picks up new results -- this only stops the same range being
+    re-fetched on every re-run of the same night.
+    """
+    return cached_dataframe_call("statsapi_schedule", statsapi.schedule,
+                                 start_date=start_date, end_date=end_date, team=team_id)
+
+
 def build_schedule_context_performance(team_id, season, end_date):
     """Team offense (R/G) and pitching (RA/G) split by schedule spot: extra rest, get-away day,
     day-after-night, and normal. Frames hitter/pitcher output through the rest notes."""
     columns = ["Context", "G", "R/G", "RA/G", "W-L"]
     try:
         raw = _regular_season(
-            statsapi.schedule(start_date=_season_start_date(season), end_date=end_date, team=team_id))
+            _cached_team_schedule(_season_start_date(season), end_date, team_id))
     except Exception:
         return pd.DataFrame(columns=columns)
     games = sorted([g for g in raw if g.get("status") == "Final" and g.get("game_datetime")], key=lambda g: g["game_datetime"])
@@ -2490,48 +2845,21 @@ def build_schedule_context_performance(team_id, season, end_date):
     # scheduled that way or a split admission. Both the nightcap itself and the following
     # day carry a real workload cost -- a short bullpen and a lineup that played 18 innings.
     from collections import Counter
-    per_date = Counter(_dt(g).date() for g in games if _dt(g))
+    starts = _local_starts(games)
+    per_date = Counter(date for date, _ in starts if date)
 
     buckets = {}
     for i, g in enumerate(games):
         rs, ra = _runs(g)
-        dt = _dt(g)
-        if rs is None or ra is None or dt is None:
+        if rs is None or ra is None:
             continue
-        prev = games[i - 1] if i > 0 else None
-        nxt = games[i + 1] if i + 1 < len(games) else None
-        prev_dt = _dt(prev) if prev else None
-        gap = (dt.date() - prev_dt.date()).days if prev_dt else None
-        is_day = dt.hour < 22
-        prev_night = prev_dt is not None and prev_dt.hour >= 22
-        series_ends = nxt is not None and _opp_id(nxt) != _opp_id(g)
-
-        same_day_earlier = prev_dt is not None and prev_dt.date() == dt.date()
-        after_doubleheader = (
-            prev_dt is not None
-            and (dt.date() - prev_dt.date()).days == 1
-            and per_date.get(prev_dt.date(), 0) >= 2
-        )
-
-        # Doubleheader contexts are checked first: they are more specific than the rest
-        # spots below and would otherwise be swallowed by "Day after night" or "Normal".
-        if same_day_earlier:
-            ctx = "DH game 2"
-        elif after_doubleheader:
-            ctx = "Day after DH"
-        elif gap is not None and gap >= 2:
-            ctx = "Extra rest (2+d)"
-        elif is_day and series_ends:
-            ctx = "Get-away day"
-        elif gap == 1 and prev_night and is_day:
-            ctx = "Day after night"
-        else:
-            ctx = "Normal"
+        ctx = _schedule_spot(games, starts, i, team_id, per_date)
+        if ctx is None:
+            continue
         buckets.setdefault(ctx, []).append((rs, ra, rs > ra))
 
     rows = []
-    for ctx in ["DH game 2", "Day after DH", "Extra rest (2+d)", "Get-away day",
-                "Day after night", "Normal"]:
+    for ctx in SCHEDULE_SPOTS:
         items = buckets.get(ctx, [])
         if not items:
             continue
@@ -2560,8 +2888,8 @@ def build_sweep_record(team_id, season, end_date):
     # progress -- without it, a 2-0 lead in a three-game set would book as a sweep.
     try:
         look_ahead = (datetime.strptime(str(end_date), "%Y-%m-%d") + timedelta(days=5)).strftime("%Y-%m-%d")
-        raw = _regular_season(
-            statsapi.schedule(start_date=_season_start_date(season), end_date=look_ahead, team=team_id))
+        raw = _regular_season(_cached_team_schedule(
+            _season_start_date(season), look_ahead, team_id))
     except Exception:
         return empty
     played = sorted([g for g in raw if g.get("status") == "Final" and g.get("game_datetime")
@@ -2625,49 +2953,27 @@ def build_tonight_schedule_context(team_id, season, game_date, dh_game=None):
         ))
     except Exception:
         return ""
-    games = sorted([g for g in raw if g.get("game_datetime")], key=lambda g: g["game_datetime"])
-
-    def _dt(g):
-        try:
-            return datetime.strptime(g["game_datetime"], "%Y-%m-%dT%H:%M:%SZ")
-        except Exception:
-            return None
-
-    def _opp_id(g):
-        return g.get("away_id") if g.get("home_id") == team_id else g.get("home_id")
+    # Completed games plus tonight's, matching what the season table counts. A postponement
+    # sitting in the window is not "the previous game" -- nobody played it -- and treating
+    # it as one moved the rest gap by a day and produced a spot the table never assigns.
+    games = sorted(
+        [g for g in raw
+         if g.get("game_datetime")
+         and (g.get("status") == "Final" or str(g.get("game_date") or "")[:10] == game_date)],
+        key=lambda g: g["game_datetime"])
 
     # On a doubleheader date there are two entries; dh_game picks which one is "tonight".
     todays = [i for i, g in enumerate(games) if g.get("game_date") == game_date]
     if not todays:
         return ""
     idx = todays[min(int(dh_game or 1), len(todays)) - 1]
-    today = games[idx]
-    dt = _dt(today)
-    if dt is None:
-        return ""
-    prev_dt = _dt(games[idx - 1]) if idx > 0 else None
-    nxt = games[idx + 1] if idx + 1 < len(games) else None
-    gap = (dt.date() - prev_dt.date()).days if prev_dt else None
-    is_day = dt.hour < 22
-    prev_night = prev_dt is not None and prev_dt.hour >= 22
-    series_ends = nxt is not None and _opp_id(nxt) != _opp_id(today)
 
     from collections import Counter
-    per_date = Counter(_dt(g).date() for g in games if _dt(g))
-
-    # Same precedence as the season table, so the highlighted row matches a real bucket.
-    if prev_dt is not None and prev_dt.date() == dt.date():
-        return "DH game 2"
-    if (prev_dt is not None and (dt.date() - prev_dt.date()).days == 1
-            and per_date.get(prev_dt.date(), 0) >= 2):
-        return "Day after DH"
-    if gap is not None and gap >= 2:
-        return "Extra rest (2+d)"
-    if is_day and series_ends:
-        return "Get-away day"
-    if gap == 1 and prev_night and is_day:
-        return "Day after night"
-    return "Normal"
+    starts = _local_starts(games)
+    per_date = Counter(date for date, _ in starts if date)
+    # The same function the season table buckets with, so the highlighted row is the row
+    # this note names rather than a second opinion about the same night.
+    return _schedule_spot(games, starts, idx, team_id, per_date) or ""
 
 
 def _first_value(df, column, default=""):
@@ -2716,6 +3022,8 @@ def build_starting_pitcher_info(pitcher_id, team_abbr, report_date, last_n=5, se
             "WHIP": None,
             "IP": None,
             "GS": None,
+            "HR": None,
+            "HR/9": None,
             "Last Starts": []
         }
 
@@ -2744,6 +3052,8 @@ def build_starting_pitcher_info(pitcher_id, team_abbr, report_date, last_n=5, se
         "WHIP": round(whip, 2),
         "IP": round(ip, 1),
         "GS": gs,
+        "HR": int(hr),
+        "HR/9": round(hr * 9 / ip, 2) if ip > 0 else None,
         "Last Starts": get_last_n_starts_direct(
             pitcher_id,
             season_used,
@@ -2812,6 +3122,8 @@ def get_today_starting_pitcher(pitcher_id, team_abbr="CIN", date=None, last_n=5,
             "WHIP": None,
             "IP": None,
             "GS": None,
+            "HR": None,
+            "HR/9": None,
             "Last Starts": []
         }
 
@@ -2841,6 +3153,8 @@ def get_today_starting_pitcher(pitcher_id, team_abbr="CIN", date=None, last_n=5,
         "WHIP": round(whip, 2),
         "IP": round(ip, 1),
         "GS": gs,
+        "HR": int(hr),
+        "HR/9": round(hr * 9 / ip, 2) if ip > 0 else None,
         "Last Starts": get_last_n_starts_direct(pitcher_id, season)
     }
 
@@ -3364,6 +3678,11 @@ def _park_context_for_venue(venue_name):
 
 
 CALIBRATION_PATH = os.path.join(PROJECT_ROOT, ".cache", "model_calibration.json")
+CALIBRATION_DATA_PATH = os.path.join(PROJECT_ROOT, ".cache", "model_calibration_games.csv")
+CALIBRATION_FEATURE_VERSION = 3
+CALIBRATION_TEAM_PRIOR_GAMES = 20.0
+CALIBRATION_RECENT_PRIOR_GAMES = 5.0
+CALIBRATION_RUNS_PRIOR = 4.4
 _STATCAST_DETAIL_MEMORY_CACHE = {}
 _STATCAST_SPLITS_MEMORY_CACHE = {}
 
@@ -3398,8 +3717,18 @@ def save_report_data_cache(date, away_team, home_team, report_args, advanced_con
     os.makedirs(REPORT_DATA_CACHE_DIR, exist_ok=True)
     path = _report_data_cache_path(date, away_team, home_team, dh_game)
     try:
+        summary = (advanced_context or {}).get("projection_summary", {})
+        calibration = {
+            "fingerprint": summary.get("Calibration Fingerprint", "unknown"),
+            "feature_version": summary.get("Calibration Feature Version"),
+            "created_at": summary.get("Calibration Created At"),
+        }
         with open(path, "wb") as f:
-            pickle.dump({"report_args": report_args, "advanced_context": advanced_context}, f)
+            pickle.dump({
+                "report_args": report_args,
+                "advanced_context": advanced_context,
+                "model_calibration": calibration,
+            }, f)
     except Exception as e:
         print(f"⚠️ Could not cache report data: {e}")
     return path
@@ -3413,7 +3742,91 @@ def load_report_data_cache(date, away_team, home_team, dh_game=None):
         return pickle.load(f)
 
 
-def refresh_cached_lineups(payload, date, away_team, home_team):
+def _lineup_signature(frame):
+    """A batting order as sorted (spot, name) pairs -- what has to match to call it unchanged.
+
+    None when the frame cannot describe a full order. That counts as *changed*, never as
+    same: an unreadable cache is exactly the situation a refresh exists for.
+    """
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return None
+    if not {"Name", "Spot"} <= set(frame.columns):
+        return None
+    spots = pd.to_numeric(frame["Spot"], errors="coerce")
+    names = frame["Name"].astype(str).map(remove_accents).str.strip()
+    pairs = [(int(spot), name) for spot, name in zip(spots, names)
+             if pd.notna(spot) and name]
+    return tuple(sorted(pairs)) if len(pairs) == 9 else None
+
+
+def _posted_lineup_signature(team_abbr, game_date):
+    """The same signature read off MLB's card, or None when no full card is posted."""
+    try:
+        posted = get_today_lineup(team_abbr, game_date=game_date)
+    except Exception as error:
+        print(f"⚠️ Could not read {team_abbr}'s lineup card ({error}); refreshing anyway.")
+        return None
+    pairs = [(int(player["#"]) // 100, remove_accents(str(player["Name"])).strip())
+             for player in (posted or []) if player.get("#") and player.get("Name")]
+    return tuple(sorted(pairs)) if len(pairs) == 9 else None
+
+
+def _cached_lineup_confidence(frame):
+    if not isinstance(frame, pd.DataFrame) or "Lineup Confidence" not in frame.columns:
+        return ""
+    values = frame["Lineup Confidence"].dropna().astype(str)
+    return values.iloc[0] if len(values) else ""
+
+
+def cached_lineups_are_current(payload, date, away_team, home_team, dh_game=None):
+    """Is the cached lineup already what MLB is showing? -> (bool, one-line reason).
+
+    Reading the two cards costs a schedule and a boxscore call per team. What it guards is
+    the whole of `refresh_cached_lineups`: hot/cold game logs and season stats for eighteen
+    hitters, the statcast splits and detail loads, and the composite plus offense-index
+    rebuild. So the probe pays for itself even on the runs where it saves nothing, and the
+    common case it is here for -- autosnap taking `confirmed` and then `final` an hour later
+    off an unchanged card -- it skips outright.
+
+    Every uncertain answer resolves to "not current". A refresh that was not needed costs
+    time; a skip that was needed prints yesterday's bats.
+    """
+    if dh_game:
+        # `get_today_lineup` reads schedule[0], so on a doubleheader it may answer about the
+        # other half. Comparing the wrong game's card is how a stale lineup gets kept.
+        return False, "doubleheader, so the card cannot be matched to the right game"
+
+    args = payload.get("report_args") or ()
+    if len(args) < 8:
+        return False, "cached payload predates the current report_args layout"
+
+    for team, frame in ((home_team, args[0]), (away_team, args[7])):
+        cached = _lineup_signature(frame)
+        confidence = _cached_lineup_confidence(frame)
+        posted = _posted_lineup_signature(team, date)
+
+        if posted is not None:
+            if cached != posted:
+                return False, f"{team}'s posted card differs from the cached lineup"
+            if not confidence.startswith("Confirmed"):
+                # Same nine names, but the cache recorded them as a guess. The refresh adds
+                # no players -- it upgrades the label the report prints, which is the
+                # difference between "this is the lineup" and "this is our guess".
+                return False, f"{team}'s lineup is posted but cached as '{confidence}'"
+            continue
+
+        # Nothing posted for this team. A projection is deterministic for a given date, so
+        # re-running it against the same history returns the same nine and there is nothing
+        # to learn. A Fallback is a projection that failed, and is worth retrying.
+        if confidence.startswith("Projected"):
+            continue
+        return False, (f"no card posted for {team} and the cached lineup is "
+                       f"'{confidence or 'unreadable'}'")
+
+    return True, "both cards already match the cached lineups"
+
+
+def refresh_cached_lineups(payload, date, away_team, home_team, dh_game=None, force=False):
     """Re-pull both lineups into a cached payload and rebuild what depends on them.
 
     A plain cache re-render replays whatever lineup was cached, which is usually a
@@ -3424,7 +3837,18 @@ def refresh_cached_lineups(payload, date, away_team, home_team):
     Carried over: arsenal / similar-pitcher / BvP columns, which are per-player and would
     need the similarity engine to rebuild. Players newly in the lineup simply have no
     values there, which is visible rather than wrong.
+
+    Returns the payload untouched when both cards already match what is cached -- see
+    `cached_lineups_are_current`. Pass force=True to rebuild regardless.
     """
+    if not force:
+        current, reason = cached_lineups_are_current(payload, date, away_team, home_team,
+                                                     dh_game=dh_game)
+        if current:
+            print(f"🔄 Lineups unchanged — kept the cached report ({reason}).")
+            return payload
+        print(f"🔄 Re-pulling lineups: {reason}.")
+
     args = list(payload["report_args"])
     context = payload["advanced_context"]
     season = int(str(date)[:4])
@@ -3466,15 +3890,93 @@ def refresh_cached_lineups(payload, date, away_team, home_team):
     return payload
 
 
+# How authoritative each starter source is. Only used to tell "firmed up" from "changed":
+# a report built off the rotation model and later confirmed by DK is the same report with a
+# better label, while a *different* arm is a different report entirely.
+STARTER_SOURCE_RANK = {"unknown": 0, "rotation": 1, "bulk": 1, "salary": 2,
+                       "announced": 3, "override": 4}
+
+
+def recheck_cached_starters(payload, date, away_team, home_team, dh_game=None):
+    """Re-run the starter ladder over a payload that was built on a provisional pick.
+
+    Returns `(action, detail)`:
+
+        "none"      nothing to do -- both starters were announced when the report was
+                    built, or nothing has moved since
+        "relabel"   the same arms, but a source firmed up (rotation model -> DK -> posted
+                    probable). The provenance is updated in the payload and saved; no table
+                    changes, only the line the report prints about where the name came from.
+        "rebuild"   a different arm is starting. Nothing here can be patched: the arsenal,
+                    the comparable-pitcher set, BvP, the platoon splits and the entire
+                    hitter composite were all built against the old pitcher, so the only
+                    honest answer is to generate the game again.
+
+    A payload with no `starter_provenance` predates the ladder, which means its starters
+    could only have come from an announced probable -- so it is left alone.
+    """
+    context = payload.get("advanced_context") or {}
+    provenance = context.get("starter_provenance") or {}
+    provisional = {side: pick for side, pick in provenance.items()
+                   if isinstance(pick, dict) and pick.get("provisional")}
+    if not provisional:
+        return "none", ""
+
+    args = payload.get("report_args") or ()
+    if len(args) < 13:
+        return "none", "cached payload predates the current report_args layout"
+    cached_ids = {"home": args[5], "away": args[12]}
+
+    try:
+        selected_game = choose_game(date, away_team=away_team, home_team=home_team,
+                                    dh_game=dh_game)
+    except Exception as error:
+        print(f"⚠️ Could not re-check starters for {away_team}@{home_team}: {error}")
+        return "none", ""
+    if not selected_game:
+        return "none", ""
+
+    season = int(str(date)[:4])
+    context_end = _pregame_end_date(date) or date
+    changed, firmed = [], []
+    for side, team in (("home", home_team), ("away", away_team)):
+        if side not in provisional:
+            continue
+        fresh = resolve_starter(selected_game, side, team, date,
+                                season=season, context_end=context_end)
+        if not fresh.get("id"):
+            continue
+        was = provenance.get(side) or {}
+        if int(fresh["id"]) != int(cached_ids[side] or 0):
+            changed.append(f"{team}: {was.get('name', 'unknown')} -> {fresh['name']} "
+                           f"({STARTER_SOURCE_LABEL.get(fresh['source'], fresh['source'])})")
+        elif STARTER_SOURCE_RANK.get(fresh["source"], 0) > STARTER_SOURCE_RANK.get(was.get("source"), 0):
+            firmed.append(f"{team}: {fresh['name']} confirmed by "
+                          f"{STARTER_SOURCE_LABEL.get(fresh['source'], fresh['source'])}")
+        provenance[side] = fresh
+
+    if changed:
+        return "rebuild", "; ".join(changed)
+    if firmed:
+        context["starter_provenance"] = provenance
+        save_report_data_cache(date, away_team, home_team, payload["report_args"],
+                               context, dh_game=dh_game)
+        return "relabel", "; ".join(firmed)
+    return "none", ""
+
+
 def render_report_from_cache(date, away_team, home_team, output_dir="scouting_reports",
                              dated_output=True, reports_root="scouting_reports", formats=("pdf",),
                              dfs_highlight=True, fast=False, refresh_lineups=False,
-                             dh_game=None, dfs_slate=None):
+                             dh_game=None, dfs_slate=None, force_lineup_refresh=False):
     """Rebuild report(s) from cached data. Fast layout iteration.
 
     fast:            skip every API refresh below and render purely from cache (~1s).
                      Boxscores, sweeps, schedule spot and umpire stay as cached.
-    refresh_lineups: re-pull lineups first, so a confirmed lineup actually appears.
+    refresh_lineups: re-pull lineups first, so a confirmed lineup actually appears. The
+                     cards are checked before anything is rebuilt, so a re-run against an
+                     unchanged lineup keeps the cached report instead of rebuilding it.
+    force_lineup_refresh: rebuild even when the cards match.
 
     formats: any of "pdf", "xlsx". Returns list of output paths.
     """
@@ -3483,7 +3985,37 @@ def render_report_from_cache(date, away_team, home_team, output_dir="scouting_re
         print(f"⚠️ No cached report data for {date} {away_team}@{home_team}. Run a full generation first.")
         return []
     if refresh_lineups:
-        payload = refresh_cached_lineups(payload, date, away_team, home_team)
+        action, detail = recheck_cached_starters(payload, date, away_team, home_team,
+                                                 dh_game=dh_game)
+        if action == "rebuild":
+            # Re-rendering from cache here would print the old starter's arsenal under the
+            # new starter's name, so the game is generated again instead. The first format
+            # rewrites the payload; the rest then come off it for free.
+            print(f"🔄 Starter changed ({detail}) — regenerating {away_team}@{home_team} "
+                  f"from source rather than re-rendering the cache.")
+            formats = tuple(formats)
+            rebuilt = list(generate_scouting_report_for_game(
+                date, away_team=away_team, home_team=home_team,
+                output_format=formats[0], reports_root=reports_root,
+                dated_output=dated_output, dfs_highlight=dfs_highlight,
+                dh_game=dh_game, dfs_slate=dfs_slate) or [])
+            for extra in formats[1:]:
+                rebuilt.extend(render_report_from_cache(
+                    date, away_team, home_team, reports_root=reports_root,
+                    dated_output=dated_output, formats=(extra,),
+                    dfs_highlight=dfs_highlight, fast=True, dh_game=dh_game,
+                    dfs_slate=dfs_slate) or [])
+            return [path for path in rebuilt if path]
+        if action == "relabel":
+            print(f"🔄 Starter provenance updated ({detail}).")
+        payload = refresh_cached_lineups(payload, date, away_team, home_team,
+                                         dh_game=dh_game, force=force_lineup_refresh)
+    payload, calibration_changed, calibration_provenance = refresh_payload_model_calibration(payload)
+    if calibration_changed:
+        print(
+            "Rebuilt cached scorecard for model calibration "
+            f"{calibration_provenance['fingerprint']}."
+        )
     cached_context = payload["advanced_context"]
     args = payload["report_args"]
     season = int(str(date)[:4])
@@ -3501,6 +4033,30 @@ def render_report_from_cache(date, away_team, home_team, output_dir="scouting_re
         for side, team in (("away", away_team), ("home", home_team)):
             team_id = get_team_id(team)
             cached_context[f"{side}_recent_boxscores"] = build_recent_boxscores(team_id, team, date)
+            # args[8]/args[1] are the away/home bullpen frames, same as the form tables above.
+            cached_context[f"{side}_bullpen_l5"] = build_bullpen_l5(
+                team_id, team, date, bullpen_df=args[8] if side == "away" else args[1])
+            # Tonight's comparison is against the OPPOSING probable: args[2] is the home
+            # starter (what the away lineup faces) and args[9] the away starter.
+            conditions = _tonight_conditions(
+                cached_context.get("environment"),
+                args[2] if side == "away" else args[9],
+                args[7] if side == "away" else args[0],
+                is_home=(side == "home"),
+                rest_schedule=cached_context.get(f"{side}_rest_schedule"))
+            cached_context[f"{side}_relevant_games"] = build_relevant_games(
+                team_id, team, date, conditions, season=season, context_end=context_end)
+            cached_context[f"{side}_comparable_games"] = build_comparable_games(
+                team_id, team, date, conditions, season=season, context_end=context_end)
+            # Statcast is memory-cached per process and disk-cached across runs, so this is
+            # a slice rather than a pull on any machine that has already built the night.
+            try:
+                cached_context[f"{side}_bullpen_batted"] = build_bullpen_batted(
+                    args[8] if side == "away" else args[1],
+                    load_statcast_detail(season=season, end_date=context_end),
+                    team_abbr=team, as_of_date=context_end)
+            except Exception as e:
+                print(f"⚠️ Bullpen batted-ball profile unavailable for {team}: {e}")
             cached_context[f"{side}_sweeps"] = build_sweep_record(team_id, season, context_end)
             cached_context[f"{side}_context_tonight"] = build_tonight_schedule_context(team_id, season, date, dh_game)
 
@@ -3531,6 +4087,78 @@ def render_report_from_cache(date, away_team, home_team, output_dir="scouting_re
                     cached_context[f"{side}_type_results"] = results
         except Exception as e:
             print(f"⚠️ Could not rebuild pitcher-type splits from cache: {e}")
+
+    # The batter arsenal tables gained "K Edge", which is the only arsenal number the DFS
+    # pitcher projection reads. A cached game without it does not fail -- the factor simply
+    # never fires -- so it has to be rebuilt rather than tolerated. Same one-time-upgrade
+    # pattern as the block above, keyed on the new column.
+    def _stale(key, marker=None):
+        frame = cached_context.get(key)
+        if not isinstance(frame, pd.DataFrame):
+            return True
+        return marker is not None and marker not in frame.columns
+
+    # Every artifact this block writes needs its own marker. Gating on one of them meant a
+    # cache that had already gained "K Edge" skipped the whole block, so the watchlist kept
+    # its old columns forever.
+    needs_arsenal_rebuild = not fast and (
+        any(_stale(f"{side}_batter_arsenal", "K Edge") for side in ("away", "home"))
+        or any(_stale(f"{side}_team_defense") for side in ("away", "home"))
+        or _stale("pitcher_watchlist", "K Edge")
+    )
+
+    # Opener profiles cached before the index was fixed carry innings counted as "distinct
+    # innings appeared in" and, in ~3% of games, the wrong follower. `bulk_repeat_rate` is
+    # the marker for a profile built by the corrected index.
+    needs_opener_rebuild = not fast and any(
+        not isinstance(cached_context.get(f"{side}_opener_profile"), dict)
+        or "bulk_repeat_rate" not in cached_context[f"{side}_opener_profile"]
+        for side in ("away", "home")
+    )
+    if needs_opener_rebuild:
+        try:
+            for side, pitcher_id in (("away", args[12]), ("home", args[5])):
+                cached_context[f"{side}_opener_profile"] = build_opener_profile(
+                    pitcher_id, season, context_end)
+        except Exception as e:
+            print(f"⚠️ Could not rebuild opener profiles from cache: {e}")
+
+    if needs_arsenal_rebuild:
+        try:
+            detail_df = load_statcast_detail(season=season, end_date=context_end)
+
+            def _arsenal_for(pitcher_id):
+                pitcher_id = _safe_number(pitcher_id, None)
+                if pitcher_id is None:
+                    return pd.DataFrame()
+                return generate_starter_arsenal(int(pitcher_id),
+                                                _season_start_date(season), context_end)
+
+            for side, team, lineup_df, opposing_arsenal, opposing_sp in (
+                ("away", away_team, args[7], _arsenal_for(args[5]), args[2]),
+                ("home", home_team, args[0], _arsenal_for(args[12]), args[9]),
+            ):
+                rebuilt = generate_batter_arsenal_matchups(
+                    team, lineup_df, opposing_arsenal,
+                    _pitcher_throw_code(opposing_sp), detail_df)
+                if not rebuilt.empty:
+                    cached_context[f"{side}_batter_arsenal"] = rebuilt
+                # Same statcast frame is already in memory, so team defence rides along.
+                cached_context[f"{side}_team_defense"] = build_team_defense(team, detail_df)
+            refresh_baserunning_heat_anchors(season)
+            # The watchlist is a cached artifact, so it keeps its old columns until it is
+            # rebuilt -- and it is the table the K edge is most worth reading in. Pure
+            # computation over frames already in hand, so it costs nothing to redo.
+            cached_context["pitcher_watchlist"] = build_pitcher_watchlist(
+                home_team, away_team, args[2], args[9],
+                cached_context.get("away_vs_home_arsenal"),
+                cached_context.get("home_vs_away_arsenal"),
+                cached_context.get("environment"),
+                away_batter_arsenal=cached_context.get("away_batter_arsenal"),
+                home_batter_arsenal=cached_context.get("home_batter_arsenal"),
+                away_lineup_df=args[7], home_lineup_df=args[0])
+        except Exception as e:
+            print(f"⚠️ Could not rebuild batter arsenal fits from cache: {e}")
 
     cached_context["scorecard"], cached_context["projection_summary"] = (
         apply_trusted_time_zone_baseline(
@@ -3574,7 +4202,7 @@ def load_statcast_detail(season=None, end_date=None, lookback_seasons=1):
         year_end = end_date if year == int(season) else f"{year}-10-31"
         if year_end < start_date:
             continue
-        df = cached_dataframe_call("statcast", statcast, start_date, year_end)
+        df = load_statcast_range(start_date, year_end)
         if df is not None and not df.empty:
             frames.append(df)
     if not frames:
@@ -3602,7 +4230,7 @@ def load_statcast_pitches(season=None, end_date=None, lookback_seasons=1):
         year_end = end_date if year == int(season) else f"{year}-10-31"
         if year_end < start_date:
             continue
-        df = cached_dataframe_call("statcast", statcast, start_date, year_end)
+        df = load_statcast_range(start_date, year_end)
         if df is not None and not df.empty:
             frames.append(df)
     out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
@@ -3629,52 +4257,103 @@ def _swing_metrics(pitches_df):
     return out
 
 
-def _pitcher_throw_code(pitcher_id):
+@lru_cache(maxsize=8192)
+def _person_record(player_id):
+    """One cached StatsAPI `people` record per id.
+
+    **Why this exists.** `statsapi.get` goes straight to the network -- it does not touch
+    the disk cache -- so the hand and name lookups re-fetched the same players on every
+    run: 24.6s and 17.5s of a 588s report, for data (a name, a throwing hand) that cannot
+    change mid-season. Routing through `cached_json_request` makes it permanent on disk,
+    and sharing one record between the two lookups halves the requests as well.
+    """
     try:
-        player_info = statsapi.get("people", {"personIds": pitcher_id})
-        return player_info["people"][0].get("pitchHand", {}).get("code")
+        data = cached_json_request("https://statsapi.mlb.com/api/v1/people",
+                                   params={"personIds": player_id}, namespace="statsapi")
+        people = data.get("people") or []
+        return people[0] if people else {}
     except Exception:
+        return {}
+
+
+@lru_cache(maxsize=None)
+def _throw_code_for_id(pitcher_id):
+    return (_person_record(pitcher_id).get("pitchHand") or {}).get("code")
+
+
+def _pitcher_throw_code(pitcher_id):
+    """L/R for a pitcher id, or None.
+
+    Memoized behind `_throw_code_for_id`: a throwing hand cannot change mid-season, and
+    the relevant-games table asks for one opposing starter per game per club, which
+    repeats heavily inside a division.
+
+    The unhashable guard is load-bearing rather than defensive. `cmp_pitcher_type_view`
+    calls this with a whole starter_info dict, which never resolved to a hand -- the old
+    body swallowed it in its bare `except` and returned None, so that call site has always
+    fallen through to its "same-handed" default. Caching turned that into a TypeError.
+    Returning None keeps the existing output exactly as it was; fixing what that call site
+    meant to pass is a separate change with a visible effect on the report text.
+    """
+    try:
+        hash(pitcher_id)
+    except TypeError:
         return None
+    return _throw_code_for_id(pitcher_id)
 
 
 def _player_name_from_id(player_id):
-    try:
-        player_info = statsapi.get("people", {"personIds": player_id})
-        return player_info["people"][0].get("fullName", str(player_id))
-    except Exception:
-        return str(player_id)
+    return _person_record(player_id).get("fullName") or str(player_id)
+
+
+_BATTING_LINE_BLANK = {"PA": 0, "AB": 0, "H": 0, "HR": 0, "BB": 0, "K": 0,
+                       "AVG": 0.0, "SLG": 0.0, "OPS_proxy": 0.0}
+_NON_AB_EVENTS = ("walk", "intent_walk", "hit_by_pitch", "sac_fly", "sac_bunt")
 
 
 def _events_to_batting_line(events_df):
-    if events_df is None or events_df.empty:
-        return {"PA": 0, "AB": 0, "H": 0, "HR": 0, "BB": 0, "K": 0, "AVG": 0.0, "SLG": 0.0, "OPS_proxy": 0.0}
+    """Batting line from statcast event rows.
 
-    pa_events = events_df[events_df["events"].isin(TERMINAL_PA_EVENTS)].copy()
-    if pa_events.empty:
-        return {"PA": 0, "AB": 0, "H": 0, "HR": 0, "BB": 0, "K": 0, "AVG": 0.0, "SLG": 0.0, "OPS_proxy": 0.0}
+    Counts come from a single `value_counts` over the one column that matters. The previous
+    version copied the whole 119-column frame (which it never mutated) and then made eight
+    separate passes over `events`; at 3,816 calls per report that was 49s of a 588s run.
+    Verified against the previous implementation on 800 real batter/game slices.
 
-    ab_events = pa_events[~pa_events["events"].isin({"walk", "intent_walk", "hit_by_pitch", "sac_fly", "sac_bunt"})]
-    hits = pa_events["events"].isin(HIT_EVENTS).sum()
-    doubles = pa_events["events"].eq("double").sum()
-    triples = pa_events["events"].eq("triple").sum()
-    homers = pa_events["events"].eq("home_run").sum()
+    One deliberate difference: a frame with no `events` column returns a blank line, where
+    the previous version raised KeyError. Blank is already this function's answer for "no
+    data", so that path now degrades the way the empty-frame path always has.
+    """
+    if events_df is None or events_df.empty or "events" not in events_df.columns:
+        return dict(_BATTING_LINE_BLANK)
+
+    events = events_df["events"]
+    counts = events[events.isin(TERMINAL_PA_EVENTS)].value_counts()
+    pa = int(counts.sum())
+    if not pa:
+        return dict(_BATTING_LINE_BLANK)
+
+    def total(*names):
+        return int(sum(int(counts.get(name, 0)) for name in names))
+
+    hits = total(*HIT_EVENTS)
+    doubles, triples, homers = total("double"), total("triple"), total("home_run")
     singles = max(0, hits - doubles - triples - homers)
     total_bases = singles + (2 * doubles) + (3 * triples) + (4 * homers)
-    walks = pa_events["events"].isin({"walk", "intent_walk"}).sum()
-    hbp = pa_events["events"].eq("hit_by_pitch").sum()
-    strikeouts = pa_events["events"].isin({"strikeout", "strikeout_double_play"}).sum()
-    pa = len(pa_events)
-    ab = len(ab_events)
+    walks = total("walk", "intent_walk")
+    hbp = total("hit_by_pitch")
+    strikeouts = total("strikeout", "strikeout_double_play")
+    ab = pa - total(*_NON_AB_EVENTS)
+
     avg = hits / ab if ab else 0.0
     obp = (hits + walks + hbp) / pa if pa else 0.0
     slg = total_bases / ab if ab else 0.0
     return {
-        "PA": int(pa),
+        "PA": pa,
         "AB": int(ab),
-        "H": int(hits),
-        "HR": int(homers),
-        "BB": int(walks),
-        "K": int(strikeouts),
+        "H": hits,
+        "HR": homers,
+        "BB": walks,
+        "K": strikeouts,
         "AVG": round(avg, 3),
         "SLG": round(slg, 3),
         "OPS_proxy": round(obp + slg, 3),
@@ -3684,8 +4363,16 @@ def _events_to_batting_line(events_df):
 def _contact_quality(events_df):
     if events_df is None or events_df.empty:
         return {"xwOBA": 0.0, "HardHit%": 0.0, "Avg EV": 0.0, "Whiff%": 0.0}
-    xwoba = pd.to_numeric(events_df.get("estimated_woba_using_speedangle"), errors="coerce").mean()
-    batted = events_df[pd.to_numeric(events_df.get("launch_speed"), errors="coerce").notna()].copy()
+    # `DataFrame.get` on a missing column returns None, and pd.to_numeric(None) is a scalar
+    # nan -- which then fails on `.notna()`. Real statcast frames always carry these, but a
+    # caller passing a trimmed frame got an AttributeError instead of zeros.
+    def column(name):
+        values = events_df[name] if name in events_df.columns else pd.Series(dtype=float,
+                                                                             index=events_df.index)
+        return pd.to_numeric(values, errors="coerce")
+
+    xwoba = column("estimated_woba_using_speedangle").mean()
+    batted = events_df[column("launch_speed").notna()].copy()
     hard_hit = (pd.to_numeric(batted.get("launch_speed"), errors="coerce") >= 95).mean() * 100 if not batted.empty else 0.0
     avg_ev = pd.to_numeric(batted.get("launch_speed"), errors="coerce").mean() if not batted.empty else 0.0
     descriptions = events_df.get("description", pd.Series(dtype=str)).astype(str)
@@ -3912,8 +4599,32 @@ def generate_lineup_similarity_report(lineup_df, starter_arsenal_df, starter_han
     return pd.DataFrame(rows, columns=columns).sort_values(["OPS_proxy", "PA"], ascending=False)
 
 
+# Plate appearances of prior weight pulling a hitter's arsenal K% back toward his own K%
+# against that hand. A weighted arsenal sample is ~18 PA at the median, so the raw rate is
+# mostly noise; 25 PA of shrinkage was the value that maximized the measured effect on
+# starter scoring across 13,158 starts (2024-26). See docs/arsenal_study.md.
+ARSENAL_K_SHRINK_PA = 25.0
+
+
+def _arsenal_k_edge(arsenal_k_rate, arsenal_pa, baseline_k_rate):
+    """How much more this hitter strikes out against this shape than he usually does.
+
+    Positive is a pitcher's edge. The level alone is nearly useless -- a high-strikeout
+    hitter posts a high K% against every arsenal -- so what is reported is the residual
+    against his own rate versus the same hand, shrunk for sample size.
+    """
+    if baseline_k_rate is None or arsenal_pa is None:
+        return None
+    observed = float(arsenal_pa or 0.0)
+    shrunk = ((float(arsenal_k_rate or 0.0) * observed
+               + float(baseline_k_rate) * ARSENAL_K_SHRINK_PA)
+              / (observed + ARSENAL_K_SHRINK_PA))
+    return round(shrunk - float(baseline_k_rate), 2)
+
+
 def generate_batter_arsenal_matchups(team_abbr, lineup_df, starter_arsenal_df, starter_hand, statcast_df):
-    columns = ["Team", "Name", "PA", "AB", "OPS", "xwOBA", "SLG", "HR", "K%", "HardHit%", "Whiff%", "Fit", "Arsenal Score", "Basis"]
+    columns = ["Team", "Name", "PA", "AB", "OPS", "xwOBA", "SLG", "HR", "K%", "K% vs Hand",
+               "K Edge", "HardHit%", "Whiff%", "Fit", "Arsenal Score", "Basis"]
     if (
         lineup_df is None or lineup_df.empty or "ID" not in lineup_df.columns
         or statcast_df is None or statcast_df.empty
@@ -3930,10 +4641,13 @@ def generate_batter_arsenal_matchups(team_abbr, lineup_df, starter_arsenal_df, s
     if not batter_ids:
         return pd.DataFrame(columns=columns)
 
-    df = statcast_df[statcast_df["batter"].isin(batter_ids)].copy()
-    if starter_hand and "p_throws" in df.columns:
-        df = df[df["p_throws"].astype(str).str.strip().eq(starter_hand)]
-    df = _filter_to_arsenal_shape(df, starter_arsenal_df, top_pitches, min_pa=max(30, len(batter_ids) * 4))
+    hand_df = statcast_df[statcast_df["batter"].isin(batter_ids)].copy()
+    if starter_hand and "p_throws" in hand_df.columns:
+        hand_df = hand_df[hand_df["p_throws"].astype(str).str.strip().eq(starter_hand)]
+    # `hand_df` is everything the hitter sees from this hand; `df` narrows it to the
+    # starter's pitch shapes. The pair is what makes an edge measurable -- the same
+    # source, the same window, the same hand, differing only in the shape filter.
+    df = _filter_to_arsenal_shape(hand_df, starter_arsenal_df, top_pitches, min_pa=max(30, len(batter_ids) * 4))
 
     id_to_name = dict(zip(pd.to_numeric(lineup_df["ID"], errors="coerce"), lineup_df.get("Name")))
     basis = _format_pitch_weight_basis(starter_hand, pitch_weights, starter_arsenal_df)
@@ -3943,6 +4657,10 @@ def generate_batter_arsenal_matchups(team_abbr, lineup_df, starter_arsenal_df, s
         metrics = _weighted_arsenal_metrics(batter_events, pitch_weights)
         pa = metrics["PA"]
         k_rate = metrics["K%"]
+        hand_line = _events_to_batting_line(hand_df[hand_df["batter"] == batter_id])
+        baseline_k = (round((hand_line["K"] / hand_line["PA"]) * 100, 1)
+                      if hand_line["PA"] >= 25 else None)
+        k_edge = _arsenal_k_edge(k_rate, pa, baseline_k)
         ops = metrics["OPS"]
         xwoba = metrics["xwOBA"]
         if pa >= 10 and (ops >= 0.850 or xwoba >= 0.360):
@@ -3965,6 +4683,8 @@ def generate_batter_arsenal_matchups(team_abbr, lineup_df, starter_arsenal_df, s
             "SLG": metrics["SLG"],
             "HR": metrics["HR"],
             "K%": k_rate,
+            "K% vs Hand": baseline_k,
+            "K Edge": k_edge,
             "HardHit%": metrics["HardHit%"],
             "Whiff%": metrics["Whiff%"],
             "Fit": fit,
@@ -3981,56 +4701,140 @@ def generate_batter_arsenal_matchups(team_abbr, lineup_df, starter_arsenal_df, s
 PITCH_PROFILE_TYPES = ["FF", "SI", "FC", "SL", "ST", "CU", "KC", "CH", "FS", "SPL", "SV", "SW"]
 
 
+_PITCHER_PROFILE_CACHE = {}
+_PROFILE_NUMERIC = {"Velo": "release_speed", "Spin": "release_spin_rate",
+                    "HB": "pfx_x", "VB": "pfx_z"}
+# pfx_x / pfx_z are in feet; the report shows inches.
+_PROFILE_SCALE = {"Velo": 1.0, "Spin": 1.0, "HB": 12.0, "VB": 12.0}
+_PROFILE_ROUND = {"Velo": 1, "Spin": 0, "HB": 1, "VB": 1}
+
+
+def _profile_frame_key(statcast_df, min_pitches):
+    """Cheap fingerprint for a statcast frame, for memoising the profile table.
+
+    The frame is a season (or three) of pitches and is rebuilt by `.copy()` on each
+    `load_statcast_*` call, so identity is useless; length plus the first and last game
+    separates the 1-season from the 3-season frame, which is all that varies here.
+    """
+    if statcast_df is None or statcast_df.empty:
+        return ("empty", min_pitches)
+    game = statcast_df["game_pk"] if "game_pk" in statcast_df.columns else statcast_df.index
+    return (len(statcast_df), int(min_pitches),
+            int(pd.to_numeric(game.iat[0], errors="coerce") or 0),
+            int(pd.to_numeric(game.iat[-1], errors="coerce") or 0))
+
+
+def _mode_by_pitcher(df, column):
+    """Per-pitcher modal value, matching `groupby(...)[col].mode().iloc[0]`.
+
+    `.mode()` returns its values sorted, so `.iloc[0]` breaks a tie on the lowest value;
+    sorting by (count desc, value asc) and taking the first reproduces that exactly.
+    """
+    if column not in df.columns:
+        return pd.Series(dtype=object)
+    counts = df.dropna(subset=[column]).groupby(["pitcher", column], observed=True).size()
+    if counts.empty:
+        return pd.Series(dtype=object)
+    counts = counts.reset_index(name="_n").sort_values(
+        ["pitcher", "_n", column], ascending=[True, False, True], kind="mergesort")
+    return counts.groupby("pitcher", observed=True)[column].first()
+
+
 def _pitcher_profile_table(statcast_df, min_pitches=150):
+    """Per-pitcher arsenal profile: overall shape plus one block per pitch type.
+
+    **Why this is vectorised and memoised.** It used to walk ~800 pitchers in Python and,
+    for each, mask the group once per pitch type and call `pd.to_numeric(...).mean()` on
+    four columns -- roughly 48,000 pandas operations over a multi-season frame. Measured at
+    81s per call, and `generate_pitcher_similarity_report` calls it four times per report
+    with identical arguments, so it was 325s of a 588s report: 55% of the whole run. Two
+    groupbys and a cache do the same work.
+    """
     base_columns = ["PitcherID", "Name", "Throws", "Pitches", "Velo", "Spin", "HB", "VB"]
     for pitch in PITCH_PROFILE_TYPES:
         base_columns.extend([f"Mix_{pitch}", f"Velo_{pitch}", f"Spin_{pitch}", f"HB_{pitch}", f"VB_{pitch}"])
     if statcast_df is None or statcast_df.empty or "pitcher" not in statcast_df.columns:
         return pd.DataFrame(columns=base_columns)
 
-    df = statcast_df.dropna(subset=["pitcher", "pitch_type"]).copy()
+    cache_key = _profile_frame_key(statcast_df, min_pitches)
+    cached = _PITCHER_PROFILE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached.copy()
+
+    df = statcast_df.dropna(subset=["pitcher", "pitch_type"])
     if df.empty:
         return pd.DataFrame(columns=base_columns)
+    keep = ["pitcher", "pitch_type"] + [c for c in ("p_throws", "player_name") if c in df.columns]
+    keep += [c for c in _PROFILE_NUMERIC.values() if c in df.columns]
+    df = df[keep].copy()
     df["pitcher"] = pd.to_numeric(df["pitcher"], errors="coerce")
     df = df.dropna(subset=["pitcher"])
+    if df.empty:
+        return pd.DataFrame(columns=base_columns)
+    # Converted once for the whole frame rather than once per pitcher per pitch type.
+    for source in _PROFILE_NUMERIC.values():
+        if source in df.columns:
+            df[source] = pd.to_numeric(df[source], errors="coerce")
 
-    grouped = df.groupby("pitcher")
-    rows = []
-    for pitcher_id, group in grouped:
-        pitch_count = len(group)
-        if pitch_count < min_pitches:
-            continue
-        pitch_mix = group["pitch_type"].value_counts(normalize=True)
-        throws = group["p_throws"].mode().iloc[0] if "p_throws" in group and not group["p_throws"].mode().empty else ""
-        if "player_name" in group.columns and not group["player_name"].dropna().empty:
-            raw_name = str(group["player_name"].dropna().mode().iloc[0])
-            if "," in raw_name:
-                last, first = [part.strip() for part in raw_name.split(",", 1)]
-                pitcher_name = f"{first} {last}".strip()
+    counts = df.groupby("pitcher", observed=True).size()
+    qualified = counts[counts >= min_pitches]
+    if qualified.empty:
+        return pd.DataFrame(columns=base_columns)
+    df = df[df["pitcher"].isin(qualified.index)]
+
+    out = pd.DataFrame({"PitcherID": qualified.index.astype(int),
+                        "Pitches": qualified.to_numpy()})
+    overall = df.groupby("pitcher", observed=True)[
+        [c for c in _PROFILE_NUMERIC.values() if c in df.columns]].mean()
+    for label, source in _PROFILE_NUMERIC.items():
+        values = overall[source].reindex(qualified.index) if source in overall.columns else np.nan
+        out[label] = np.round(
+            np.asarray(values, dtype=float) * _PROFILE_SCALE[label], _PROFILE_ROUND[label])
+
+    throws = _mode_by_pitcher(df, "p_throws").reindex(qualified.index)
+    out["Throws"] = throws.fillna("").to_numpy()
+
+    names = _mode_by_pitcher(df, "player_name").reindex(qualified.index)
+    resolved = []
+    for pitcher_id, raw in zip(qualified.index, names.to_numpy()):
+        if isinstance(raw, str) and raw:
+            if "," in raw:
+                last, first = [part.strip() for part in raw.split(",", 1)]
+                resolved.append(f"{first} {last}".strip())
             else:
-                pitcher_name = raw_name
+                resolved.append(raw)
         else:
-            pitcher_name = _player_name_from_id(int(pitcher_id))
-        row = {
-            "PitcherID": int(pitcher_id),
-            "Name": pitcher_name,
-            "Throws": throws,
-            "Pitches": pitch_count,
-            "Velo": round(pd.to_numeric(group.get("release_speed"), errors="coerce").mean(), 1),
-            "Spin": round(pd.to_numeric(group.get("release_spin_rate"), errors="coerce").mean(), 0),
-            "HB": round(pd.to_numeric(group.get("pfx_x"), errors="coerce").mean() * 12, 1),
-            "VB": round(pd.to_numeric(group.get("pfx_z"), errors="coerce").mean() * 12, 1),
-        }
-        for pitch in PITCH_PROFILE_TYPES:
-            pitch_df = group[group["pitch_type"] == pitch]
-            row[f"Mix_{pitch}"] = round(float(pitch_mix.get(pitch, 0.0)), 3)
-            row[f"Velo_{pitch}"] = round(pd.to_numeric(pitch_df.get("release_speed"), errors="coerce").mean(), 1) if not pitch_df.empty else 0.0
-            row[f"Spin_{pitch}"] = round(pd.to_numeric(pitch_df.get("release_spin_rate"), errors="coerce").mean(), 0) if not pitch_df.empty else 0.0
-            row[f"HB_{pitch}"] = round(pd.to_numeric(pitch_df.get("pfx_x"), errors="coerce").mean() * 12, 1) if not pitch_df.empty else 0.0
-            row[f"VB_{pitch}"] = round(pd.to_numeric(pitch_df.get("pfx_z"), errors="coerce").mean() * 12, 1) if not pitch_df.empty else 0.0
-        rows.append(row)
+            resolved.append(_player_name_from_id(int(pitcher_id)))
+    out["Name"] = resolved
 
-    return pd.DataFrame(rows, columns=base_columns)
+    per_pitch = df.groupby(["pitcher", "pitch_type"], observed=True).agg(
+        _n=("pitch_type", "size"),
+        **{label: (source, "mean") for label, source in _PROFILE_NUMERIC.items()
+           if source in df.columns})
+    mix = (per_pitch["_n"] / per_pitch["_n"].groupby(level=0).transform("sum"))
+
+    for pitch in PITCH_PROFILE_TYPES:
+        try:
+            block = per_pitch.xs(pitch, level="pitch_type")
+            block_mix = mix.xs(pitch, level="pitch_type")
+        except KeyError:
+            out[f"Mix_{pitch}"] = 0.0
+            for label in _PROFILE_NUMERIC:
+                out[f"{label}_{pitch}"] = 0.0
+            continue
+        out[f"Mix_{pitch}"] = np.round(
+            np.nan_to_num(block_mix.reindex(qualified.index).to_numpy(dtype=float)), 3)
+        for label in _PROFILE_NUMERIC:
+            values = (block[label].reindex(qualified.index).to_numpy(dtype=float)
+                      if label in block.columns
+                      else np.full(len(qualified), np.nan))
+            # A pitch a pitcher never threw reads 0.0, as it did before.
+            values = np.where(np.isnan(values), 0.0, values * _PROFILE_SCALE[label])
+            out[f"{label}_{pitch}"] = np.round(values, _PROFILE_ROUND[label])
+
+    out = out.reindex(columns=base_columns).reset_index(drop=True)
+    _PITCHER_PROFILE_CACHE[cache_key] = out
+    return out.copy()
 
 
 def generate_pitcher_similarity_report(starter_pitcher_id, statcast_df, min_pitches=80, top_n=14):
@@ -4435,6 +5239,129 @@ def generate_batter_pitcher_matchups(lineup_df, pitcher_id, season, end_date, lo
     return pd.DataFrame(rows, columns=columns).sort_values(["PA", "SLG"], ascending=False) if rows else pd.DataFrame(columns=columns)
 
 
+def generate_batter_bullpen_matchups(lineup_df, bullpen_df, season, end_date,
+                                     lookback_seasons=5, available_only=False):
+    """Career line for each batter against the opposing bullpen *as a whole*.
+
+    The starter matchup table asks "how has this hitter done against this arm", which is the
+    question with the worst sample in the report -- a median BvP line is single digits of
+    plate appearances. Pooling every reliever asks a coarser question with a much better
+    sample: a hitter who has faced a division rival's pen for four years can have a hundred
+    plate appearances here against nine for the starter.
+
+    That extra sample buys less than it looks like. Facing "the bullpen" is not facing one
+    skill -- it is an average over arms that come and go between seasons, so a big total is
+    mostly a statement about how often the two clubs have met, and division opponents will
+    dominate the column. It is worth showing next to the starter line and worth nothing as a
+    projection input, which is the same verdict the report already reached for BvP itself
+    (HITTER_SPLIT_WEIGHTS["BvP"] is 0.0, shown and not scored).
+
+    `available_only` restricts the pool to arms the bullpen table thinks can actually pitch
+    tonight, which is the more decision-relevant read on a night with a taxed pen.
+    """
+    columns = ["Name", "Arms", "Years", "PA", "AB", "H", "HR", "BB", "K", "AVG", "SLG", "OPS"]
+    if lineup_df is None or lineup_df.empty:
+        return pd.DataFrame(columns=columns)
+    if bullpen_df is None or not isinstance(bullpen_df, pd.DataFrame) or bullpen_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    pen = bullpen_df
+    if available_only and "Availability" in pen.columns:
+        pen = pen[pen["Availability"].astype(str).str.strip().str.lower() == "available"]
+    names = [str(n).strip() for n in pen.get("Name", pd.Series(dtype=str)) if str(n).strip()]
+    if not names:
+        return pd.DataFrame(columns=columns)
+
+    start_season = max(2015, int(season) - int(lookback_seasons) + 1)
+    start_date = _season_start_date(start_season)
+    if end_date < start_date:
+        return pd.DataFrame(columns=columns)
+
+    # One Statcast pull per reliever, cached per arm. Keyed that way on purpose: the same
+    # bullpen recurs in every game its club plays, so the cache is reused across the slate
+    # and across dates, where a per-(batter, pitcher) key would never hit twice.
+    frames = []
+    for name in names:
+        pitcher_id = lookup_player_id(name)
+        if pitcher_id is None:
+            continue
+        try:
+            frame = cached_dataframe_call("statcast_pitcher", statcast_pitcher,
+                                          start_date, end_date, pitcher_id)
+        except Exception:
+            continue
+        if frame is None or frame.empty:
+            continue
+        frames.append(frame)
+    if not frames:
+        return pd.DataFrame(columns=columns)
+    pen_df = pd.concat(frames, ignore_index=True)
+
+    rows = []
+    for _, player in lineup_df.iterrows():
+        batter_id = player.get("ID")
+        if pd.isna(batter_id):
+            continue
+        faced = pen_df[pen_df["batter"] == int(batter_id)]
+        line = _events_to_batting_line(faced)
+        if line["PA"] == 0:
+            continue
+        # Distinct arms actually faced, not arms in the pen -- "0-for-6 against five
+        # different relievers" and "0-for-6 against one" are not the same note.
+        arms = int(pd.to_numeric(faced.get("pitcher"), errors="coerce").dropna().nunique())
+        if "game_year" in faced.columns:
+            years = sorted(pd.to_numeric(faced["game_year"], errors="coerce")
+                           .dropna().astype(int).unique().tolist())
+        elif "game_date" in faced.columns:
+            years = sorted(pd.to_datetime(faced["game_date"], errors="coerce")
+                           .dropna().dt.year.unique().tolist())
+        else:
+            years = []
+        rows.append({
+            "Name": player.get("Name"),
+            "Arms": arms,
+            "Years": ",".join(str(year) for year in years[-3:]) if years
+            else f"{start_season}-{season}",
+            **{key: line[key] for key in ["PA", "AB", "H", "HR", "BB", "K", "AVG", "SLG"]},
+            "OPS": line["OPS_proxy"],
+        })
+
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame(rows, columns=columns).sort_values(["PA", "SLG"], ascending=False)
+
+
+def build_matchup_overview(starter_df, bullpen_df, starter_name=None):
+    """One row per hitter: career vs tonight's starter beside career vs the whole pen.
+
+    Merged outer, because the two tables rarely cover the same hitters -- a hitter with no
+    history against a rookie starter can still have fifty plate appearances against the pen,
+    and dropping him would hide the larger of the two samples.
+    """
+    columns = ["Name", "SP", "SP PA", "SP AVG", "SP OPS", "SP HR",
+               "Pen Arms", "Pen PA", "Pen AVG", "Pen OPS", "Pen HR"]
+    starter_df = starter_df if isinstance(starter_df, pd.DataFrame) else pd.DataFrame()
+    bullpen_df = bullpen_df if isinstance(bullpen_df, pd.DataFrame) else pd.DataFrame()
+    if starter_df.empty and bullpen_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    left = starter_df.reindex(columns=["Name", "PA", "AVG", "OPS", "HR"]).rename(
+        columns={"PA": "SP PA", "AVG": "SP AVG", "OPS": "SP OPS", "HR": "SP HR"})
+    right = bullpen_df.reindex(columns=["Name", "Arms", "PA", "AVG", "OPS", "HR"]).rename(
+        columns={"Arms": "Pen Arms", "PA": "Pen PA", "AVG": "Pen AVG",
+                 "OPS": "Pen OPS", "HR": "Pen HR"})
+    merged = left.merge(right, on="Name", how="outer") if not left.empty and not right.empty \
+        else (left if right.empty else right)
+    merged["SP"] = starter_name or ""
+    for column in columns:
+        if column not in merged.columns:
+            merged[column] = pd.NA
+    # Sorted by the bigger of the two samples, so the rows worth reading are on top.
+    order = merged[["SP PA", "Pen PA"]].apply(pd.to_numeric, errors="coerce").max(axis=1)
+    return merged.reindex(columns=columns).assign(_o=order) \
+        .sort_values("_o", ascending=False).drop(columns="_o").reset_index(drop=True)
+
+
 def _reliever_recent_workload(player_id, season, end_date):
     params = {"stats": "gameLog", "group": "pitching", "season": season}
     url = f"https://statsapi.mlb.com/api/v1/people/{player_id}/stats"
@@ -4446,8 +5373,12 @@ def _reliever_recent_workload(player_id, season, end_date):
     last3_start = cutoff - timedelta(days=2)
     last5_start = cutoff - timedelta(days=4)
     l7_start = cutoff - timedelta(days=6)
-    totals = {"Last3D_G": 0, "Last3D_Pitches": 0, "Last3D_IP": 0.0, "Last5D_Pitches": 0, "Last Outing": "", "L7 Usage": "-------", "L7 Pitches": "- - - - - - -"}
+    totals = {"Last3D_G": 0, "Last3D_Pitches": 0, "Last3D_IP": 0.0, "Last5D_Pitches": 0,
+              "Last2D_Pitches": 0, "B2B": False,
+              "Last Outing": "", "L7 Usage": "-------", "L7 Pitches": "- - - - - - -"}
 
+    last2_start = cutoff - timedelta(days=1)
+    pitched_on = {}    # date -> pitches, used to spot consecutive days
     day_codes = {}  # date -> single-char usage code within the last 7 days
     day_appearances = {}  # date -> compact code + pitch-count tokens
     for split in sorted(splits, key=lambda item: item.get("date", ""), reverse=True):
@@ -4469,6 +5400,9 @@ def _reliever_recent_workload(player_id, season, end_date):
             totals["Last3D_IP"] += ip
         if dt >= last5_start:
             totals["Last5D_Pitches"] += pitches
+        if dt >= last2_start:
+            totals["Last2D_Pitches"] += pitches
+        pitched_on[dt.date()] = pitched_on.get(dt.date(), 0) + pitches
         if dt >= l7_start:
             if _stat_int(stat, "saves"):
                 code = "s"
@@ -4484,6 +5418,12 @@ def _reliever_recent_workload(player_id, season, end_date):
             day_appearances.setdefault(dt.date(), []).append(f"{code}{pitches}")
         if not totals["Last Outing"]:
             totals["Last Outing"] = f"{game_date}: {round(ip, 1)} IP/{pitches} pit"
+
+    # Back-to-back *into tonight*: he worked yesterday and the day before. Consecutive days
+    # earlier in the week say nothing about whether he is available now, so only the two days
+    # ending at the cutoff count.
+    totals["B2B"] = bool(pitched_on.get(cutoff.date()) and
+                         pitched_on.get((cutoff - timedelta(days=1)).date()))
 
     # 7 single-char slots, oldest -> newest: - off, a appeared, s save, b blown, h hold
     totals["L7 Usage"] = "".join(
@@ -4512,9 +5452,15 @@ def enhance_bullpen_analysis(bullpen_df, team_abbr, season, end_date):
             workload = _reliever_recent_workload(player_id, season, _pregame_end_date(end_date) or end_date)
             throws = _pitcher_throw_code(player_id)
         else:
-            workload = {"Last3D_G": 0, "Last3D_Pitches": 0, "Last3D_IP": 0.0, "Last5D_Pitches": 0, "Last Outing": "", "L7 Usage": "-------", "L7 Pitches": "- - - - - - -"}
+            workload = {"Last3D_G": 0, "Last3D_Pitches": 0, "Last3D_IP": 0.0,
+                        "Last5D_Pitches": 0, "Last2D_Pitches": 0, "B2B": False,
+                        "Last Outing": "", "L7 Usage": "-------",
+                        "L7 Pitches": "- - - - - - -"}
         player.update(workload)
         player["Throws"] = throws or ""
+        # Kept on the frame so downstream blocks can slice statcast by pitcher without
+        # re-resolving names against the roster.
+        player["MLBAM"] = player_id
         k_minus_bb = _safe_number(player.get("K%"), 0) - _safe_number(player.get("BB%"), 0)
         fip = _safe_number(player.get("FIP"), 5.0)
         whip = _safe_number(player.get("WHIP"), 1.35)
@@ -4538,7 +5484,20 @@ def enhance_bullpen_analysis(bullpen_df, team_abbr, season, end_date):
             player["Save Efficiency"] = f"{int(holds)} holds"
         else:
             player["Save Efficiency"] = ""
-        if player["Last3D_Pitches"] >= 45 or player["Last3D_G"] >= 3:
+        # **Back-to-back days count as taxed.** Measured over the 2025 regular season from
+        # the Statcast pitch log -- 281 relievers, 20,868 appearances, restricted to days
+        # the club played again the next day -- a reliever who worked on consecutive days
+        # appeared the following day only **5.5%** of the time (n=2,032), against **26.0%**
+        # on a day or more of rest. Above 35 pitches across the two days it falls to 1.4%.
+        # A three-day pitch total misses this entirely: 15 pitches yesterday and 12 the day
+        # before totals 27 and used to grade "Monitor", while the arm is effectively out.
+        #
+        # This deliberately reuses the existing "Taxed" wording rather than adding a tier.
+        # `bullpen_deployment_notes`, `summarize_bullpen_form` and the available-only filter
+        # all match on these exact strings, so a new label would be silently dropped by each
+        # of them. `B2B` and `Last2D_Pitches` carry the evidence for anything that wants it.
+        if (player.get("B2B") or player["Last3D_Pitches"] >= 45
+                or player["Last3D_G"] >= 3):
             player["Availability"] = "Taxed"
         elif player["Last3D_Pitches"] >= 25:
             player["Availability"] = "Monitor"
@@ -4701,6 +5660,48 @@ def get_umpire_runs_tendency(ump_name, season, end_date):
     ump_rpg = sum(ump_runs) / len(ump_runs)
     lg_rpg = sum(all_runs) / len(all_runs)
     return {"Umpire": ump_name, "Games": len(ump_runs), "R/G": round(ump_rpg, 2), "Lg R/G": round(lg_rpg, 2), "vs Avg": round(ump_rpg - lg_rpg, 2)}
+
+
+UMPIRE_TAG_PATH = os.path.join(PROJECT_ROOT, "data", "raw", "Umpire Tags - Sheet1.csv")
+
+
+def _umpire_name_key(name):
+    """Punctuation-insensitive key so e.g. CB and C.B. Bucknor match."""
+    plain = remove_accents(str(name or "")).casefold()
+    return re.sub(r"[^a-z0-9]", "", plain)
+
+
+@lru_cache(maxsize=4)
+def load_umpire_tags(path=UMPIRE_TAG_PATH):
+    """Load the hand-tagged umpire sheet, keyed by normalized full name."""
+    if not os.path.exists(path):
+        return {}
+    try:
+        frame = pd.read_csv(path, encoding="utf-8-sig")
+    except Exception as exc:
+        print(f"Could not read umpire tags: {exc}")
+        return {}
+    required = {"Umpire", "ERA", "Rating"}
+    if not required.issubset(frame.columns):
+        return {}
+    tags = {}
+    for _, row in frame.iterrows():
+        key = _umpire_name_key(row.get("Umpire"))
+        if not key:
+            continue
+        era = _safe_number(row.get("ERA"), None)
+        tags[key] = {
+            "Umpire": str(row.get("Umpire", "")).strip(),
+            "ERA": round(float(era), 2) if era is not None else None,
+            "Rating": str(row.get("Rating", "")).strip(),
+        }
+    return tags
+
+
+def get_umpire_tag(ump_name, path=UMPIRE_TAG_PATH):
+    if not ump_name or ump_name == "Not yet assigned":
+        return None
+    return load_umpire_tags(path).get(_umpire_name_key(ump_name))
 
 
 # --- handedness park factors (park_factors/*.csv, 3-year Savant-style indices) ------
@@ -5101,12 +6102,18 @@ def get_game_environment(game_id, game_date):
             break
 
     ump_tendency = get_umpire_runs_tendency(hp_umpire, int(str(game_date)[:4]), _pregame_end_date(game_date) or game_date)
+    umpire_tag = get_umpire_tag(hp_umpire)
     if ump_tendency:
         hp_umpire_line = f"{hp_umpire} ({ump_tendency['R/G']} R/G, {ump_tendency['vs Avg']:+.2f} vs lg avg, {ump_tendency['Games']}g)"
         notes.append(f"Home plate umpire: {hp_umpire} — {ump_tendency['R/G']} runs/game in his {ump_tendency['Games']} plate games ({ump_tendency['vs Avg']:+.2f} vs league {ump_tendency['Lg R/G']}).")
     else:
         hp_umpire_line = hp_umpire
         notes.append(f"Home plate umpire: {hp_umpire}.")
+    if umpire_tag:
+        hp_umpire_line += f" | {umpire_tag['Rating']} (tag ERA {umpire_tag['ERA']:.2f})"
+        notes.append(
+            f"Umpire tag: {umpire_tag['Rating']} with a {umpire_tag['ERA']:.2f} ERA benchmark."
+        )
     return {
         "game_id": game_id,
         "venue": venue_name,
@@ -5121,6 +6128,7 @@ def get_game_environment(game_id, game_date):
         "hp_umpire": hp_umpire,
         "hp_umpire_line": hp_umpire_line,
         "ump_tendency": ump_tendency,
+        "umpire_tag": umpire_tag,
     }
 
 
@@ -5168,6 +6176,10 @@ def _recent_final_games(team_id, as_of_date, count=3):
                 "away_abbr": TEAM_ID_MAP.get(away.get("team", {}).get("id"), ""),
                 "home_score": home.get("score"),
                 "away_score": away.get("score"),
+                "own_score": own.get("score"),
+                "opp_score": opp.get("score"),
+                "opp_id": opp.get("team", {}).get("id"),
+                "venue_name": (game.get("venue", {}) or {}).get("name", ""),
                 "is_home": is_home,
                 "result": "W" if (own.get("score") or 0) > (opp.get("score") or 0) else "L",
             })
@@ -5194,7 +6206,7 @@ def _boxscore_statcast_index(game_dates, statcast_df=None):
     df = statcast_df
     if df is None or df.empty:
         try:
-            df = cached_dataframe_call("statcast", statcast, dates[0], dates[-1])
+            df = load_statcast_range(dates[0], dates[-1])
         except Exception as e:
             print(f"⚠️ Statcast unavailable for box scores: {e}")
             return {}
@@ -5311,9 +6323,126 @@ def build_recent_boxscores(team_id, team_abbr, as_of_date, count=3, statcast_df=
     Each entry carries a header line, a line score, and away/home batting+pitching tables
     ready to stack vertically on a worksheet. Pass the pipeline's already-loaded
     statcast frame to avoid a second pull just for the batted-ball columns."""
-    out = []
     metas = _recent_final_games(team_id, as_of_date, count)
     statcast_index = _boxscore_statcast_index([m.get("date") for m in metas], statcast_df)
+    built = [_build_one_boxscore(meta, statcast_index) for meta in metas]
+    return [game for game in built if game is not None]
+
+
+def _build_one_boxscore(meta, statcast_index=None):
+    """One game's banner, line score and four stat tables, or None if it will not load.
+
+    Split out of `build_recent_boxscores` so the comparable-games tabs can render an
+    arbitrary set of games rather than a chronological window, off the same code and the
+    same disk cache.
+    """
+    game_pk = meta.get("game_pk")
+    if not game_pk:
+        return None
+    try:
+        data = cached_json_request(
+            f"https://statsapi.mlb.com/api/v1/game/{int(game_pk)}/boxscore",
+            namespace="statsapi",
+        )
+        line = cached_json_request(
+            f"https://statsapi.mlb.com/api/v1/game/{int(game_pk)}/linescore",
+            namespace="statsapi",
+        )
+    except Exception as e:
+        print(f"⚠️ Box score unavailable for game {game_pk}: {e}")
+        return None
+    teams = data.get("teams", {}) or {}
+    away_bat, away_pit = _box_side_tables(teams.get("away", {}) or {}, statcast_index, meta["date"])
+    home_bat, home_pit = _box_side_tables(teams.get("home", {}) or {}, statcast_index, meta["date"])
+
+    innings = line.get("innings", []) or []
+    header = ["Team"] + [str(i.get("num", n + 1)) for n, i in enumerate(innings)] + ["R", "H", "E"]
+    line_rows = []
+    for side, abbr in (("away", meta["away_abbr"]), ("home", meta["home_abbr"])):
+        totals = (line.get("teams", {}) or {}).get(side, {}) or {}
+        row = {"Team": abbr or meta[f"{side}_name"]}
+        for n, inning in enumerate(innings):
+            frame = inning.get(side, {}) or {}
+            runs = frame.get("runs")
+            # A home team that never bats in the 9th gets "-", not a 0.
+            row[str(inning.get("num", n + 1))] = "-" if runs is None else runs
+        row["R"] = totals.get("runs", "")
+        row["H"] = totals.get("hits", "")
+        row["E"] = totals.get("errors", "")
+        line_rows.append(row)
+
+    own_abbr = meta["home_abbr"] if meta["is_home"] else meta["away_abbr"]
+    opp_abbr = meta["away_abbr"] if meta["is_home"] else meta["home_abbr"]
+    versus = f"vs {opp_abbr}" if meta["is_home"] else f"@ {opp_abbr}"
+    # Both halves of a doubleheader share a date, so tag the game number.
+    dh = f" (G{meta['game_number']})" if _safe_number(meta.get("game_number"), 1) > 1 else ""
+    return {
+        "title": (f"{meta['date']}{dh}   {own_abbr} {versus}   "
+                  f"{meta['away_abbr']} {meta['away_score']} - {meta['home_abbr']} {meta['home_score']}   "
+                  f"({meta['result']})"),
+        "result": meta["result"],
+        "date": meta["date"],
+        "linescore": pd.DataFrame(line_rows, columns=header),
+        "away_label": f"{meta['away_abbr']} Batting",
+        "home_label": f"{meta['home_abbr']} Batting",
+        "away_pitch_label": f"{meta['away_abbr']} Pitching",
+        "home_pitch_label": f"{meta['home_abbr']} Pitching",
+        "away_batting": away_bat, "away_pitching": away_pit,
+        "home_batting": home_bat, "home_pitching": home_pit,
+    }
+
+
+_PEN_L5_GROUP_COLS = ["Date", "Opp", "Res", "SP IP", "Pen IP", "Arms", "Pit", "P/Out",
+                      "H", "R", "ER", "K", "BB", "HR", "IR"]
+# A relief outing this long is a bulk arm or a mop-up, not a leverage appearance. Marked in
+# the arm grid so five innings of long relief cannot be read as the pen being worked hard.
+_BULK_RELIEF_IP = 3.0
+
+
+def _relief_lines(box_team):
+    """(starter, [relievers]) for one club's boxscore, each as (player, pitching stats).
+
+    `pitchers` is in appearance order, so the first arm with a line is the starter and
+    everything after it is the pen. On an opener night that makes the bulk arm count as
+    relief, which is the right answer for the question this table asks: he threw those
+    innings out of the pen and he is unavailable tomorrow because of them.
+    """
+    players = box_team.get("players", {}) or {}
+    lines = []
+    for pid in box_team.get("pitchers", []) or []:
+        player = players.get(f"ID{pid}")
+        if not player:
+            continue
+        stats = (player.get("stats", {}) or {}).get("pitching", {}) or {}
+        if stats:
+            lines.append((player, stats))
+    return (lines[0] if lines else None), lines[1:]
+
+
+def build_bullpen_l5(team_id, team_abbr, as_of_date, count=5, bullpen_df=None):
+    """Relief workload over the team's last `count` completed games, two ways.
+
+    Returns (group_df, arm_df). The group frame is one row per game plus a TOTAL row --
+    how many innings the pen was asked for and what it did with them. The arm frame is one
+    row per reliever carrying a pitch count per game, which is the half that says who can
+    actually pitch tonight.
+
+    Counted per GAME, not per calendar day. `L7 Usage` in the scouting table below is a
+    seven-day strip, so an off day silently makes it span six games and a doubleheader
+    eight. Availability is a function of games and pitches, not of dates.
+
+    The boxscores come from the same disk cache `build_recent_boxscores` fills for the
+    "Last 3" tabs, so on a normal run three of the five are already local.
+    """
+    group_cols = list(_PEN_L5_GROUP_COLS)
+    metas = _recent_final_games(team_id, as_of_date, count)
+    if not metas:
+        return pd.DataFrame(columns=group_cols), pd.DataFrame(columns=["Name"])
+
+    # Newest first, matching the starter's L5 log directly above this on the sheet. The
+    # arm grid's game columns are built from this same list, so the two read the same way.
+    labels, group_rows = [], []
+    per_arm = {}
     for meta in metas:
         game_pk = meta.get("game_pk")
         if not game_pk:
@@ -5323,53 +6452,631 @@ def build_recent_boxscores(team_id, team_abbr, as_of_date, count=3, statcast_df=
                 f"https://statsapi.mlb.com/api/v1/game/{int(game_pk)}/boxscore",
                 namespace="statsapi",
             )
-            line = cached_json_request(
-                f"https://statsapi.mlb.com/api/v1/game/{int(game_pk)}/linescore",
-                namespace="statsapi",
-            )
         except Exception as e:
-            print(f"⚠️ Box score unavailable for game {game_pk}: {e}")
+            print(f"⚠️ Box score unavailable for pen L5 game {game_pk}: {e}")
             continue
-        teams = data.get("teams", {}) or {}
-        away_bat, away_pit = _box_side_tables(teams.get("away", {}) or {}, statcast_index, meta["date"])
-        home_bat, home_pit = _box_side_tables(teams.get("home", {}) or {}, statcast_index, meta["date"])
+        side = "home" if meta["is_home"] else "away"
+        starter, relievers = _relief_lines((data.get("teams", {}) or {}).get(side, {}) or {})
+        if starter is None and not relievers:
+            continue
 
-        innings = line.get("innings", []) or []
-        header = ["Team"] + [str(i.get("num", n + 1)) for n, i in enumerate(innings)] + ["R", "H", "E"]
-        line_rows = []
-        for side, abbr in (("away", meta["away_abbr"]), ("home", meta["home_abbr"])):
-            totals = (line.get("teams", {}) or {}).get(side, {}) or {}
-            row = {"Team": abbr or meta[f"{side}_name"]}
-            for n, inning in enumerate(innings):
-                frame = inning.get(side, {}) or {}
-                runs = frame.get("runs")
-                # A home team that never bats in the 9th gets "-", not a 0.
-                row[str(inning.get("num", n + 1))] = "-" if runs is None else runs
-            row["R"] = totals.get("runs", "")
-            row["H"] = totals.get("hits", "")
-            row["E"] = totals.get("errors", "")
-            line_rows.append(row)
+        # Both halves of a doubleheader share a date, so the column has to say which.
+        label = str(meta.get("date", ""))[5:]
+        if _safe_number(meta.get("game_number"), 1) > 1:
+            label += f" G{int(meta['game_number'])}"
+        labels.append(label)
 
-        own_abbr = meta["home_abbr"] if meta["is_home"] else meta["away_abbr"]
-        opp_abbr = meta["away_abbr"] if meta["is_home"] else meta["home_abbr"]
-        versus = f"vs {opp_abbr}" if meta["is_home"] else f"@ {opp_abbr}"
-        # Both halves of a doubleheader share a date, so tag the game number.
-        dh = f" (G{meta['game_number']})" if _safe_number(meta.get("game_number"), 1) > 1 else ""
-        out.append({
-            "title": (f"{meta['date']}{dh}   {own_abbr} {versus}   "
-                      f"{meta['away_abbr']} {meta['away_score']} - {meta['home_abbr']} {meta['home_score']}   "
-                      f"({meta['result']})"),
-            "result": meta["result"],
-            "date": meta["date"],
-            "linescore": pd.DataFrame(line_rows, columns=header),
-            "away_label": f"{meta['away_abbr']} Batting",
-            "home_label": f"{meta['home_abbr']} Batting",
-            "away_pitch_label": f"{meta['away_abbr']} Pitching",
-            "home_pitch_label": f"{meta['home_abbr']} Pitching",
-            "away_batting": away_bat, "away_pitching": away_pit,
-            "home_batting": home_bat, "home_pitching": home_pit,
+        # `battingOrder`, not `batters`: the latter appends every pitcher who appeared, so
+        # testing against it flagged the entire bullpen as position players. Under the
+        # universal DH a real reliever is never in the batting order, so anyone who is
+        # there and also pitched is a position player mopping up (or a two-way starter).
+        lineup = set((data.get("teams", {}) or {}).get(side, {}).get("battingOrder", []) or [])
+        pen_ip = pen_pitches = 0.0
+        totals = {key: 0 for key in ("H", "R", "ER", "K", "BB", "HR")}
+        inherited = scored = 0
+        for player, stats in relievers:
+            ip = _ip_to_float(stats.get("inningsPitched", 0))
+            pitches = _safe_number(stats.get("numberOfPitches"), 0) or 0
+            pen_ip += ip
+            pen_pitches += pitches
+            totals["H"] += _stat_int(stats, "hits")
+            totals["R"] += _stat_int(stats, "runs")
+            totals["ER"] += _stat_int(stats, "earnedRuns")
+            totals["K"] += _stat_int(stats, "strikeOuts")
+            totals["BB"] += _stat_int(stats, "baseOnBalls")
+            totals["HR"] += _stat_int(stats, "homeRuns")
+            inherited += _stat_int(stats, "inheritedRunners")
+            scored += _stat_int(stats, "inheritedRunnersScored")
+
+            person = player.get("person", {}) or {}
+            arm = per_arm.setdefault(remove_accents(str(person.get("fullName", ""))), {
+                "Name": person.get("fullName", ""), "games": {}, "IP": 0.0, "Pit": 0,
+                "ER": 0, "K": 0, "BB": 0, "App": 0,
+                # A position player mopping up is a fact about the game, not about the pen.
+                "position_player": person.get("id") in lineup,
+            })
+            arm["IP"] += ip
+            arm["Pit"] += int(pitches)
+            arm["ER"] += _stat_int(stats, "earnedRuns")
+            arm["K"] += _stat_int(stats, "strikeOuts")
+            arm["BB"] += _stat_int(stats, "baseOnBalls")
+            arm["App"] += 1
+            token = f"{int(pitches)}" if pitches else "0"
+            if ip >= _BULK_RELIEF_IP:
+                token += "+"
+            # Two outings in one game (rare, but a suspended game does it) stack rather
+            # than overwrite, so the pitch count in the cell is the day's real total.
+            prior = arm["games"].get(label)
+            arm["games"][label] = f"{prior}/{token}" if prior else token
+
+        pen_outs = pen_ip * 3
+        group_rows.append({
+            "Date": label,
+            "Opp": ("vs " if meta["is_home"] else "@ ") + (
+                meta["away_abbr"] if meta["is_home"] else meta["home_abbr"]),
+            "Res": meta.get("result", ""),
+            "SP IP": _float_to_ip(_ip_to_float((starter[1] if starter else {}).get("inningsPitched", 0))),
+            "Pen IP": _float_to_ip(pen_ip),
+            "Arms": len(relievers),
+            "Pit": int(pen_pitches),
+            "P/Out": round(pen_pitches / pen_outs, 1) if pen_outs else "",
+            "IR": f"{scored}/{inherited}" if inherited else "-",
+            **totals,
         })
+
+    if not group_rows:
+        return pd.DataFrame(columns=group_cols), pd.DataFrame(columns=["Name"])
+
+    group = pd.DataFrame(group_rows, columns=group_cols)
+    total_ip = sum(_ip_to_float(v) for v in group["Pen IP"])
+    total_outs = total_ip * 3
+    total_pitches = int(pd.to_numeric(group["Pit"], errors="coerce").fillna(0).sum())
+    inherited_total = sum(int(str(v).split("/")[1]) for v in group["IR"] if "/" in str(v))
+    scored_total = sum(int(str(v).split("/")[0]) for v in group["IR"] if "/" in str(v))
+    summary = {
+        "Date": "TOTAL", "Opp": f"{len(group)} games", "Res": "",
+        "SP IP": _float_to_ip(sum(_ip_to_float(v) for v in group["SP IP"])),
+        "Pen IP": _float_to_ip(total_ip),
+        # DISTINCT relievers, not the column sum -- "how deep into the pen did this week
+        # go" is the question, and summing appearances answers a different one. Written
+        # with the unit attached so it cannot be misread as a total of the rows above.
+        "Arms": f"{len(per_arm)} arms",
+        "Pit": total_pitches,
+        "P/Out": round(total_pitches / total_outs, 1) if total_outs else "",
+        "IR": f"{scored_total}/{inherited_total}" if inherited_total else "-",
+    }
+    for col in ("H", "R", "ER", "K", "BB", "HR"):
+        summary[col] = int(pd.to_numeric(group[col], errors="coerce").fillna(0).sum())
+    group = pd.concat([group, pd.DataFrame([summary])], ignore_index=True)[group_cols]
+
+    # ---- per-arm grid -------------------------------------------------------------
+    hand, avail = {}, {}
+    if bullpen_df is not None and not bullpen_df.empty and "Name" in bullpen_df.columns:
+        keys = bullpen_df["Name"].map(lambda n: remove_accents(str(n)))
+        hand = dict(zip(keys, bullpen_df.get("Throws", pd.Series("", index=bullpen_df.index))))
+        avail = dict(zip(keys, bullpen_df.get("Availability", pd.Series("", index=bullpen_df.index))))
+
+    arm_rows = []
+    for key, arm in per_arm.items():
+        outs = arm["IP"] * 3
+        arm_rows.append({
+            "Name": arm["Name"] + (" *" if arm["position_player"] else ""),
+            "T": _pen_hand(hand.get(key, "")),
+            **{label: arm["games"].get(label, "-") for label in labels},
+            "App": arm["App"],
+            "IP": _float_to_ip(arm["IP"]),
+            "Pit": arm["Pit"],
+            "P/Out": round(arm["Pit"] / outs, 1) if outs else "",
+            "ERA": round(arm["ER"] * 9 / arm["IP"], 2) if arm["IP"] else "",
+            "K-BB": arm["K"] - arm["BB"],
+            "Avail": avail.get(key, ""),
+        })
+    arm_cols = ["Name", "T"] + labels + ["App", "IP", "Pit", "P/Out", "ERA", "K-BB", "Avail"]
+    arms = pd.DataFrame(arm_rows, columns=arm_cols)
+    if not arms.empty:
+        # Busiest first: the top of this table is the reason the pen is short tonight.
+        arms = arms.sort_values(["Pit", "App"], ascending=False).reset_index(drop=True)
+    return group, arms
+
+
+_RELEVANT_GAME_COLS = ["Date", "Opp", "H/A", "Res", "R", "Park", "Opp SP", "T", "K%",
+                       "FIP", "HR/9", "Rest", "LU", "Match", "Rk"]
+# How many comparable games the per-team tabs carry. Five, because that is the count the
+# eye can hold side by side and because the gate has to stay satisfiable -- asking for ten
+# comparable games out of a fifteen-game pool means taking games that are not comparable.
+_COMPARABLE_COUNT = 5
+# Candidate pool for the ranking. Deliberately larger than the L10 table it sits under:
+# ten games is not enough to find five genuinely similar ones, and every game beyond the
+# tenth costs exactly one boxscore fetch, which the disk cache then keeps.
+_COMPARABLE_POOL = 15
+# What counts as "tonight-like" on each dimension. Deliberately loose enough that a
+# ten-game window still produces matches and tight enough that the matched set is not
+# simply the window: on a sample of slates these land 3-5 games out of 10. Both failure
+# modes are visible in the MATCHED row -- 10 matches means the test is doing nothing, 0
+# or 1 means it is too strict to average.
+_RELEVANT_PARK_TOLERANCE = 0.04     # park Runs factor, absolute
+_RELEVANT_LINEUP_MIN = 7            # of tonight's nine who started that game
+_RELEVANT_MATCH_MIN = 3             # dimensions that must agree to call a game comparable
+
+
+def _tonight_conditions(environment, opposing_starter_info, lineup_df, is_home,
+                        rest_schedule=None):
+    """What a past game is compared against: run environment, starter type, game context,
+    and tonight's projected lineup.
+
+    Note what is NOT here: the opposing bullpen's state. Reconstructing a pen's workload as
+    of some date three weeks ago means pulling that club's preceding three boxscores for
+    every candidate game -- roughly sixty extra requests per team -- and it is the one
+    dimension whose historical cost exceeds its value. Tonight's pen state is covered
+    directly by the Bullpen L5 block on the pitching sheet instead.
+    """
+    park = (environment or {}).get("park") or {}
+    ids = []
+    if lineup_df is not None and not lineup_df.empty and "ID" in lineup_df.columns:
+        ids = pd.to_numeric(lineup_df["ID"], errors="coerce").dropna().astype(int).tolist()
+
+    # The starter frame already carries K%, so tonight's side of the comparison costs no
+    # API call. It arrives as either a fraction or a percentage depending on the source,
+    # the same ambiguity `cmp_starter_row` handles.
+    k_rate = _safe_number((opposing_starter_info or {}).get("K%"), None)
+    if k_rate is not None and abs(k_rate) > 1:
+        k_rate /= 100.0
+
+    rest = None
+    if rest_schedule is not None and not getattr(rest_schedule, "empty", True):
+        rest = _safe_number(str(_first_value(rest_schedule, "Rest") or "").rstrip("dD"), None)
+
+    return {
+        "park_runs": _safe_number(park.get("Runs"), None),
+        "opp_sp_hand": _pen_hand((opposing_starter_info or {}).get("Throws")),
+        "opp_sp_k": k_rate,
+        "is_home": is_home,
+        "rest": rest,
+        "lineup_ids": ids,
+    }
+
+
+def _relevant_agreement(flags):
+    """How many dimensions a Match string agrees on. '·' is a tested-and-differed slot."""
+    text = str(flags or "")
+    return sum(1 for ch in text if ch in "PTHL")
+
+
+def _starter_profile(pitcher_id, season, end_date):
+    """A starter's season K rate, FIP and HR/9 as of `end_date`. Blanks when unavailable.
+
+    Ex-ante only. It is tempting to use the line the pitcher actually threw in the game
+    being scored -- it is already in the boxscore and costs nothing -- but selecting past
+    games by how the opposing pitcher performed and then averaging the runs scored against
+    him is circular: the selection has already read the answer. Season talent as of that
+    point is the honest version of "what kind of arm was this".
+
+    FIP rather than ERA because the whole point is the arm rather than the defense behind
+    it, and HR/9 because the run environment this table is built around acts on the ball in
+    the air more than on anything else.
+    """
+    blank = {"k_rate": None, "fip": None, "hr9": None}
+    if not pitcher_id:
+        return blank
+    try:
+        stat = get_player_stat(int(pitcher_id), "pitching", season, end_date) or {}
+    except Exception:
+        return blank
+    batters = _safe_number(stat.get("battersFaced"), 0) or 0
+    if batters < 100:                 # too little to characterise an arm
+        return blank
+    innings = _ip_to_float(stat.get("inningsPitched", 0))
+    strikeouts = _safe_number(stat.get("strikeOuts"), 0) or 0
+    intentional = _safe_number(stat.get("intentionalWalks"), 0) or 0
+    walks = (_safe_number(stat.get("baseOnBalls"), 0) or 0) - intentional
+    homers = _safe_number(stat.get("homeRuns"), 0) or 0
+    try:
+        _, fip_constant = get_league_pitching_stats(int(season))
+    except Exception:
+        fip_constant = 3.1
+    return {
+        "k_rate": strikeouts / batters,
+        "fip": round(calculate_fip(homers, walks, strikeouts, innings,
+                                   fip_constant=fip_constant or 3.1), 2) if innings else None,
+        "hr9": round(homers * 9 / innings, 2) if innings else None,
+    }
+
+
+def _relevant_game_features(meta, tonight_lineup, season, context_end):
+    """Everything one past game contributes, from a single boxscore fetch.
+
+    Shared by the L10 context table and the comparable-game ranker so the two can never
+    disagree about a game, and so the boxscore is pulled once.
+    """
+    # Through the alias resolver, not a raw dict lookup: neutral-site and renamed venues
+    # appear in the schedule under names PARK_CONTEXT does not key on, and a miss here
+    # reads as "no park data" for a game that has perfectly good park data.
+    park_context, _ = _park_context_for_venue(meta.get("venue_name"))
+    out = {
+        "park": _safe_number(park_context.get("Runs"), None),
+        "opp_sp_name": "", "opp_sp_hand": "", "opp_sp_k": None,
+        "opp_sp_fip": None, "opp_sp_hr9": None, "lineup_hits": None,
+        "is_home": bool(meta.get("is_home")),
+    }
+    game_pk = meta.get("game_pk")
+    if not game_pk:
+        return out
+    try:
+        data = cached_json_request(
+            f"https://statsapi.mlb.com/api/v1/game/{int(game_pk)}/boxscore",
+            namespace="statsapi",
+        )
+    except Exception:
+        return out
+    teams = data.get("teams", {}) or {}
+    own_side = "home" if meta["is_home"] else "away"
+    opp_starter, _ = _relief_lines(teams.get("away" if meta["is_home"] else "home", {}) or {})
+    if opp_starter:
+        person = opp_starter[0].get("person", {}) or {}
+        out["opp_sp_name"] = person.get("fullName", "")
+        out["opp_sp_hand"] = _pen_hand(_pitcher_throw_code(person.get("id")))
+        profile = _starter_profile(person.get("id"), season, context_end)
+        out["opp_sp_k"] = profile["k_rate"]
+        out["opp_sp_fip"] = profile["fip"]
+        out["opp_sp_hr9"] = profile["hr9"]
+    order = (teams.get(own_side, {}) or {}).get("battingOrder") or []
+    if order and tonight_lineup:
+        out["lineup_hits"] = len(tonight_lineup.intersection(int(p) for p in order))
     return out
+
+
+def _rest_days(metas):
+    """Rest going INTO each game. The list runs newest first, so the preceding game is the
+    NEXT element -- reading it the other way reports the gap that FOLLOWED each game and
+    shifts the whole column by a row."""
+    rests = []
+    for index, meta in enumerate(metas):
+        value = ""
+        if index + 1 < len(metas):
+            try:
+                value = (datetime.strptime(meta["date"], "%Y-%m-%d")
+                         - datetime.strptime(metas[index + 1]["date"], "%Y-%m-%d")).days
+            except (TypeError, ValueError):
+                value = ""
+        rests.append(value)
+    return rests
+
+
+# Similarity weights. Numeric features are standardized by the spread of the candidate
+# pool itself rather than by a league SD -- it needs no lookup table and it asks the right
+# question ("unusual relative to how much this team's own schedule varies"), at the cost
+# of not being comparable between teams. Binary features contribute their full weight when
+# they differ. NONE of these are fitted; they are a stated prior, and the honest test of
+# the whole idea is still the MATCHED-vs-TOTAL comparison on the Game Context sheet.
+_SIMILARITY_WEIGHTS = {"park": 1.0, "hand": 1.0, "k_rate": 1.0,
+                       "home": 0.75, "rest": 0.5}
+# How hard to prefer recent games among equally similar ones. At 0.35 a game at the far
+# end of the pool needs to be noticeably more similar to outrank a recent one, which is
+# what "the 5 most relevant AND recent" asks for.
+_RECENCY_WEIGHT = 0.35
+# Floor on a pool's spread, so a feature that barely varies cannot divide by ~0 and
+# dominate the distance. In the feature's own units.
+_SIMILARITY_SPREAD_FLOOR = {"park": 0.02, "k_rate": 0.02, "rest": 0.5}
+
+
+def rank_relevant_games(metas, features, rests, tonight):
+    """Score every candidate game against tonight; return indices best-first.
+
+    Returns (order, detail) where detail[i] carries the distance and the gate outcome for
+    game i, so the report can show WHY a game was picked rather than just a rank.
+
+    Lineup overlap is a gate, not a distance term: a game where four of tonight's nine
+    played is not a game this team played, and no amount of park agreement fixes that.
+    The gate relaxes step by step when it would leave too few games, and the relaxation is
+    reported -- a silent gate that returns two games is worse than a loose one that says
+    it loosened.
+    """
+    tonight_park = _safe_number((tonight or {}).get("park_runs"), None)
+    tonight_hand = str((tonight or {}).get("opp_sp_hand", "") or "")[:1].upper()
+    tonight_home = (tonight or {}).get("is_home")
+    tonight_k = _safe_number((tonight or {}).get("opp_sp_k"), None)
+
+    def spread(values, key):
+        clean = [v for v in values if v is not None]
+        if len(clean) < 2:
+            return _SIMILARITY_SPREAD_FLOOR.get(key, 1.0)
+        sd = float(pd.Series(clean, dtype=float).std(ddof=0))
+        return max(sd, _SIMILARITY_SPREAD_FLOOR.get(key, 1.0))
+
+    park_sd = spread([f["park"] for f in features], "park")
+    k_sd = spread([f["opp_sp_k"] for f in features], "k_rate")
+    rest_sd = spread([r if r != "" else None for r in rests], "rest")
+
+    detail = []
+    for index, feature in enumerate(features):
+        terms, used = 0.0, 0.0
+
+        def add(key, deviation):
+            nonlocal terms, used
+            weight = _SIMILARITY_WEIGHTS[key]
+            terms += weight * deviation ** 2
+            used += weight
+
+        if tonight_park is not None and feature["park"] is not None:
+            add("park", (feature["park"] - tonight_park) / park_sd)
+        if tonight_hand and feature["opp_sp_hand"]:
+            add("hand", 0.0 if feature["opp_sp_hand"] == tonight_hand else 1.0)
+        if tonight_k is not None and feature["opp_sp_k"] is not None:
+            add("k_rate", (feature["opp_sp_k"] - tonight_k) / k_sd)
+        if tonight_home is not None:
+            add("home", 0.0 if bool(feature["is_home"]) == bool(tonight_home) else 1.0)
+        rest = rests[index]
+        if rest != "" and (tonight or {}).get("rest") not in (None, ""):
+            add("rest", (float(rest) - float(tonight["rest"])) / rest_sd)
+
+        # Normalised by the weight actually used, so a game missing a feature is not
+        # rewarded for having fewer terms to disagree on.
+        distance = (terms / used) ** 0.5 if used else float("inf")
+        detail.append({"distance": distance,
+                       "recency": _RECENCY_WEIGHT * (index / max(len(features) - 1, 1)),
+                       "lineup_hits": feature["lineup_hits"]})
+
+    # Progressive gate: try the strict overlap first and loosen only as far as needed.
+    gate = _RELEVANT_LINEUP_MIN
+    wanted = min(_COMPARABLE_COUNT, len(features))
+    while gate > 0:
+        eligible = [i for i, d in enumerate(detail)
+                    if d["lineup_hits"] is None or d["lineup_hits"] >= gate]
+        if len(eligible) >= wanted:
+            break
+        gate -= 1
+    else:
+        eligible = list(range(len(features)))
+
+    for index, d in enumerate(detail):
+        d["gate"] = gate
+        d["eligible"] = index in eligible
+        d["score"] = d["distance"] + d["recency"]
+
+    order = sorted(eligible, key=lambda i: detail[i]["score"])
+    return order, detail
+
+
+def build_relevant_games(team_id, team_abbr, as_of_date, tonight, count=10,
+                         season=None, context_end=None):
+    """The team's last `count` games with tonight's conditions attached to each one.
+
+    This is the *diagnostic*, not the selector -- it stays in date order so the roster
+    drift and the schedule are both visible. `Rk` marks where each game landed in the
+    similarity ranking that drives the comparable-games tabs, so the two views agree.
+
+    The acceptance test lives in the last two rows: if MATCHED's runs-per-game equals
+    TOTAL's, conditioning bought nothing on this slate and the honest read is that it is a
+    display feature rather than a model input.
+    """
+    # Ranked over the SAME pool the comparable-games tabs use, then truncated for display.
+    # Ranking over just the ten shown would put a different number in `Rk` than the tab
+    # puts in `#` for the same game, which is worse than having no rank at all.
+    metas = _recent_final_games(team_id, as_of_date, max(count, _COMPARABLE_POOL))
+    if not metas:
+        return pd.DataFrame(columns=_RELEVANT_GAME_COLS)
+
+    season = season or int(str(as_of_date)[:4])
+    context_end = context_end or _pregame_end_date(as_of_date) or as_of_date
+    tonight_park = _safe_number((tonight or {}).get("park_runs"), None)
+    tonight_hand = str((tonight or {}).get("opp_sp_hand", "") or "")[:1].upper()
+    tonight_home = (tonight or {}).get("is_home")
+    tonight_lineup = {int(pid) for pid in (tonight or {}).get("lineup_ids", []) or []}
+
+    features = [_relevant_game_features(m, tonight_lineup, season, context_end) for m in metas]
+    rests = _rest_days(metas)
+    order, detail = rank_relevant_games(metas, features, rests, tonight)
+    rank_of = {index: position + 1 for position, index in enumerate(order)}
+    metas = metas[:count]
+
+    rows = []
+    for index, meta in enumerate(metas):
+        feature = features[index]
+        park, lineup_hits = feature["park"], feature["lineup_hits"]
+
+        # One letter per dimension that agrees with tonight, so the reason a game is
+        # comparable is legible rather than hidden behind a score.
+        flags = ""
+        if tonight_park is not None and park is not None:
+            flags += "P" if abs(park - tonight_park) <= _RELEVANT_PARK_TOLERANCE else "·"
+        if tonight_hand and feature["opp_sp_hand"]:
+            flags += "T" if feature["opp_sp_hand"] == tonight_hand else "·"
+        if tonight_home is not None:
+            flags += "H" if bool(meta["is_home"]) == bool(tonight_home) else "·"
+        if lineup_hits is not None:
+            flags += "L" if lineup_hits >= _RELEVANT_LINEUP_MIN else "·"
+
+        rows.append({
+            "Date": str(meta.get("date", ""))[5:],
+            "Opp": ("vs " if meta["is_home"] else "@ ") + (
+                meta["away_abbr"] if meta["is_home"] else meta["home_abbr"]),
+            "H/A": "H" if meta["is_home"] else "A",
+            "Res": meta.get("result", ""),
+            "R": meta.get("own_score"),
+            "Park": park if park is not None else "",
+            "Opp SP": feature["opp_sp_name"],
+            "T": feature["opp_sp_hand"],
+            "K%": round(feature["opp_sp_k"] * 100, 1) if feature["opp_sp_k"] is not None else "",
+            "FIP": feature["opp_sp_fip"] if feature["opp_sp_fip"] is not None else "",
+            "HR/9": feature["opp_sp_hr9"] if feature["opp_sp_hr9"] is not None else "",
+            "Rest": rests[index],
+            "LU": f"{lineup_hits}/9" if lineup_hits is not None else "",
+            "Match": flags,
+            "Rk": rank_of.get(index, ""),
+        })
+
+    table = pd.DataFrame(rows, columns=_RELEVANT_GAME_COLS)
+    # Agreed dimensions, not "no disagreements": a game whose flags are empty because
+    # nothing could be computed has agreed on nothing and must not count as comparable.
+    matched = table["Match"].map(_relevant_agreement) >= _RELEVANT_MATCH_MIN
+
+    def _runs(frame):
+        values = pd.to_numeric(frame["R"], errors="coerce").dropna()
+        return round(float(values.mean()), 2) if not values.empty else ""
+
+    summary = [{
+        **{c: "" for c in _RELEVANT_GAME_COLS},
+        "Date": "TOTAL / AVG", "Opp": f"{len(table)} games", "R": _runs(table),
+        "Park": round(float(pd.to_numeric(table["Park"], errors="coerce").dropna().mean()), 3)
+        if pd.to_numeric(table["Park"], errors="coerce").notna().any() else "",
+    }, {
+        **{c: "" for c in _RELEVANT_GAME_COLS},
+        # The payoff line. If this is the same as the row above, conditioning bought
+        # nothing on this slate and the honest read is that it is a display feature.
+        "Date": "MATCHED", "Opp": f"{int(matched.sum())} of {len(table)}",
+        "R": _runs(table[matched]),
+        "Match": f"{_RELEVANT_MATCH_MIN}+ of P/T/H/L",
+    }]
+    return pd.concat([table, pd.DataFrame(summary)], ignore_index=True)[_RELEVANT_GAME_COLS]
+
+
+# `Dist` is pure similarity and `Score` is what the ranking actually sorted on -- distance
+# plus the recency preference. Both are shown because only Score is monotonic down the
+# table, and a reader seeing a larger Dist above a smaller one deserves the explanation
+# rather than a suspicion that the sort is broken.
+_COMPARABLE_SUMMARY_COLS = ["#", "Date", "Opp", "Res", "R", "Park", "Opp SP", "T", "K%",
+                            "FIP", "HR/9", "Rest", "LU", "Match", "Dist", "Score"]
+
+
+def build_comparable_games(team_id, team_abbr, as_of_date, tonight, count=_COMPARABLE_COUNT,
+                           pool=_COMPARABLE_POOL, season=None, context_end=None,
+                           statcast_df=None):
+    """The `count` games most like tonight, with full box scores.
+
+    Returns (games, summary, note): `games` in the shape `_write_boxscore_sheet` consumes,
+    `summary` a table of why each was chosen, and `note` a plain sentence describing the
+    selection -- including whether the lineup gate had to be relaxed to fill the slots.
+
+    This replaces "last 3 completed games" on the per-team tabs. Recency answers "what
+    happened lately"; three chronological games spanning a different park, a different
+    handedness and two roster moves answer nothing in particular. The pool is still recent
+    (`pool` games) and the ranking still prefers recent, so what changes is *which* recent
+    games get the space, not how far back the tab reaches.
+    """
+    season = season or int(str(as_of_date)[:4])
+    context_end = context_end or _pregame_end_date(as_of_date) or as_of_date
+    metas = _recent_final_games(team_id, as_of_date, pool)
+    if not metas:
+        return [], pd.DataFrame(columns=_COMPARABLE_SUMMARY_COLS), "No completed games found."
+
+    tonight_lineup = {int(pid) for pid in (tonight or {}).get("lineup_ids", []) or []}
+    features = [_relevant_game_features(m, tonight_lineup, season, context_end) for m in metas]
+    rests = _rest_days(metas)
+    order, detail = rank_relevant_games(metas, features, rests, tonight)
+    chosen = order[:count]
+
+    tonight_park = _safe_number((tonight or {}).get("park_runs"), None)
+    tonight_hand = str((tonight or {}).get("opp_sp_hand", "") or "")[:1].upper()
+    tonight_home = (tonight or {}).get("is_home")
+
+    rows = []
+    for position, index in enumerate(chosen, start=1):
+        meta, feature = metas[index], features[index]
+        flags = ""
+        if tonight_park is not None and feature["park"] is not None:
+            flags += "P" if abs(feature["park"] - tonight_park) <= _RELEVANT_PARK_TOLERANCE else "·"
+        if tonight_hand and feature["opp_sp_hand"]:
+            flags += "T" if feature["opp_sp_hand"] == tonight_hand else "·"
+        if tonight_home is not None:
+            flags += "H" if bool(meta["is_home"]) == bool(tonight_home) else "·"
+        if feature["lineup_hits"] is not None:
+            flags += "L" if feature["lineup_hits"] >= _RELEVANT_LINEUP_MIN else "·"
+        rows.append({
+            "#": position,
+            "Date": meta.get("date", ""),
+            "Opp": ("vs " if meta["is_home"] else "@ ") + (
+                meta["away_abbr"] if meta["is_home"] else meta["home_abbr"]),
+            "Res": meta.get("result", ""), "R": meta.get("own_score"),
+            "Park": feature["park"] if feature["park"] is not None else "",
+            "Opp SP": feature["opp_sp_name"], "T": feature["opp_sp_hand"],
+            "K%": round(feature["opp_sp_k"] * 100, 1) if feature["opp_sp_k"] is not None else "",
+            "FIP": feature["opp_sp_fip"] if feature["opp_sp_fip"] is not None else "",
+            "HR/9": feature["opp_sp_hr9"] if feature["opp_sp_hr9"] is not None else "",
+            "Rest": rests[index],
+            "LU": f"{feature['lineup_hits']}/9" if feature["lineup_hits"] is not None else "",
+            "Match": flags,
+            "Dist": round(detail[index]["distance"], 3),
+            "Score": round(detail[index]["score"], 3),
+        })
+    summary = pd.DataFrame(rows, columns=_COMPARABLE_SUMMARY_COLS)
+    if not summary.empty:
+        def _avg(column, digits=2):
+            values = pd.to_numeric(summary[column], errors="coerce").dropna()
+            return round(float(values.mean()), digits) if not values.empty else ""
+        summary = pd.concat([summary, pd.DataFrame([{
+            **{c: "" for c in _COMPARABLE_SUMMARY_COLS},
+            "#": "AVG", "Opp": f"{len(rows)} games", "R": _avg("R"),
+            # The average arm faced across the comparable set, which is the number that
+            # says whether this stretch of runs came against pitching like tonight's.
+            "K%": _avg("K%", 1), "FIP": _avg("FIP"), "HR/9": _avg("HR/9"),
+        }])], ignore_index=True)[_COMPARABLE_SUMMARY_COLS]
+
+    gate = detail[0]["gate"] if detail else _RELEVANT_LINEUP_MIN
+    note = (f"{len(chosen)} of the last {len(metas)} games, ranked by similarity to tonight "
+            f"(park run factor, opposing starter hand and K%, home/away, rest) with a mild "
+            f"preference for recency. Lineup gate: {gate}+ of tonight's nine started. "
+            f"FIP and HR/9 are shown for context and do NOT enter the ranking.")
+    if gate < _RELEVANT_LINEUP_MIN:
+        note += (f"  ⚠ Relaxed from {_RELEVANT_LINEUP_MIN}+ — the roster has turned over "
+                 f"enough that a stricter gate could not fill {count} games.")
+
+    # Box scores only for the games that made the cut, so the extra fetches are bounded by
+    # `count` rather than by the pool.
+    statcast_index = _boxscore_statcast_index([metas[i].get("date") for i in chosen], statcast_df)
+    games = []
+    for position, index in enumerate(chosen, start=1):
+        built = _build_one_boxscore(metas[index], statcast_index)
+        if built is None:
+            continue
+        row = rows[position - 1]
+        built["title"] = (f"#{position}  ·  {built['title']}"
+                          f"   |   park {row['Park']}, {row['Opp SP']} ({row['T']}"
+                          + (f", {row['K%']}% K" if row["K%"] != "" else "")
+                          + f"), rest {row['Rest']}, lineup {row['LU']}, match {row['Match']}")
+        games.append(built)
+    return games, summary, note
+
+
+def cmp_comparable_summary_fills(summary):
+    """Shade the match column the same way the L10 diagnostic does, so a tab that had to
+    reach for its fifth game says so rather than presenting all five as equivalent."""
+    if summary is None or summary.empty or "Match" not in summary.columns:
+        return {}
+    fills = []
+    for _, row in summary.iterrows():
+        if str(row.get("#", "")).strip().upper() == "AVG":
+            fills.append(None)
+            continue
+        agreed = _relevant_agreement(row.get("Match"))
+        if agreed >= _RELEVANT_MATCH_MIN:
+            fills.append(_DELTA_UP_STRONG)
+        elif agreed == _RELEVANT_MATCH_MIN - 1:
+            fills.append(_DELTA_UP_MILD)
+        else:
+            fills.append(_DELTA_DOWN_MILD)
+    return {"Match": fills, "Dist": list(fills), "Score": list(fills)}
+
+
+def cmp_relevant_games_fills(table):
+    """Tint the rows that resemble tonight, so the comparable stretch reads as a block."""
+    if table is None or table.empty or "Match" not in table.columns:
+        return {}
+    fills = []
+    for _, row in table.iterrows():
+        # Summary rows are identified by their Date label, not by parsing the Match cell:
+        # the MATCHED row puts a caption there, and pattern-matching a caption is how a
+        # summary line ends up shaded as though it were a game.
+        if str(row.get("Date", "")).strip().upper() in _PITCHING_SUMMARY_ROWS | {"MATCHED"}:
+            fills.append(None)
+            continue
+        agreed = _relevant_agreement(row.get("Match"))
+        if agreed >= _RELEVANT_MATCH_MIN:
+            fills.append(_DELTA_UP_STRONG)
+        elif agreed == _RELEVANT_MATCH_MIN - 1:
+            fills.append(_DELTA_UP_MILD)
+        else:
+            fills.append(None)
+    return {"Match": fills, "Date": list(fills), "R": list(fills)}
 
 
 def _resolve_game_id(date, away_team, home_team):
@@ -5433,7 +7140,7 @@ def refresh_environment_umpire(context, date, away_team, home_team):
               f"{fresh_forecast.get('temp_f')}F, wind {fresh_forecast.get('wind')}")
 
     if ump_pending and fresh.get("hp_umpire", "Not yet assigned") != "Not yet assigned":
-        for key in ("hp_umpire", "hp_umpire_line", "ump_tendency"):
+        for key in ("hp_umpire", "hp_umpire_line", "ump_tendency", "umpire_tag"):
             env[key] = fresh.get(key)
         notes = env.get("notes")
         if isinstance(notes, list):
@@ -5523,6 +7230,181 @@ def generate_defensive_stress_report(def_team, opponent_team, defense_df, oppone
             "Priority": "Prioritize clean exchanges, shift/positioning discipline, and first-step reads."
         })
     return pd.DataFrame(rows, columns=["Unit", "Stress", "Why", "Priority"])
+
+
+def _statcast_fielding_rows(statcast_df, team_abbr):
+    """Pitches thrown while `team_abbr` was in the field -- the inverse of the batting view."""
+    if statcast_df is None or statcast_df.empty:
+        return pd.DataFrame()
+    if not {"home_team", "away_team", "inning_topbot"}.issubset(statcast_df.columns):
+        return pd.DataFrame()
+    statcast_alias = {"ARI": "AZ", "OAK": "ATH"}
+    team = statcast_alias.get(team_abbr.upper(), team_abbr.upper())
+    df = statcast_df.copy()
+    top = df["inning_topbot"].astype(str).str.lower().eq("top")
+    # Top of the inning: the away team bats, so the home team is fielding.
+    fielding_team = np.where(top, df["home_team"], df["away_team"])
+    df["fielding_team"] = fielding_team
+    return df[df["fielding_team"].astype(str).str.upper().eq(team)].copy()
+
+
+# Roughly what one non-home-run hit is worth to the batting side in DK points once the
+# single/double/triple mix and the runs and RBI it tends to produce are counted. Used only
+# to translate a defensive rate into fantasy units; the pitcher side (-0.6 per hit) is exact.
+DK_POINTS_PER_HIT_ALLOWED = 4.5
+
+
+_LEAGUE_DEFENSE_CACHE = {}
+
+
+def _league_defense_baseline(statcast_df):
+    """League-average (xBA - hit) per batted ball, overall and by batted-ball type.
+
+    Computed once per statcast frame: thirty teams asking for it individually is thirty
+    passes over the same two million rows.
+    """
+    # Keyed on content, not on id(): a garbage-collected frame's id can be handed to a
+    # different frame, and serving one season's baseline to another would be silent.
+    dates = statcast_df.get("game_date")
+    key = (len(statcast_df), len(statcast_df.columns),
+           str(dates.min()) if dates is not None and len(statcast_df) else "",
+           str(dates.max()) if dates is not None and len(statcast_df) else "")
+    if key in _LEAGUE_DEFENSE_CACHE:
+        return _LEAGUE_DEFENSE_CACHE[key]
+    events = statcast_df["events"].astype("string")
+    batted = statcast_df[
+        events.notna() & events.ne("") & events.ne("home_run")
+        & statcast_df["estimated_ba_using_speedangle"].notna()
+    ]
+    baseline = {"all": 0.0, "ground": 0.0, "air": 0.0, "frame": 0.0}
+    if not batted.empty:
+        xba = pd.to_numeric(batted["estimated_ba_using_speedangle"], errors="coerce").fillna(0.0)
+        is_hit = batted["events"].astype("string").isin(["single", "double", "triple"])
+        bb_type = batted.get("bb_type", pd.Series(index=batted.index, dtype="string")).astype("string")
+        for name, mask in (("all", pd.Series(True, index=batted.index)),
+                           ("ground", bb_type.eq("ground_ball")),
+                           ("air", bb_type.isin(["fly_ball", "line_drive", "popup"]))):
+            chances = int(mask.sum())
+            if chances:
+                baseline[name] = float((xba[mask].sum() - is_hit[mask].sum()) / chances)
+    taken = statcast_df[statcast_df["description"].astype("string").isin(
+        ["ball", "called_strike", "blocked_ball"])]
+    if not taken.empty and "zone" in taken.columns:
+        zone = pd.to_numeric(taken["zone"].astype("string"), errors="coerce")
+        called = taken["description"].astype("string").eq("called_strike")
+        baseline["frame"] = float((int((called & (zone >= 11)).sum())
+                                   - int((~called & zone.between(1, 9)).sum())) / len(taken))
+    _LEAGUE_DEFENSE_CACHE[key] = baseline
+    return baseline
+
+
+def build_team_defense(team_abbr, statcast_df, min_bip=200):
+    """Team defense measured from what happened to batted balls, not from putout counts.
+
+    **Why this replaces the fielding-stat view.** Putouts and assists per inning -- what
+    `_defensive_range_unit` scored -- are set by the pitching staff, not the fielders. A
+    ground-ball staff hands its infield more chances and a fly-ball staff hands its outfield
+    more, so that number rates the rotation and calls it defense. Errors and fielding
+    percentage only count plays a fielder already reached, which is the opposite of range,
+    and for DFS specifically they are close to irrelevant: an error produces *unearned* runs
+    and DK scores a pitcher on earned runs only.
+
+    What does matter is whether balls in play become hits. Statcast prices every batted ball
+    with an expected batting average from its exit velocity and launch angle, so
+
+        hits saved = sum(xBA) - actual hits
+
+    is the defense's contribution with the hitter's contact quality already divided out.
+    Home runs are excluded: no defence has a say in those.
+
+    Split by `bb_type` into an infield (ground balls) and an outfield (air) component,
+    because they price differently -- an outfield that cannot cover gaps costs doubles.
+    """
+    columns = ["Team", "BIP", "xBA Allowed", "BA Allowed", "Hits Saved/G",
+               "IF Saved/G", "OF Saved/G", "Frame +Str/G", "Grade", "DFS Read"]
+    rows = _statcast_fielding_rows(statcast_df, team_abbr)
+    if rows.empty:
+        return pd.DataFrame(columns=columns)
+
+    # xBA is what makes this a defensive measure rather than a pitching one; without it
+    # there is nothing honest to report, so the table is omitted rather than approximated.
+    if "estimated_ba_using_speedangle" not in rows.columns:
+        return pd.DataFrame(columns=columns)
+    events = rows["events"].astype("string")
+    in_play = rows[events.notna() & events.ne("")].copy()
+    if in_play.empty:
+        return pd.DataFrame(columns=columns)
+
+    # Balls the defence could actually field: tracked contact that stayed in the park.
+    batted = in_play[
+        in_play["estimated_ba_using_speedangle"].notna()
+        & in_play["events"].astype("string").ne("home_run")
+    ].copy()
+    if len(batted) < min_bip:
+        return pd.DataFrame(columns=columns)
+
+    xba = pd.to_numeric(batted["estimated_ba_using_speedangle"], errors="coerce").fillna(0.0)
+    is_hit = batted["events"].astype("string").isin(["single", "double", "triple"])
+    games = max(int(batted["game_pk"].nunique()), 1)
+
+    bb_type = batted.get("bb_type", pd.Series(index=batted.index, dtype="string")).astype("string")
+    ground = bb_type.eq("ground_ball")
+    air = bb_type.isin(["fly_ball", "line_drive", "popup"])
+
+    # xBA runs above actual BA league-wide -- it is fitted on exit velocity and launch angle
+    # alone and cannot see the fielders who are, on average, there. Uncentred, that bias put
+    # eighteen of thirty defences above zero and made the grade meaningless. So the league's
+    # own gap is the zero point and a team is measured against it.
+    league = _league_defense_baseline(statcast_df)
+
+    def saved(mask, key):
+        chances = int(mask.sum())
+        if not chances:
+            return 0.0
+        team_rate = float((xba[mask].sum() - is_hit[mask].sum()) / chances)
+        return (team_rate - league.get(key, 0.0)) * chances / games
+
+    everything = pd.Series(True, index=batted.index)
+    hits_saved = saved(everything, "all")
+    if_saved, of_saved = saved(ground, "ground"), saved(air, "air")
+
+    # Framing: taken pitches that went the defence's way. Called strikes on pitches outside
+    # the zone, minus in-zone takes that were called balls. Worth including because it moves
+    # the starter's strikeout rate, which is the largest term in his DK line.
+    taken = rows[rows["description"].astype("string").isin(
+        ["ball", "called_strike", "blocked_ball"])].copy()
+    frame_per_game = 0.0
+    if not taken.empty and "zone" in taken.columns:
+        zone = pd.to_numeric(taken["zone"].astype("string"), errors="coerce")
+        called = taken["description"].astype("string").eq("called_strike")
+        stolen = int((called & (zone >= 11)).sum())
+        lost = int((~called & (zone.between(1, 9))).sum())
+        frame_games = max(int(taken["game_pk"].nunique()), 1)
+        # Centred the same way and for the same reason as the batted-ball figure: the raw
+        # stolen-minus-lost count is positive for everyone, so only the gap to league reads.
+        rate = (stolen - lost) / max(len(taken), 1)
+        frame_per_game = (rate - league.get("frame", 0.0)) * len(taken) / frame_games
+
+    grade = ("Plus" if hits_saved >= 0.35 else
+             "Risk" if hits_saved <= -0.35 else "Neutral")
+    pitcher_swing = hits_saved * 0.6
+    hitter_swing = -hits_saved * DK_POINTS_PER_HIT_ALLOWED
+    read = (f"~{hits_saved:+.2f} hits/g vs expectation -> "
+            f"{pitcher_swing:+.1f} DK to their pitching, "
+            f"{hitter_swing:+.1f} DK to opposing bats")
+
+    return pd.DataFrame([{
+        "Team": team_abbr,
+        "BIP": int(len(batted)),
+        "xBA Allowed": round(float(xba.mean()), 3),
+        "BA Allowed": round(float(is_hit.mean()), 3),
+        "Hits Saved/G": round(hits_saved, 2),
+        "IF Saved/G": round(if_saved, 2),
+        "OF Saved/G": round(of_saved, 2),
+        "Frame +Str/G": round(frame_per_game, 1),
+        "Grade": grade,
+        "DFS Read": read,
+    }], columns=columns)
 
 
 def _defensive_range_unit(defense_df, positions):
@@ -5921,12 +7803,18 @@ def generate_uncertainty_flags(scorecard, away_team, home_team, away_lineup_df, 
     if "low" in model_label:
         flags.append("Model calibration is low reliability; treat win lean as directional.")
     elif "medium" in model_label:
-        flags.append("Model calibration is medium reliability; totals remain noisy.")
+        flags.append("Model calibration is medium reliability; use win leans directionally and totals as ranges.")
+    if "umpire experimental" in model_label:
+        flags.append("Umpire tendency is included experimentally but has not shown holdout value by magnitude.")
 
     if scorecard is not None and not scorecard.empty and "Win Lean" in scorecard.columns:
         win_pcts = pd.to_numeric(scorecard["Win Lean"].astype(str).str.replace("%", "", regex=False), errors="coerce").dropna()
         if not win_pcts.empty and win_pcts.max() < 57:
             flags.append("Game edge is narrow; avoid over-reading the projected winner.")
+        elif not win_pcts.empty and win_pcts.max() >= 58 and "win magnitude directional" in model_label:
+            flags.append(
+                "Large win-edge magnitude has not validated monotonically; treat the favorite as a lean, especially early season."
+            )
 
     for team, lineup in [(away_team, away_lineup_df), (home_team, home_lineup_df)]:
         confidence = _lineup_confidence(lineup)
@@ -6260,11 +8148,57 @@ def _park_adjust(value, factor, strength=1.0):
     return round(val / eff, 3)
 
 
-def _split_ops_xwoba(events_df):
-    """PA, OPS_proxy, xwOBA for a subset of statcast PA-end rows."""
+def _split_metrics(events_df):
+    """One split's line: rate stats for a subset of statcast PA-end rows.
+
+    Everything here already fell out of `_events_to_batting_line` and `_contact_quality`
+    and was simply being discarded -- the two summary tables kept PA/OPS/xwOBA and threw
+    the rest away.
+
+    K% earns its place ahead of the others: it is the largest term in a starter's DK line
+    (docs/arsenal_study.md) and it sets a hitter's floor, since a strikeout is the one
+    outcome that can produce nothing downstream. ISO separates the lineups that get their
+    OPS from power -- which is what pays on DK, at 10 points a home run -- from the ones
+    that get it from singles and walks.
+
+    Whiff% is deliberately *not* included. These frames are PA-ending pitches only, so a
+    whiff rate computed over them would be whiffs per swing on final pitches, which is not
+    the whiff rate anyone reads it as.
+    """
     line = _events_to_batting_line(events_df)
     quality = _contact_quality(events_df)
-    return line["PA"], line["OPS_proxy"], quality["xwOBA"]
+    pa = line["PA"]
+    return {
+        "PA": pa,
+        "OPS": line["OPS_proxy"],
+        "xwOBA": quality["xwOBA"],
+        "ISO": round(max(0.0, line["SLG"] - line["AVG"]), 3),
+        "K%": round(line["K"] / pa * 100, 1) if pa else 0.0,
+        "BB%": round(line["BB"] / pa * 100, 1) if pa else 0.0,
+        "HardHit%": quality["HardHit%"],
+        # A rate, not the count: these splits carry wildly different plate-appearance
+        # totals, and "17 HR vs LHP" against "58 vs RHP" says more about who they faced
+        # than about the lineup.
+        "HR%": round(line["HR"] / pa * 100, 1) if pa else 0.0,
+    }
+
+
+# Columns both summary tables carry beyond the split label, in display order.
+SPLIT_STAT_COLUMNS = ["PA", "OPS", "xwOBA", "ISO", "K%", "BB%", "HardHit%", "HR%"]
+
+
+def _park_adjusted_split(events_df, factor):
+    """A split with the park factor applied to the rate stats it should touch.
+
+    Park adjustment belongs on run-scoring rates, not on strikeout and walk rates: a park
+    moves how far the ball carries, not whether the hitter made contact. So OPS, xwOBA and
+    ISO are adjusted and K%/BB%/HardHit% pass through untouched.
+    """
+    metrics = _split_metrics(events_df)
+    metrics["OPS"] = _park_adjust(metrics["OPS"], factor)
+    metrics["xwOBA"] = _park_adjust(metrics["xwOBA"], factor, 0.5)
+    metrics["ISO"] = _park_adjust(metrics["ISO"], factor, 0.5)
+    return metrics
 
 
 def _keep_venue_split(df, keep_label):
@@ -6276,8 +8210,8 @@ def _keep_venue_split(df, keep_label):
 
 
 def build_lineup_split_summary(team_abbr, lineup_df, statcast_detail_df, starter_hand, vs_type_row=None, context_end=None):
-    """Aggregate lineup OPS/xwOBA sliced by Overall, Home/Away (park-adj), vs L/R, vs Type, and L28."""
-    columns = ["Team", "Split", "PA", "OPS", "xwOBA"]
+    """Aggregate lineup rate line sliced by Overall, Home/Away (park-adj), vs L/R, vs Type, L28."""
+    columns = ["Team", "Split"] + SPLIT_STAT_COLUMNS
     if (
         lineup_df is None or lineup_df.empty or "ID" not in lineup_df.columns
         or statcast_detail_df is None or statcast_detail_df.empty
@@ -6296,63 +8230,101 @@ def build_lineup_split_summary(team_abbr, lineup_df, statcast_detail_df, starter
     canon = _canon_team(team_abbr)
     rows = []
 
-    pa, ops, xw = _split_ops_xwoba(df)
-    rows.append({"Split": "Overall", "PA": pa, "OPS": round(ops, 3), "xwOBA": round(xw, 3)})
+    rows.append({"Split": "Overall", **_split_metrics(df)})
 
     if "home_team" in df.columns:
         home_mask = df["home_team"].astype(str).map(_canon_team) == canon
         home_df = df[home_mask]
         away_df = df[~home_mask]
         home_factor = _team_home_park_run_factor(canon)
-        pa_h, ops_h, xw_h = _split_ops_xwoba(home_df)
-        rows.append({"Split": "Home (PF)", "PA": pa_h,
-                     "OPS": _park_adjust(ops_h, home_factor),
-                     "xwOBA": _park_adjust(xw_h, home_factor, 0.5)})
+        rows.append({"Split": "Home (PF)", **_park_adjusted_split(home_df, home_factor)})
         away_factor = float(away_df["home_team"].astype(str).map(_team_home_park_run_factor).mean()) if not away_df.empty else 1.0
-        pa_a, ops_a, xw_a = _split_ops_xwoba(away_df)
-        rows.append({"Split": "Away (PF)", "PA": pa_a,
-                     "OPS": _park_adjust(ops_a, away_factor),
-                     "xwOBA": _park_adjust(xw_a, away_factor, 0.5)})
+        rows.append({"Split": "Away (PF)", **_park_adjusted_split(away_df, away_factor)})
 
     if "p_throws" in df.columns:
         for hand, label in [("L", "vs LHP"), ("R", "vs RHP")]:
             sub = df[df["p_throws"].astype(str).str.strip() == hand]
-            pa_s, ops_s, xw_s = _split_ops_xwoba(sub)
             split_label = f"{label} *" if starter_hand and starter_hand == hand else label
-            rows.append({"Split": split_label, "PA": pa_s, "OPS": round(ops_s, 3), "xwOBA": round(xw_s, 3)})
+            rows.append({"Split": split_label, **_split_metrics(sub)})
 
     if vs_type_row is not None and not vs_type_row.empty:
+        # Carried across from the vs-arsenal table, which computes its own line. It reports
+        # HR as a count, so the rate is derived here; ISO and BB% it does not carry at all
+        # and are left blank rather than filled with a zero that would read as a real value.
         r = vs_type_row.iloc[0]
-        rows.append({"Split": "vs Type", "PA": int(_safe_number(r.get("PA"), 0) or 0),
-                     "OPS": round(_safe_number(r.get("OPS"), 0.0) or 0.0, 3),
-                     "xwOBA": round(_safe_number(r.get("xwOBA"), 0.0) or 0.0, 3)})
+        type_pa = int(_safe_number(r.get("PA"), 0) or 0)
+        type_hr = _safe_number(r.get("HR"), None)
+        rows.append({
+            "Split": "vs Type",
+            "PA": type_pa,
+            "OPS": round(_safe_number(r.get("OPS"), 0.0) or 0.0, 3),
+            "xwOBA": round(_safe_number(r.get("xwOBA"), 0.0) or 0.0, 3),
+            "K%": _safe_number(r.get("K%"), None),
+            "HardHit%": _safe_number(r.get("HardHit%"), None),
+            "HR%": round(type_hr / type_pa * 100, 1) if type_hr is not None and type_pa else None,
+        })
 
     if "game_date" in df.columns and context_end:
         try:
             cutoff = (datetime.strptime(context_end, "%Y-%m-%d") - timedelta(days=28)).strftime("%Y-%m-%d")
             recent = df[df["game_date"].astype(str) >= cutoff]
-            pa_r, ops_r, xw_r = _split_ops_xwoba(recent)
-            rows.append({"Split": "L28", "PA": pa_r, "OPS": round(ops_r, 3), "xwOBA": round(xw_r, 3)})
+            rows.append({"Split": "L28", **_split_metrics(recent)})
         except Exception:
             pass
 
     out = pd.DataFrame(rows)
+    for column in SPLIT_STAT_COLUMNS:
+        if column not in out.columns:
+            out[column] = None
     out.insert(0, "Team", team_abbr)
     return out[columns]
 
 
 _OPENER_INDEX_CACHE = {}
-OPENER_MAX_INNINGS = 2        # an opener works the 1st and maybe the 2nd
-BULK_MIN_INNINGS = 3          # the arm behind him has to actually carry the game
+OPENER_MAX_INNINGS = 2.0      # an opener works the 1st and maybe the 2nd
+BULK_MIN_INNINGS = 3.0        # the arm behind him has to actually carry the game
+
+# Share of opener games in which the arm who most often followed before follows again.
+# Measured over 371 opener halves in 2024-26: 28% overall, and still only ~34% restricted
+# to openers with 2+ prior games or a 60%+ historical share. The follower is therefore a
+# scouting note, not a projection -- see research/arsenal/opener_audit.py.
+OPENER_BULK_REPEAT_RATE = 0.33
+
+# Outs each terminal event records. Innings pitched used to be approximated by counting the
+# distinct innings a pitcher appeared in, which is wrong in both directions: an arm who goes
+# 2.1 shows up in three innings and stops looking like an opener, while one who records a
+# single out either side of an inning break looks like he went two. Checked against 56,223
+# box-score lines: distinct innings is exact 60% of the time and off by 0.24 IP on average;
+# counting outs is exact 92% of the time and off by 0.03. On the "<= 2 IP" test that decides
+# an opener, distinct innings misses 313 real short outings and outs-based misses 15.
+_EVENT_OUTS = {
+    "strikeout": 1, "field_out": 1, "force_out": 1, "sac_fly": 1, "sac_bunt": 1,
+    "fielders_choice_out": 1, "other_out": 1, "caught_stealing_2b": 1,
+    "caught_stealing_3b": 1, "caught_stealing_home": 1, "pickoff_1b": 1,
+    "pickoff_2b": 1, "pickoff_3b": 1, "pickoff_caught_stealing_2b": 1,
+    "pickoff_caught_stealing_3b": 1, "pickoff_caught_stealing_home": 1,
+    "strikeout_double_play": 2, "grounded_into_double_play": 2, "double_play": 2,
+    "sac_fly_double_play": 2, "sac_bunt_double_play": 2, "triple_play": 3,
+}
 
 
 def build_opener_index(season, context_end, statcast_pitches_df=None):
     """Every opener-shaped half-game this season, straight off the pitch-level data.
 
-    A half-inning's first pitcher who covers <= OPENER_MAX_INNINGS and hands off to
-    someone who covers >= BULK_MIN_INNINGS is an opener/bulk pair. Derived from statcast
-    rather than boxscore fetches, so scanning the whole league costs one already-cached
-    pull. Returns a frame: game_pk, half, first, first_inn, bulk, bulk_inn, is_opener.
+    A half-game's first pitcher who covers <= OPENER_MAX_INNINGS and hands off to someone
+    who covers >= BULK_MIN_INNINGS is an opener/bulk pair. Derived from statcast rather
+    than boxscore fetches, so scanning the whole league costs one already-cached pull.
+    Returns a frame: game_pk, half, first, first_inn, bulk, bulk_inn, is_opener.
+
+    Two things here are load-bearing and were previously got wrong:
+
+    * **Order comes from `at_bat_number`, not from the inning.** Two pitchers can work the
+      same inning, and sorting by inning alone left that tie to be broken by whatever order
+      the rows happened to sit in -- with a non-stable sort. That named the wrong follower
+      in 3.4% of half-games and the wrong starter in 0.3%.
+    * **Exhibition games are excluded.** The season pull starts March 1, so without the
+      filter roughly 7% of the index was spring training, where every arm is on a two-inning
+      leash and nothing about the pattern is real.
     """
     key = (int(season), str(context_end))
     if key in _OPENER_INDEX_CACHE:
@@ -6364,27 +8336,43 @@ def build_opener_index(season, context_end, statcast_pitches_df=None):
         except Exception as e:
             print(f"⚠️ Opener detection unavailable: {e}")
             return pd.DataFrame()
-    needed = {"game_pk", "inning", "pitcher", "inning_topbot"}
+    needed = {"game_pk", "inning", "pitcher", "inning_topbot", "at_bat_number", "events"}
     if df is None or df.empty or not needed.issubset(df.columns):
         return pd.DataFrame()
 
-    slim = df[list(needed)].dropna()
-    rows = []
-    for (game_pk, half), group in slim.groupby(["game_pk", "inning_topbot"], sort=False):
-        group = group.sort_values("inning")
-        first = int(group.iloc[0]["pitcher"])
-        first_inn = int(group.loc[group["pitcher"] == first, "inning"].nunique())
-        others = group[group["pitcher"] != first]
-        bulk, bulk_inn = None, 0
-        if not others.empty:
-            bulk = int(others.sort_values("inning").iloc[0]["pitcher"])
-            bulk_inn = int(others.loc[others["pitcher"] == bulk, "inning"].nunique())
-        rows.append({
-            "game_pk": int(game_pk), "half": str(half), "first": first,
-            "first_inn": first_inn, "bulk": bulk, "bulk_inn": bulk_inn,
-            "is_opener": bool(first_inn <= OPENER_MAX_INNINGS and bulk_inn >= BULK_MIN_INNINGS),
-        })
-    index = pd.DataFrame(rows)
+    slim = df[list(needed) + (["game_type"] if "game_type" in df.columns else [])].copy()
+    if "game_type" in slim.columns:
+        slim = slim[slim["game_type"].astype("string").eq("R")]
+    slim = slim.dropna(subset=["game_pk", "inning", "pitcher", "inning_topbot",
+                               "at_bat_number"])
+    if slim.empty:
+        return pd.DataFrame()
+
+    slim["outs"] = slim["events"].astype("string").map(_EVENT_OUTS).fillna(0.0)
+    # One row per (half-game, pitcher): when he first appeared, and how many outs he got.
+    per_pitcher = slim.groupby(["game_pk", "inning_topbot", "pitcher"], observed=True).agg(
+        first_ab=("at_bat_number", "min"), outs=("outs", "sum")).reset_index()
+    per_pitcher["ip"] = per_pitcher["outs"] / 3.0
+    per_pitcher = per_pitcher.sort_values(["game_pk", "inning_topbot", "first_ab"],
+                                          kind="mergesort")
+    per_pitcher["slot"] = per_pitcher.groupby(["game_pk", "inning_topbot"],
+                                              observed=True).cumcount()
+
+    starters = per_pitcher[per_pitcher["slot"] == 0].rename(
+        columns={"pitcher": "first", "ip": "first_ip"})
+    followers = per_pitcher[per_pitcher["slot"] == 1].rename(
+        columns={"pitcher": "bulk", "ip": "bulk_ip"})
+    index = starters[["game_pk", "inning_topbot", "first", "first_ip"]].merge(
+        followers[["game_pk", "inning_topbot", "bulk", "bulk_ip"]],
+        on=["game_pk", "inning_topbot"], how="left")
+
+    index["bulk_ip"] = index["bulk_ip"].fillna(0.0)
+    index["is_opener"] = (index["first_ip"] <= OPENER_MAX_INNINGS) & (
+        index["bulk_ip"] >= BULK_MIN_INNINGS)
+    index = index.rename(columns={"inning_topbot": "half",
+                                  "first_ip": "first_inn", "bulk_ip": "bulk_inn"})
+    index["game_pk"] = index["game_pk"].astype(int)
+    index["first"] = index["first"].astype(int)
     _OPENER_INDEX_CACHE[key] = index
     return index
 
@@ -6448,7 +8436,7 @@ def build_opener_profile(pitcher_id, season, context_end, statcast_pitches_df=No
         role = "Traditional starter"
 
     candidates = []
-    opener_games = mine[mine["is_opener"]]
+    opener_games = mine[mine["is_opener"] & mine["bulk"].notna()]
     if not opener_games.empty:
         counts = opener_games["bulk"].value_counts()
         for bulk_id, times in counts.head(3).items():
@@ -6470,7 +8458,341 @@ def build_opener_profile(pitcher_id, season, context_end, statcast_pitches_df=No
         "avg_first_inn": avg_first_inn,
         "bulk": candidates[0] if candidates else None,
         "candidates": candidates,
+        # How often the most-frequent prior follower is the one who actually follows,
+        # measured over 176 opener games in 2024-26. It sits at roughly a third even when
+        # the historical share is 60%+ and even with four or more prior games to go on --
+        # bullpen sequencing is a game-state decision, not a tendency. Carried on the
+        # profile so the report can state the confidence instead of implying one.
+        "bulk_repeat_rate": OPENER_BULK_REPEAT_RATE,
     }
+
+
+# ---------------------------------------------------------------------------------------
+# Team rotation model
+#
+# Replaces the old question "who follows tonight's opener" with a better-posed one: "who does
+# this club start, and in what order". The first was abandoned at a 33% hit rate because
+# bullpen sequencing is a game-state decision. Start order is not -- clubs cycle a rotation --
+# and it measures far better. Walk-forward over 7,084 team-games of 2026:
+#
+#     most frequent starter (baseline)          17.5%
+#     most days rest                             7.7%
+#     most days rest, last 30 days              10.3%
+#     who followed this starter before          46.1%     <- the model below
+#
+# Two facts shape the design. Rotations churn hard: **11.7 distinct starters per club** over a
+# season, which is why "most rested" scores near nothing -- it keeps nominating arms who made
+# one April start and were never seen again. Availability filtering is therefore not a polish
+# step, it is the thing that makes the rest term usable at all. And opener-shaped starts are
+# only 2.2% of team-games, so the everyday value here is the no-probable-announced case rather
+# than the opener case.
+# ---------------------------------------------------------------------------------------
+
+_TEAM_START_LOG_CACHE = {}
+_ROSTER_STATUS_CACHE = {}
+
+# Starts inside this window make an arm a live rotation candidate. Long enough to survive a
+# skipped turn or a short IL stint, short enough that April's call-ups age out.
+ROTATION_RECENT_DAYS = 45
+# How startable an arm is on N days of rest. Peaked, not monotone, and that matters: a curve
+# that simply saturates above four days makes a pitcher who last started a month ago look as
+# ready as one on a normal turn, which is how Logan Allen came back as Cleveland's second most
+# likely starter on 29 days' rest off a single start. Four to six days is a rotation turn;
+# past ten, the arm is not in the rotation right now whatever his history says.
+ROTATION_REST_CURVE = [
+    (0, 0.02), (1, 0.02), (2, 0.05), (3, 0.35),
+    (4, 1.00), (5, 1.00), (6, 1.00),
+    (7, 0.80), (9, 0.55), (12, 0.30), (16, 0.15),
+]
+ROTATION_REST_FAR = 0.08        # beyond the last knot
+# Weight on the league opener rate when shrinking a pitcher's own. Openers are rare (2.2%), so
+# an arm with one short outing in one start should not come back as a 100% opener.
+OPENER_PRIOR_STARTS = 4.0
+
+
+def build_team_start_log(season, context_end, statcast_pitches_df=None):
+    """One row per (team, game): who started, how long, who followed, was it opener-shaped.
+
+    Built from the same pitch-level data as `build_opener_index` and with the same two
+    load-bearing details -- order from `at_bat_number` rather than inning, and exhibition
+    games excluded -- but keyed by *team* and date so a rotation can be read off it.
+
+    The pitching team comes from the half: the top of an inning is the away side batting, so
+    the home club is on the mound.
+    """
+    key = (int(season), str(context_end))
+    if key in _TEAM_START_LOG_CACHE:
+        return _TEAM_START_LOG_CACHE[key]
+
+    df = statcast_pitches_df
+    if df is None or df.empty:
+        try:
+            df = load_statcast_pitches(season=season, end_date=context_end)
+        except Exception as error:
+            print(f"⚠️ Rotation model unavailable: {error}")
+            return pd.DataFrame()
+    needed = {"game_pk", "game_date", "home_team", "away_team", "inning_topbot",
+              "pitcher", "at_bat_number", "events"}
+    if df is None or df.empty or not needed.issubset(df.columns):
+        return pd.DataFrame()
+
+    columns = list(needed) + (["game_type"] if "game_type" in df.columns else [])
+    slim = df[columns].copy()
+    if "game_type" in slim.columns:
+        slim = slim[slim["game_type"].astype("string").eq("R")]
+    slim = slim.dropna(subset=["game_pk", "pitcher", "at_bat_number", "inning_topbot"])
+    if slim.empty:
+        return pd.DataFrame()
+
+    slim["outs"] = slim["events"].astype("string").map(_EVENT_OUTS).fillna(0.0)
+    per = slim.groupby(["game_pk", "inning_topbot", "pitcher"], observed=True).agg(
+        first_ab=("at_bat_number", "min"), outs=("outs", "sum"),
+        game_date=("game_date", "first"), home=("home_team", "first"),
+        away=("away_team", "first")).reset_index()
+    per["ip"] = per["outs"] / 3.0
+    per = per.sort_values(["game_pk", "inning_topbot", "first_ab"], kind="mergesort")
+    per["slot"] = per.groupby(["game_pk", "inning_topbot"], observed=True).cumcount()
+    per["team"] = np.where(per["inning_topbot"].astype(str).str.startswith("Top"),
+                           per["home"], per["away"])
+
+    first = per[per["slot"] == 0].rename(columns={"pitcher": "starter", "ip": "starter_ip"})
+    second = per[per["slot"] == 1][["game_pk", "inning_topbot", "pitcher", "ip"]].rename(
+        columns={"pitcher": "bulk", "ip": "bulk_ip"})
+    log = first[["game_pk", "inning_topbot", "game_date", "team",
+                 "starter", "starter_ip"]].merge(
+        second, on=["game_pk", "inning_topbot"], how="left")
+    log["bulk_ip"] = log["bulk_ip"].fillna(0.0)
+    log["is_opener"] = (log["starter_ip"] <= OPENER_MAX_INNINGS) & \
+                       (log["bulk_ip"] >= BULK_MIN_INNINGS)
+    log["starter"] = log["starter"].astype(int)
+    log["game_date"] = pd.to_datetime(log["game_date"])
+    log = log.sort_values(["team", "game_date", "game_pk"]).reset_index(drop=True)
+    _TEAM_START_LOG_CACHE[key] = log
+    return log
+
+
+def roster_status(team_abbr, as_of_date=None):
+    """{player_id: (state, note)} where state is 'active', 'injured' or 'gone'.
+
+    Three lookups because the answer needs three: the active roster says who can pitch
+    tonight, the 40-man adds the injured with the injury text attached, and anyone the start
+    log knows about who appears on neither has been traded, released or outrighted. Without
+    this the rotation nominates arms who are no longer on the club, which is most of why a
+    naive rest-based prediction scores 7.7%.
+    """
+    key = (str(team_abbr), str(as_of_date))
+    if key in _ROSTER_STATUS_CACHE:
+        return _ROSTER_STATUS_CACHE[key]
+    out = {}
+    try:
+        for entry in get_team_roster(team_abbr, "40Man", as_of_date=as_of_date) or []:
+            pid = ((entry.get("person") or {}).get("id"))
+            if pid is None:
+                continue
+            status = ((entry.get("status") or {}).get("description") or "").strip()
+            note = (entry.get("note") or "").strip()
+            state = "active" if status.lower() == "active" else "injured"
+            out[int(pid)] = (state, note or status)
+        for entry in get_team_roster(team_abbr, "active", as_of_date=as_of_date) or []:
+            pid = ((entry.get("person") or {}).get("id"))
+            if pid is not None:
+                out[int(pid)] = ("active", "")
+    except Exception as error:
+        print(f"⚠️ Roster status unavailable for {team_abbr}: {error}")
+        return {}
+    _ROSTER_STATUS_CACHE[key] = out
+    return out
+
+
+def _rest_factor(days):
+    """How startable an arm is on this much rest, from ROTATION_REST_CURVE."""
+    if days is None:
+        return 0.5
+    for cut, value in ROTATION_REST_CURVE:
+        if days <= cut:
+            return value
+    return ROTATION_REST_FAR
+
+
+def _league_opener_rate(log):
+    return float(log["is_opener"].mean()) if log is not None and not log.empty else 0.02
+
+
+def build_rotation(team_abbr, season, context_end, as_of_date=None,
+                   log=None, statcast_pitches_df=None):
+    """This club's rotation as of a date: who the candidates are and who is likely to start.
+
+    Returns a dict with `candidates` (each carrying a start probability and a roster state),
+    the start-order `transitions` the probability is built from, and `bulk_arms` -- the arms
+    who actually cover innings behind a short start, which is what an opener night needs.
+
+    `p_start` is the sequence share for each candidate, gated by availability and rest and
+    renormalised over whoever is left. Announced probables are not consulted here; that is
+    `effective_starter`'s job, and keeping them apart means this can be checked against
+    history on nights where a probable was in fact posted.
+    """
+    if log is None:
+        log = build_team_start_log(season, context_end, statcast_pitches_df)
+    blank = {"team": team_abbr, "as_of": as_of_date, "candidates": [],
+             "transitions": {}, "bulk_arms": [], "last_starter": None,
+             "league_opener_rate": 0.02, "note": ""}
+    if log is None or log.empty:
+        return {**blank, "note": "no start log available"}
+
+    as_of = pd.to_datetime(as_of_date) if as_of_date else log["game_date"].max()
+    mine = log[(log["team"] == team_abbr) & (log["game_date"] < as_of)]
+    if mine.empty:
+        return {**blank, "note": f"no starts on record for {team_abbr}"}
+    mine = mine.sort_values(["game_date", "game_pk"])
+
+    league_opener = _league_opener_rate(log)
+    status = roster_status(team_abbr, as_of_date=as_of_date)
+
+    # Start-order transitions: who has followed whom in the rotation.
+    transitions = {}
+    starters = mine["starter"].tolist()
+    for previous, following in zip(starters, starters[1:]):
+        transitions.setdefault(int(previous), {})
+        transitions[int(previous)][int(following)] = \
+            transitions[int(previous)].get(int(following), 0) + 1
+
+    last_starter = int(starters[-1])
+    following_counts = transitions.get(last_starter, {})
+    following_total = sum(following_counts.values()) or 1
+
+    recent_cut = as_of - pd.Timedelta(days=ROTATION_RECENT_DAYS)
+    candidates = []
+    for pid, group in mine.groupby("starter"):
+        last_start = group["game_date"].max()
+        starts = len(group)
+        recent_starts = int((group["game_date"] >= recent_cut).sum())
+        state, note = status.get(int(pid), ("gone", "not on the 40-man"))
+        days_rest = int((as_of - last_start).days)
+        opener_starts = int(group["is_opener"].sum())
+        # Shrunk toward the league rate so one short outing is not a career.
+        p_opener = (opener_starts + league_opener * OPENER_PRIOR_STARTS) / \
+                   (starts + OPENER_PRIOR_STARTS)
+        sequence_share = following_counts.get(int(pid), 0) / following_total
+        available = state == "active" and recent_starts > 0
+        candidates.append({
+            "id": int(pid),
+            "name": _player_name_from_id(int(pid)),
+            "starts": starts,
+            "recent_starts": recent_starts,
+            "last_start": last_start.strftime("%Y-%m-%d"),
+            "days_rest": days_rest,
+            "avg_ip": round(float(group["starter_ip"].mean()), 2),
+            "opener_starts": opener_starts,
+            "p_opener": round(float(p_opener), 3),
+            "state": state,
+            "note": note,
+            "sequence_share": round(float(sequence_share), 3),
+            "available": available,
+            "_score": sequence_share * _rest_factor(days_rest) if available else 0.0,
+        })
+
+    total = sum(c["_score"] for c in candidates)
+    if total <= 0:
+        # Nobody scored: fall back to rest order among available arms, which is the right
+        # answer when the club has just turned its rotation over and no transition is known.
+        pool = [c for c in candidates if c["available"]] or candidates
+        for c in candidates:
+            c["p_start"] = 0.0
+        if pool:
+            pool.sort(key=lambda c: -c["days_rest"])
+            pool[0]["p_start"] = 1.0
+    else:
+        for c in candidates:
+            c["p_start"] = round(c["_score"] / total, 3)
+    for c in candidates:
+        c.pop("_score", None)
+    candidates.sort(key=lambda c: (-c["p_start"], -c["recent_starts"]))
+
+    # Arms who actually cover innings behind a short start -- the opener-night substitute.
+    bulk = mine[mine["bulk"].notna() & (mine["bulk_ip"] >= BULK_MIN_INNINGS)]
+    bulk_arms = []
+    if not bulk.empty:
+        counts = bulk["bulk"].value_counts()
+        for bid, times in counts.head(6).items():
+            sub = bulk[bulk["bulk"] == bid]
+            state, note = status.get(int(bid), ("gone", "not on the 40-man"))
+            bulk_arms.append({
+                "id": int(bid), "name": _player_name_from_id(int(bid)),
+                "games": int(times), "avg_ip": round(float(sub["bulk_ip"].mean()), 2),
+                "share": round(times / len(bulk) * 100),
+                "last": sub["game_date"].max().strftime("%Y-%m-%d"),
+                "state": state, "note": note,
+            })
+
+    return {"team": team_abbr, "as_of": as_of.strftime("%Y-%m-%d"),
+            "candidates": candidates, "transitions": transitions,
+            "bulk_arms": bulk_arms, "last_starter": last_starter,
+            "league_opener_rate": round(league_opener, 4), "note": ""}
+
+
+def effective_starter(rotation, announced_id=None, opener_profile=None,
+                      opener_threshold=0.5):
+    """Who to analyse as tonight's starter, and why.
+
+    Three cases, in order:
+
+      announced and not an opener   the listed probable, as before
+      announced but an opener       the club's likeliest bulk arm, because the lineup will
+                                    spend the night against him rather than the opener
+      nothing announced             the rotation's most likely candidate
+
+    Returns `{"id", "name", "source", "note", "displaced"}`. `source` says which branch
+    fired so a report can state it rather than silently swapping a name -- substituting a
+    pitcher without saying so is how a board becomes untrustworthy.
+    """
+    candidates = (rotation or {}).get("candidates") or []
+    bulk_arms = [b for b in (rotation or {}).get("bulk_arms") or []
+                 if b.get("state") == "active"]
+
+    def bulk_pick(displaced, why):
+        if not bulk_arms:
+            return None
+        best = max(bulk_arms, key=lambda b: (b["games"], b["avg_ip"]))
+        return {"id": best["id"], "name": best["name"], "source": "bulk",
+                "displaced": displaced,
+                "note": (f"{why}; {best['name']} has covered bulk innings in "
+                         f"{best['games']} of this club's short starts "
+                         f"({best['share']}%, {best['avg_ip']} IP average)")}
+
+    if announced_id:
+        p_opener = None
+        if isinstance(opener_profile, dict):
+            p_opener = opener_profile.get("p_opener")
+            if p_opener is None and opener_profile.get("is_opener"):
+                p_opener = 1.0
+        if p_opener is None:
+            match = next((c for c in candidates if c["id"] == int(announced_id)), None)
+            p_opener = (match or {}).get("p_opener", 0.0)
+        if p_opener is not None and p_opener >= opener_threshold:
+            swapped = bulk_pick(int(announced_id),
+                                f"listed starter profiles as an opener (p={p_opener:.2f})")
+            if swapped:
+                return swapped
+        name = next((c["name"] for c in candidates if c["id"] == int(announced_id)), None)
+        return {"id": int(announced_id), "name": name or _player_name_from_id(int(announced_id)),
+                "source": "announced", "displaced": None, "note": ""}
+
+    startable = [c for c in candidates if c.get("p_start", 0) > 0]
+    if startable:
+        best = startable[0]
+        if best.get("p_opener", 0.0) >= opener_threshold:
+            swapped = bulk_pick(best["id"],
+                                f"no probable announced and the likeliest starter "
+                                f"{best['name']} profiles as an opener")
+            if swapped:
+                return swapped
+        return {"id": best["id"], "name": best["name"], "source": "rotation",
+                "displaced": None,
+                "note": (f"no probable announced; rotation model gives {best['name']} "
+                         f"{best['p_start']:.0%} on {best['days_rest']} days rest")}
+    return bulk_pick(None, "no probable announced and no rotation candidate is startable") \
+        or {"id": None, "name": "TBD", "source": "unknown", "displaced": None,
+            "note": "no probable announced and no usable rotation history"}
 
 
 _TEAM_HITTING_CONTEXT_CACHE = {}
@@ -6706,11 +9028,15 @@ def _starter_label(info, fallback="Starter"):
 
 def build_opp_pitching_allowed_summary(starter_id, pitching_team, bullpen_df, season, context_end,
                                        max_relievers=7, starter_name=None):
-    """OPS/xwOBA allowed by the opposing starter and bullpen, sliced like the lineup summary.
+    """What the opposing starter and bullpen allow, sliced like the lineup summary.
+
+    Same columns as the hitting summary and computed by the same helper, so a row here can
+    be read directly against the row above it -- K% allowed against the lineup's own K%,
+    ISO allowed against its ISO.
 
     The starter's rows are labeled with his actual name rather than "Starter" so the table
     reads without cross-referencing which pitcher the section belongs to."""
-    columns = ["Team", "Unit", "Split", "PA", "OPS", "xwOBA"]
+    columns = ["Team", "Unit", "Split"] + SPLIT_STAT_COLUMNS
     start_date = _season_start_date(season)
     if context_end and context_end < start_date:
         return pd.DataFrame(columns=columns)
@@ -6732,29 +9058,24 @@ def build_opp_pitching_allowed_summary(starter_id, pitching_team, bullpen_df, se
         return df
 
     def add_common_splits(unit, frame, park_team=None):
-        pa, ops, xw = _split_ops_xwoba(frame)
-        rows.append({"Unit": unit, "Split": "Overall", "PA": pa, "OPS": round(ops, 3), "xwOBA": round(xw, 3)})
+        rows.append({"Unit": unit, "Split": "Overall", **_split_metrics(frame)})
         if park_team and "home_team" in frame.columns:
             canon = _canon_team(park_team)
             home_mask = frame["home_team"].astype(str).map(_canon_team) == canon
             hf = _team_home_park_run_factor(canon)
-            pa_h, ops_h, xw_h = _split_ops_xwoba(frame[home_mask])
-            rows.append({"Unit": unit, "Split": "Home (PF)", "PA": pa_h,
-                         "OPS": _park_adjust(ops_h, hf), "xwOBA": _park_adjust(xw_h, hf, 0.5)})
+            rows.append({"Unit": unit, "Split": "Home (PF)",
+                         **_park_adjusted_split(frame[home_mask], hf)})
             away_sub = frame[~home_mask]
             af = float(away_sub["home_team"].astype(str).map(_team_home_park_run_factor).mean()) if not away_sub.empty else 1.0
-            pa_a, ops_a, xw_a = _split_ops_xwoba(away_sub)
-            rows.append({"Unit": unit, "Split": "Away (PF)", "PA": pa_a,
-                         "OPS": _park_adjust(ops_a, af), "xwOBA": _park_adjust(xw_a, af, 0.5)})
+            rows.append({"Unit": unit, "Split": "Away (PF)",
+                         **_park_adjusted_split(away_sub, af)})
         if "stand" in frame.columns:
             for hand, label in [("L", "vs LHB"), ("R", "vs RHB")]:
                 sub = frame[frame["stand"].astype(str).str.strip() == hand]
-                pa_s, ops_s, xw_s = _split_ops_xwoba(sub)
-                rows.append({"Unit": unit, "Split": label, "PA": pa_s, "OPS": round(ops_s, 3), "xwOBA": round(xw_s, 3)})
+                rows.append({"Unit": unit, "Split": label, **_split_metrics(sub)})
         if cutoff and "game_date" in frame.columns:
             sub = frame[frame["game_date"].astype(str) >= cutoff]
-            pa_r, ops_r, xw_r = _split_ops_xwoba(sub)
-            rows.append({"Unit": unit, "Split": "L28", "PA": pa_r, "OPS": round(ops_r, 3), "xwOBA": round(xw_r, 3)})
+            rows.append({"Unit": unit, "Split": "L28", **_split_metrics(sub)})
 
     rows = []
     starter_df = pitcher_pa_rows(starter_id)
@@ -7004,26 +9325,91 @@ def _format_ab_ops_hr(ab, ops, hr):
     return f"{ab} AB / {ops_value:.3f} OPS / {hr} HR"
 
 
+# At-bats at which a split OPS is about half-reliable, so a sample of that size is believed
+# halfway and the rest is pulled back to the hitter's own season line. OBP stabilizes around
+# 460 PA and SLG around 320 AB, so ~300 is the honest figure for the pair of them.
+#
+# This exists because picking the *maximum* OPS across five samples of wildly different size
+# is a bias, not a read: the largest of several noisy estimates is systematically the
+# luckiest small one. Measured over 3,539 hitter rows from 203 cached games, the old
+# max-selection reported a .921 OPS for hitters whose season OPS was .730 -- 192 points of
+# pure selection bias, rising to +439 when it crowned a BvP line on a median of 9 at-bats.
+HITTER_SPLIT_SHRINK_AB = 300.0
+
+
+def _shrunk_split_ops(ops, at_bats, season_ops):
+    """A split OPS pulled toward the hitter's own season line by its sample size.
+
+    Returns (shrunk OPS, deviation from season). An 8-at-bat split moves the estimate about
+    2.5% of the way to what it observed; a 150-at-bat platoon split moves it a third.
+    """
+    ops = _safe_number(ops, None)
+    season_ops = _safe_number(season_ops, None)
+    at_bats = max(0.0, _safe_number(at_bats, 0) or 0.0)
+    if ops is None or season_ops is None or not at_bats:
+        return None, None
+    shrunk = (ops * at_bats + season_ops * HITTER_SPLIT_SHRINK_AB) / (at_bats + HITTER_SPLIT_SHRINK_AB)
+    return shrunk, shrunk - season_ops
+
+
+# Per-source belief in the *construct*, once sample size is handled by shrinkage above.
+# Set from what each one was measured to be worth, not from how interesting it looks:
+# platoon splits are a real and large effect; the individual hitter's arsenal fit came back
+# at t = 1.5 on DK points over 100,372 player-games; comp-pitcher "similar" ranks starters at
+# a coin flip; and batter-vs-pitcher history is t = 0.66, turning negative where the sample
+# reaches ten plate appearances. BvP is therefore shown and not scored.
+# See docs/arsenal_study.md.
+#
+# Scale note: these multiply a deviation from the hitter's *own season line*, where the old
+# weights multiplied a deviation from a flat .700. That is a far smaller quantity, so the
+# numbers are larger to keep Composite on its original scale and the Priority/Watch/Fade
+# thresholds meaningful. A 250-at-bat platoon split 200 points above a hitter's season now
+# moves him ~14 points, close to the ~11 it moved before; an 8-at-bat arsenal split 850
+# points above his season moves him ~1, where it used to move him ~41.
+HITTER_SPLIT_WEIGHTS = {"Platoon": 150.0, "Arsenal": 50.0, "Similar": 20.0, "BvP": 0.0}
+
+_HITTER_SPLIT_SPECS = [
+    ("Platoon", "Platoon AB", "Platoon OPS", "Platoon HR"),
+    ("Arsenal", "Arsenal AB", "Arsenal OPS", "Arsenal HR"),
+    ("Similar", "Similar AB", "Similar OPS", "Similar HR"),
+    ("BvP", "BvP AB", "BvP OPS", "BvP HR"),
+]
+
+
 def _best_hitter_signal(row):
-    candidates = []
-    specs = [
-        ("Season", "Season AB", "Season OPS", "Season HR", 50),
-        ("Platoon", "Platoon AB", "Platoon OPS", "Platoon HR", 20),
-        ("Arsenal", "Arsenal AB", "Arsenal OPS", "Arsenal HR", 8),
-        ("Similar", "Similar AB", "Similar OPS", "Similar HR", 8),
-        ("BvP", "BvP AB", "BvP OPS", "BvP HR", 6),
-    ]
-    for label, ab_col, ops_col, hr_col, min_ab in specs:
-        ab = int(_safe_number(row.get(ab_col), 0))
-        ops = _safe_number(row.get(ops_col), None)
-        hr = int(_safe_number(row.get(hr_col), 0))
-        if ab >= min_ab and ops is not None:
-            candidates.append((ops, label, ab, hr))
-    if not candidates:
-        season_ab = int(_safe_number(row.get("Season AB"), 0))
+    """The most notable split for this hitter, after shrinking each one for sample size.
+
+    Reports the raw line the reader can check *and* how much of it survives regression, so
+    a 1.200 OPS on nine at-bats is visible as the +.011 it is actually worth.
+    """
+    season_ops = _safe_number(row.get("Season OPS"), None)
+    season_ab = int(_safe_number(row.get("Season AB"), 0))
+    if season_ops is None:
         return f"Thin samples / {season_ab} season AB"
-    ops, label, ab, hr = max(candidates, key=lambda item: (item[0], item[2]))
-    return f"{label}: {ops:.3f} OPS / {ab} AB / {hr} HR"
+
+    candidates = []
+    for label, ab_col, ops_col, hr_col in _HITTER_SPLIT_SPECS:
+        # A split we do not score is a split we do not headline either. BvP is shown in its
+        # own column and note, but naming it a hitter's best signal would assert something
+        # the measurement says is not there.
+        if not HITTER_SPLIT_WEIGHTS.get(label, 0.0):
+            continue
+        at_bats = int(_safe_number(row.get(ab_col), 0))
+        _, deviation = _shrunk_split_ops(row.get(ops_col), at_bats, season_ops)
+        if deviation is None:
+            continue
+        candidates.append((abs(deviation), deviation, label, at_bats,
+                           _safe_number(row.get(ops_col), 0.0),
+                           int(_safe_number(row.get(hr_col), 0))))
+    if not candidates:
+        return f"Season: {season_ops:.3f} OPS / {season_ab} AB"
+
+    _, deviation, label, at_bats, raw_ops, hr = max(candidates, key=lambda item: item[0])
+    # Below a point of OPS the split is not saying anything the season line does not.
+    if abs(deviation) < 0.010:
+        return f"Season: {season_ops:.3f} OPS / {season_ab} AB (no split stands out)"
+    return (f"{label}: {raw_ops:.3f} OPS / {at_bats} AB / {hr} HR "
+            f"({deviation:+.3f} vs season after regression)")
 
 
 def build_hitter_composite_table(team, lineup_df, splits_df=None, similar_df=None, arsenal_df=None, bvp_df=None):
@@ -7096,15 +9482,20 @@ def build_hitter_composite_table(team, lineup_df, splits_df=None, similar_df=Non
         platoon_ab = _safe_number(row.get("Platoon AB"), 0)
         bvp_ab = _safe_number(row.get("BvP AB"), 0)
 
+        # Each split enters as its *shrunk deviation from this hitter's own season line*,
+        # scaled by how much the construct is worth. The old version added the raw split
+        # once it cleared a minimum-at-bat gate, which gave an 8-at-bat arsenal sample a
+        # heavier weight (55) than a 20-at-bat platoon split (45) and let a lucky fortnight
+        # move a hitter two tiers.
         score = (season_ops - 0.700) * 95 + min(season_hr, 25) * 1.2
-        if platoon_ops is not None and platoon_ab >= 20:
-            score += (platoon_ops - 0.700) * 45
-        if arsenal_ops is not None and arsenal_ab >= 8:
-            score += (arsenal_ops - 0.700) * 55
-        if similar_ops is not None and similar_ab >= 8:
-            score += (similar_ops - 0.700) * 35
-        if bvp_ops is not None and bvp_ab >= 6:
-            score += (bvp_ops - 0.700) * 15
+        for label, ab_col, ops_col, _hr_col in _HITTER_SPLIT_SPECS:
+            weight = HITTER_SPLIT_WEIGHTS.get(label, 0.0)
+            if not weight:
+                continue
+            _, deviation = _shrunk_split_ops(row.get(ops_col),
+                                             _safe_number(row.get(ab_col), 0), season_ops)
+            if deviation is not None:
+                score += deviation * weight
 
         if score >= 45:
             signal = "Priority"
@@ -7162,29 +9553,31 @@ def summarize_hitter_composite(hitter_composite):
         ranked = team_df.sort_values(["Composite", "Season OPS"], ascending=False)
         top_names = ranked.head(3)["Name"].dropna().astype(str).tolist()
 
-        arsenal_pool = ranked[pd.to_numeric(ranked.get("Arsenal AB", 0), errors="coerce").fillna(0) >= 8].copy()
-        if not arsenal_pool.empty:
-            arsenal_pool["Arsenal OPS Sort"] = pd.to_numeric(arsenal_pool["Arsenal OPS"], errors="coerce")
-            arsenal_row = arsenal_pool.sort_values(["Arsenal OPS Sort", "Arsenal AB"], ascending=False).iloc[0]
-            arsenal_note = f"{arsenal_row.get('Name')}: {arsenal_row.get('Arsenal')}"
-        else:
-            arsenal_note = "No strong sample"
+        def best_by_shrunk(ab_column, ops_column, display_column, empty_text):
+            """The most notable hitter on a split, after regressing it for sample size.
 
-        similar_pool = ranked[pd.to_numeric(ranked.get("Similar AB", 0), errors="coerce").fillna(0) >= 8].copy()
-        if not similar_pool.empty:
-            similar_pool["Similar OPS Sort"] = pd.to_numeric(similar_pool["Similar OPS"], errors="coerce")
-            similar_row = similar_pool.sort_values(["Similar OPS Sort", "Similar AB"], ascending=False).iloc[0]
-            similar_note = f"{similar_row.get('Name')}: {similar_row.get('Similar')}"
-        else:
-            similar_note = "No strong sample"
+            Sorting on the raw split OPS picked whoever had the fewest at-bats and the most
+            luck, which is how "Best Arsenal Fit" kept naming a hitter off eight at-bats.
+            """
+            pool = ranked.copy()
+            deviations = []
+            for _, entry in pool.iterrows():
+                _, deviation = _shrunk_split_ops(entry.get(ops_column), entry.get(ab_column),
+                                                 entry.get("Season OPS"))
+                deviations.append(deviation if deviation is not None else np.nan)
+            pool["_dev"] = deviations
+            pool = pool[pool["_dev"].notna() & (pool["_dev"] > 0)]
+            if pool.empty:
+                return empty_text
+            best = pool.sort_values("_dev", ascending=False).iloc[0]
+            return (f"{best.get('Name')}: {best.get(display_column)} "
+                    f"({best['_dev']:+.3f} vs season)")
 
-        bvp_pool = ranked[pd.to_numeric(ranked.get("BvP AB", 0), errors="coerce").fillna(0) >= 6].copy()
-        if not bvp_pool.empty:
-            bvp_pool["BvP OPS Sort"] = pd.to_numeric(bvp_pool["BvP OPS"], errors="coerce")
-            bvp_row = bvp_pool.sort_values(["BvP OPS Sort", "BvP AB"], ascending=False).iloc[0]
-            bvp_note = f"{bvp_row.get('Name')}: {bvp_row.get('BvP')}"
-        else:
-            bvp_note = "No meaningful history"
+        arsenal_note = best_by_shrunk("Arsenal AB", "Arsenal OPS", "Arsenal", "No strong sample")
+        similar_note = best_by_shrunk("Similar AB", "Similar OPS", "Similar", "No strong sample")
+        # Kept as a note and deliberately not scored anywhere: measured at t = 0.66 on DK
+        # points, and negative where the sample reaches ten plate appearances.
+        bvp_note = best_by_shrunk("BvP AB", "BvP OPS", "BvP", "No meaningful history")
 
         rows.append({
             "Team": team,
@@ -7216,6 +9609,25 @@ def load_model_calibration(path=CALIBRATION_PATH):
             return json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def model_calibration_provenance(calibration=None, path=CALIBRATION_PATH):
+    """Stable identity for the exact game-model artifact applied to a report cache."""
+    calibration = calibration if calibration is not None else load_model_calibration(path)
+    if not calibration:
+        return {
+            "fingerprint": "none",
+            "feature_version": None,
+            "created_at": None,
+        }
+    encoded = json.dumps(
+        calibration, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return {
+        "fingerprint": hashlib.sha256(encoded).hexdigest()[:16],
+        "feature_version": calibration.get("feature_version"),
+        "created_at": calibration.get("created_at"),
+    }
 
 
 def build_game_scorecard(
@@ -7291,6 +9703,10 @@ def build_game_scorecard(
                 "home_lineup_ops": home["Lineup OPS"],
                 "away_lineup_ops": away["Lineup OPS"],
             }
+            # Calibration is trained with these exact numeric transformations.  Without
+            # this update, the report silently supplied zero for every fitted weather and
+            # umpire coefficient even though those fields were present in the environment.
+            feature_values.update(_weather_calibration_features(environment))
             model_total = total_model.get("intercept", raw_total)
             for feature, coef in zip(total_model.get("features", []), total_model.get("coef", [])):
                 model_total += feature_values.get(feature, 0.0) * coef
@@ -7323,10 +9739,34 @@ def build_game_scorecard(
     winner = home_team if home_win >= away_win else away_team
     if calibration:
         reliability = calibration.get("reliability", "unknown")
-        model_note = f"calibrated/regressed ({reliability})"
+        win_signal = (
+            calibration.get("validation", {})
+            .get("signal_analysis", {})
+            .get("win", {})
+        )
+        umpire_signal = (
+            calibration.get("validation", {})
+            .get("signal_analysis", {})
+            .get("context", {})
+            .get("components", {})
+            .get("umpire_tendency", {})
+        )
+        magnitude_note = "win magnitude validated" if win_signal.get("magnitude_validated") else "win magnitude directional"
+        umpire_note = "" if umpire_signal.get("magnitude_validated") else "; umpire experimental"
+        model_note = f"calibrated/regressed ({reliability}; {magnitude_note}{umpire_note})"
     else:
         model_note = "heuristic"
-    return scorecard, {"Projected Winner": winner, "Total Runs": total_runs, "Home Win%": round(home_win * 100, 1), "Away Win%": round(away_win * 100, 1), "Model": model_note}
+    provenance = model_calibration_provenance(calibration)
+    return scorecard, {
+        "Projected Winner": winner,
+        "Total Runs": total_runs,
+        "Home Win%": round(home_win * 100, 1),
+        "Away Win%": round(away_win * 100, 1),
+        "Model": model_note,
+        "Calibration Fingerprint": provenance["fingerprint"],
+        "Calibration Feature Version": provenance["feature_version"],
+        "Calibration Created At": provenance["created_at"],
+    }
 
 
 TRUSTED_TIME_ZONE_BASELINE = {
@@ -7430,13 +9870,131 @@ def apply_trusted_time_zone_baseline(
     return result, summary
 
 
-def build_pitcher_watchlist(home_team, away_team, home_starter_info, away_starter_info, away_vs_home_arsenal=None, home_vs_away_arsenal=None, environment=None):
-    columns = ["Team", "Pitcher", "Role", "Why", "FIP", "K-BB", "Opponent Arsenal", "Score"]
+def refresh_payload_model_calibration(payload, force=False):
+    """Rebuild calibration-dependent cache fields without any network requests.
+
+    Returns ``(payload, changed, provenance)``.  DFS calls this before projecting a
+    cached game, so a stale scorecard cannot silently feed old expected runs and win
+    probabilities into the optimizer.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("report cache payload is not a dictionary")
+    args = payload.get("report_args")
+    context = payload.get("advanced_context")
+    if not isinstance(args, (tuple, list)) or len(args) <= 16:
+        raise ValueError("report cache has no compatible report_args")
+    if not isinstance(context, dict):
+        raise ValueError("report cache has no advanced_context")
+
+    calibration = load_model_calibration()
+    if not calibration:
+        raise RuntimeError(
+            f"model calibration artifact is unavailable or invalid: {CALIBRATION_PATH}"
+        )
+    current = model_calibration_provenance(calibration)
+    summary = context.get("projection_summary") or {}
+    cached = payload.get("model_calibration") or {
+        "fingerprint": summary.get("Calibration Fingerprint", "unknown"),
+        "feature_version": summary.get("Calibration Feature Version"),
+        "created_at": summary.get("Calibration Created At"),
+    }
+    if not force and cached.get("fingerprint") == current["fingerprint"]:
+        payload["model_calibration"] = current
+        return payload, False, current
+
+    home_team, away_team = args[15], args[16]
+    environment = context.get("environment") or {}
+    fresh_scorecard, fresh_summary = build_game_scorecard(
+        home_team, away_team,
+        args[2], args[9],
+        args[0], args[7],
+        args[1], args[8],
+        context.get("home_similarity"), context.get("away_similarity"),
+        environment,
+    )
+    fresh_scorecard, fresh_summary = apply_trusted_time_zone_baseline(
+        fresh_scorecard,
+        fresh_summary,
+        away_team,
+        home_team,
+        context.get("away_time_zone", {}),
+        context.get("home_time_zone", {}),
+    )
+
+    existing = context.get("scorecard")
+    if isinstance(existing, pd.DataFrame) and not existing.empty and "Team" in existing:
+        refreshed = existing.copy()
+        indexed = fresh_scorecard.set_index("Team") if not fresh_scorecard.empty else pd.DataFrame()
+        for column in ("Win Lean", "Exp Runs", "Edge", "Lineup", "Similar SP",
+                       "Opp SP FIP", "Bullpen", "TZ Study"):
+            if not indexed.empty and column in indexed:
+                refreshed[column] = refreshed["Team"].map(indexed[column]).fillna(
+                    refreshed.get(column, "")
+                )
+    else:
+        refreshed = fresh_scorecard
+
+    merged_summary = dict(summary)
+    merged_summary.update(fresh_summary)
+    context["scorecard"] = refreshed
+    context["projection_summary"] = merged_summary
+
+    # Keep report diagnostics consistent with the scorecard the optimizer consumes.
+    try:
+        context["factor_matrix"] = build_factor_matrix(
+            away_team, home_team, refreshed,
+            args[9], args[2], args[8], args[1],
+            context.get("away_vs_home_arsenal"), context.get("home_vs_away_arsenal"),
+            context.get("away_recent_summary"), context.get("home_recent_summary"),
+            context.get("away_park_defense"), context.get("home_park_defense"),
+            environment,
+        )
+    except Exception:
+        # The optimizer only consumes scorecard/environment; old report payloads may lack
+        # a newer diagnostic table, which must not prevent a valid projection refresh.
+        pass
+    context["uncertainty_flags"] = generate_uncertainty_flags(
+        refreshed, away_team, home_team,
+        args[7], args[0],
+        context.get("away_type_results"), context.get("home_type_results"),
+        args[8], args[1], merged_summary,
+    )
+    payload["advanced_context"] = context
+    payload["model_calibration"] = current
+    return payload, True, current
+
+
+def _lineup_k_edge_points(batter_arsenal_df, lineup_df):
+    """Lineup-level arsenal K edge in percentage points, or None.
+
+    Shares `dfs.projections.lineup_arsenal_k_edge` with the DFS projection rather than
+    re-deriving it, so the number printed in the report is the number that moved the
+    starter's projection. Imported lazily to keep the report importable without dfs.
+    """
+    try:
+        from dfs.projections import lineup_arsenal_k_edge
+    except Exception:
+        return None
+    edge, hitters = lineup_arsenal_k_edge(batter_arsenal_df, lineup_df)
+    return None if edge is None else (edge * 100, hitters)
+
+
+def build_pitcher_watchlist(home_team, away_team, home_starter_info, away_starter_info,
+                            away_vs_home_arsenal=None, home_vs_away_arsenal=None,
+                            environment=None, away_batter_arsenal=None,
+                            home_batter_arsenal=None, away_lineup_df=None,
+                            home_lineup_df=None):
+    # "Opponent Arsenal" is the OPS-based read, which a three-season test found to be the
+    # weak half of this measurement (docs/arsenal_study.md). "K Edge" is the half that
+    # survived, so it is shown beside it rather than instead of it -- one is context, the
+    # other is the number the projection actually uses.
+    columns = ["Team", "Pitcher", "Role", "Why", "FIP", "K-BB", "Opponent Arsenal",
+               "K Edge", "Score"]
     rows = []
     park_runs = environment.get("park", {}).get("Runs", 1.0) if isinstance(environment, dict) else 1.0
-    for team, starter, opponent_arsenal in [
-        (away_team, away_starter_info, home_vs_away_arsenal),
-        (home_team, home_starter_info, away_vs_home_arsenal),
+    for team, starter, opponent_arsenal, opp_batter_arsenal, opp_lineup in [
+        (away_team, away_starter_info, home_vs_away_arsenal, home_batter_arsenal, home_lineup_df),
+        (home_team, home_starter_info, away_vs_home_arsenal, away_batter_arsenal, away_lineup_df),
     ]:
         if isinstance(starter, dict):
             kbb = (_safe_number(starter.get("K%"), 0) * (100 if abs(_safe_number(starter.get("K%"), 0)) <= 1 else 1)) - (_safe_number(starter.get("BB%"), 0) * (100 if abs(_safe_number(starter.get("BB%"), 0)) <= 1 else 1))
@@ -7444,11 +10002,23 @@ def build_pitcher_watchlist(home_team, away_team, home_starter_info, away_starte
             arsenal_row = opponent_arsenal.iloc[0].to_dict() if opponent_arsenal is not None and not opponent_arsenal.empty else {}
             opp_ops = _safe_number(arsenal_row.get("OPS"), 0.720)
             opp_tag = arsenal_row.get("Arsenal Tag", "N/A")
+            measured = _lineup_k_edge_points(opp_batter_arsenal, opp_lineup)
+            k_edge, k_edge_hitters = measured if measured else (None, 0)
             score = (18 - fip * 2.2) + (kbb * 0.7) + ((0.720 - opp_ops) * 45) + ((1.0 - park_runs) * 5)
-            if fip <= 3.80 and opp_ops <= 0.720:
+            if k_edge is not None:
+                # Scaled off the fitted K-rate pass-through: 0.45 of the edge reaches his
+                # real K rate, at ~24 batters faced and 2 DK points a strikeout, so a point
+                # of edge is worth about 0.2 DK. Kept small on purpose -- it is a tiebreak
+                # between comparable arms, not a reason to start a bad one.
+                score += k_edge * 0.22
+            if k_edge is not None and k_edge >= 1.5:
+                why = "lineup whiffs vs his shapes"
+            elif fip <= 3.80 and opp_ops <= 0.720:
                 why = "starter run-prevention fit"
             elif opp_ops <= 0.660:
                 why = "opponent struggles vs arsenal"
+            elif k_edge is not None and k_edge <= -1.5:
+                why = "lineup makes contact vs his shapes"
             elif fip <= 3.50:
                 why = "starter form"
             else:
@@ -7461,6 +10031,8 @@ def build_pitcher_watchlist(home_team, away_team, home_starter_info, away_starte
                 "FIP": round(fip, 2),
                 "K-BB": round(kbb, 1),
                 "Opponent Arsenal": f"{opp_tag} / {opp_ops:.3f} OPS",
+                "K Edge": (f"{k_edge:+.1f} pts ({k_edge_hitters} bats)"
+                           if k_edge is not None else "n/a"),
                 "Score": round(score, 1),
             })
     return pd.DataFrame(rows, columns=columns).sort_values("Score", ascending=False)
@@ -7581,6 +10153,7 @@ def build_advanced_context(
     statcast_detail_df,
     statcast_similarity_df=None,
     dh_game=None,
+    starter_provenance=None,
 ):
     context_end = _pregame_end_date(game_date) or game_date
     environment = get_game_environment(game_id, game_date)
@@ -7606,6 +10179,9 @@ def build_advanced_context(
     home_rolling_form = get_team_rolling_form(get_team_id(home_team), home_team, season, context_end)
     away_catcher_run_game = generate_catcher_run_game_report(away_team, home_team, away_defense_df, home_baserunning_df)
     home_catcher_run_game = generate_catcher_run_game_report(home_team, away_team, home_defense_df, away_baserunning_df)
+    # Rescale the baserunning heat to where the league actually sits today, before any
+    # table is coloured. Cheap (one cached request) and silent if it fails.
+    refresh_baserunning_heat_anchors(season)
     away_park_defense = generate_park_defense_impact(away_team, home_team, away_defense_df, home_lineup_df, home_baserunning_df, environment)
     home_park_defense = generate_park_defense_impact(home_team, away_team, home_defense_df, away_lineup_df, away_baserunning_df, environment)
     home_pitcher_quality = get_pitcher_opponent_quality(home_pitcher, season, context_end)
@@ -7679,7 +10255,11 @@ def build_advanced_context(
     ], ignore_index=True)
     if not hitter_watchlist.empty and "Priority" in hitter_watchlist.columns:
         hitter_watchlist = hitter_watchlist.sort_values("Priority", ascending=False)
-    pitcher_watchlist = build_pitcher_watchlist(home_team, away_team, home_starter_info, away_starter_info, away_vs_home_arsenal, home_vs_away_arsenal, environment)
+    pitcher_watchlist = build_pitcher_watchlist(
+        home_team, away_team, home_starter_info, away_starter_info,
+        away_vs_home_arsenal, home_vs_away_arsenal, environment,
+        away_batter_arsenal=away_batter_arsenal, home_batter_arsenal=home_batter_arsenal,
+        away_lineup_df=away_lineup_df, home_lineup_df=home_lineup_df)
     away_bullpen_form = summarize_bullpen_form(away_team, away_bullpen_df)
     home_bullpen_form = summarize_bullpen_form(home_team, home_bullpen_df)
     scorecard, projection_summary = build_game_scorecard(
@@ -7770,8 +10350,16 @@ def build_advanced_context(
         away_bullpen_df, home_bullpen_df,
         projection_summary,
     )
+    # Each club is compared against the arm it faces, so the starter info is crossed.
+    _away_tonight = _tonight_conditions(environment, home_starter_info, away_lineup_df,
+                                        is_home=False, rest_schedule=away_rest_schedule)
+    _home_tonight = _tonight_conditions(environment, away_starter_info, home_lineup_df,
+                                        is_home=True, rest_schedule=home_rest_schedule)
     return {
         "environment": environment,
+        # Where each starter's name came from. Rides in the cached payload so a re-render
+        # can label a provisional pick and `refresh_cached_lineups` can retire it.
+        "starter_provenance": starter_provenance or {},
         "scorecard": scorecard,
         "factor_matrix": factor_matrix,
         "projection_summary": projection_summary,
@@ -7810,6 +10398,30 @@ def build_advanced_context(
                                                         statcast_df=statcast_detail_df),
         "home_recent_boxscores": build_recent_boxscores(get_team_id(home_team), home_team, game_date,
                                                         statcast_df=statcast_detail_df),
+        # Relief workload over the last five GAMES. Shares the boxscore cache the tables
+        # above just filled, so the two extra games cost one request each.
+        "away_bullpen_l5": build_bullpen_l5(get_team_id(away_team), away_team, game_date,
+                                            bullpen_df=away_bullpen_df),
+        "home_bullpen_l5": build_bullpen_l5(get_team_id(home_team), home_team, game_date,
+                                            bullpen_df=home_bullpen_df),
+        # Batted-ball profile for each pen, sliced from the statcast frame already loaded.
+        "away_bullpen_batted": build_bullpen_batted(away_bullpen_df, statcast_detail_df),
+        "home_bullpen_batted": build_bullpen_batted(home_bullpen_df, statcast_detail_df),
+        # Last ten games with tonight's conditions attached, and the ranked comparables the
+        # per-team tabs render. The opposing starter is the OTHER club's probable, so each
+        # side is compared against the matchup it is actually walking into.
+        "away_relevant_games": build_relevant_games(
+            get_team_id(away_team), away_team, game_date, _away_tonight,
+            season=season, context_end=context_end),
+        "home_relevant_games": build_relevant_games(
+            get_team_id(home_team), home_team, game_date, _home_tonight,
+            season=season, context_end=context_end),
+        "away_comparable_games": build_comparable_games(
+            get_team_id(away_team), away_team, game_date, _away_tonight,
+            season=season, context_end=context_end, statcast_df=statcast_detail_df),
+        "home_comparable_games": build_comparable_games(
+            get_team_id(home_team), home_team, game_date, _home_tonight,
+            season=season, context_end=context_end, statcast_df=statcast_detail_df),
         "uncertainty_flags": uncertainty_flags,
         "away_bvp": away_bvp,
         "home_bvp": home_bvp,
@@ -7821,6 +10433,10 @@ def build_advanced_context(
         "home_transactions": build_transaction_table(home_team, game_date),
         "away_defense_stress": generate_defensive_stress_report(away_team, home_team, away_defense_df, home_lineup_df, home_baserunning_df, environment),
         "home_defense_stress": generate_defensive_stress_report(home_team, away_team, home_defense_df, away_lineup_df, away_baserunning_df, environment),
+        # Measured from batted-ball outcomes rather than putout counts -- see
+        # build_team_defense for why the fielding-stat view rates the pitching staff.
+        "away_team_defense": build_team_defense(away_team, statcast_detail_df),
+        "home_team_defense": build_team_defense(home_team, statcast_detail_df),
         "away_catcher_run_game": away_catcher_run_game,
         "home_catcher_run_game": home_catcher_run_game,
         "away_lineup_splits": away_lineup_splits,
@@ -8054,6 +10670,9 @@ _HEAT_METRICS = {
     "bb_pct_pitch":  [(11.0, 0.05), (8.0, 0.50), (5.0, 0.95)],    # low is better
     "whiff":         [(18.0, 0.05), (25.0, 0.50), (33.0, 0.95)],
     "hardhit_allowed": [(45.0, 0.05), (38.0, 0.50), (30.0, 0.95)],
+    "iso_allowed":     [(0.210, 0.05), (0.160, 0.50), (0.115, 0.95)],  # low is better
+    "hr_pct_bat":      [(1.5, 0.05), (3.0, 0.50), (5.0, 0.95)],        # high is better
+    "hr_pct_allowed":  [(4.5, 0.05), (3.0, 0.50), (1.8, 0.95)],        # low is better
     # --- arsenal ---
     "stuff_plus": [(85.0, 0.05), (100.0, 0.50), (120.0, 0.95)],
     "csw":        [(24.0, 0.05), (28.0, 0.50), (34.0, 0.95)],
@@ -8080,25 +10699,101 @@ _HEAT_METRICS = {
     "appearances": [(5.0, 0.05), (25.0, 0.50), (50.0, 0.95)],
     "steal_attempts_allowed": [(70.0, 0.05), (35.0, 0.50), (10.0, 0.95)],
     "assists_plus": [(60.0, 0.05), (100.0, 0.50), (140.0, 0.95)],
+    # Baserunning counting stats. Replaced at report time by the league's actual
+    # season-to-date distribution; these are a full-season fallback for when that pull
+    # fails, which is why they look high in April.
+    "sb_count": [(0.0, 0.05), (5.0, 0.50), (25.0, 0.95)],
+    "cs_count": [(7.0, 0.05), (2.0, 0.50), (0.0, 0.95)],
+    "sb_attempts": [(0.0, 0.05), (7.0, 0.50), (31.0, 0.95)],
+    "runs_scored": [(25.0, 0.05), (50.0, 0.50), (85.0, 0.95)],
+    "triples": [(0.0, 0.05), (1.0, 0.50), (5.0, 0.95)],
+    # Team defence, league-centred, so zero is exactly average by construction.
+    "xwoba_delta": [(-0.060, 0.05), (0.0, 0.50), (0.060, 0.95)],
+    "hits_saved": [(-0.45, 0.05), (0.0, 0.50), (0.45, 0.95)],
+    "frame_strikes": [(-0.8, 0.05), (0.0, 0.50), (0.8, 0.95)],
+    "xba_allowed": [(0.325, 0.05), (0.307, 0.50), (0.290, 0.95)],
+    "ba_allowed": [(0.320, 0.05), (0.295, 0.50), (0.268, 0.95)],
 }
+
+
+def refresh_baserunning_heat_anchors(season, min_pa=200):
+    """Recalibrate the baserunning heat scale to this season's actual distribution.
+
+    Stolen bases, runs and triples are counting stats: a hitter with nine steals is in the
+    top quartile in May and merely average in September. Fixed anchors would therefore mean
+    something different every month, so the league's own season-to-date spread is pulled
+    once per run and installed as the scale. One request covers every hitter.
+
+    Caught stealing is anchored in reverse -- getting thrown out is the bad outcome -- and
+    attempts are treated as upside, because on DK a steal is five points and being caught
+    costs nothing.
+    """
+    try:
+        data = cached_json_request(
+            "https://statsapi.mlb.com/api/v1/stats",
+            params={"stats": "season", "group": "hitting", "season": int(season),
+                    "sportId": 1, "limit": 1500, "playerPool": "All", "gameType": "R"},
+            namespace="statsapi", cache_key_extra=str(season),
+        )
+        splits = (data.get("stats") or [{}])[0].get("splits") or []
+    except Exception:
+        return False
+    if not splits:
+        return False
+
+    frame = pd.DataFrame([s.get("stat", {}) for s in splits])
+    if "plateAppearances" not in frame.columns:
+        return False
+    regulars = frame[pd.to_numeric(frame["plateAppearances"], errors="coerce") >= min_pa]
+    if len(regulars) < 50:
+        return False
+
+    def anchors(series, inverted=False):
+        values = pd.to_numeric(series, errors="coerce").dropna()
+        if values.empty:
+            return None
+        low, mid, high = (float(values.quantile(q)) for q in (0.05, 0.50, 0.95))
+        if low == high:
+            return None
+        return ([(high, 0.05), (mid, 0.50), (low, 0.95)] if inverted
+                else [(low, 0.05), (mid, 0.50), (high, 0.95)])
+
+    steals = pd.to_numeric(regulars.get("stolenBases"), errors="coerce").fillna(0)
+    caught = pd.to_numeric(regulars.get("caughtStealing"), errors="coerce").fillna(0)
+    updates = {
+        "sb_count": anchors(steals),
+        "cs_count": anchors(caught, inverted=True),
+        "sb_attempts": anchors(steals + caught),
+        "runs_scored": anchors(regulars.get("runs")),
+        "triples": anchors(regulars.get("triples")),
+    }
+    for metric, scale in updates.items():
+        if scale:
+            _HEAT_METRICS[metric] = scale
+    return True
 
 # Column-header -> metric id, per table context.
 _HEAT_CONTEXTS = {
     "offense": {
         "OPS": "ops_off", "OPS_proxy": "ops_off", "OBP": "obp_off", "SLG": "slg_off",
         "AVG": "avg_off", "ISO": "iso", "xwOBA": "xwoba_off", "HardHit%": "hardhit",
-        "BB%": "bb_pct_bat", "K%": "k_pct_bat", "Off Szn": "off_index", "Off L28": "off_index",
+        "BB%": "bb_pct_bat", "K%": "k_pct_bat", "HR%": "hr_pct_bat",
+        "Off Szn": "off_index", "Off L28": "off_index",
     },
     "pitching_allowed": {
         "OPS": "ops_allowed", "OPS_proxy": "ops_allowed", "OBP": "obp_allowed", "SLG": "slg_allowed",
         "xwOBA": "xwoba_allowed", "HardHit%": "hardhit_allowed", "Whiff%": "whiff",
-        "K%": "k_pct_pitch", "BB%": "bb_pct_pitch",
+        "K%": "k_pct_pitch", "BB%": "bb_pct_pitch", "ISO": "iso_allowed",
+        "HR%": "hr_pct_allowed",
     },
     # Same "allowed" numbers, but read through the HITTING team's lens: a pitching staff
     # that has allowed a lot is a GOOD matchup for the batters, so high = green here.
     "pitching_allowed_batter_view": {
         "OPS": "ops_off", "OPS_proxy": "ops_off", "OBP": "obp_off", "SLG": "slg_off",
         "xwOBA": "xwoba_off", "HardHit%": "hardhit",
+        # Read from the hitters' side: a staff that misses few bats and walks people is a
+        # good matchup, so these point at the batter-direction anchors on purpose.
+        "K%": "k_pct_bat", "BB%": "bb_pct_bat", "ISO": "iso", "HR%": "hr_pct_bat",
     },
     "pitching": {
         "FIP": "fip", "ERA": "era", "WHIP": "whip", "K%": "k_pct_pitch", "BB%": "bb_pct_pitch",
@@ -8110,6 +10805,22 @@ _HEAT_CONTEXTS = {
     },
     "baserunning": {
         "BsR": "bsr", "Spd": "spd", "SB%": "sb_pct",
+        # Counting stats, so their anchors are refreshed from the league's own
+        # season-to-date distribution rather than hard-coded -- see
+        # refresh_baserunning_heat_anchors. Hard-coded full-season anchors would paint
+        # every hitter cold in April and warm in September.
+        "SB": "sb_count", "CS": "cs_count", "SB_Att": "sb_attempts",
+        "Runs": "runs_scored", "Triples": "triples",
+    },
+    "hot_cold": {
+        "OPS": "ops_off", "xwOBA": "xwoba_off", "Szn xwOBA": "xwoba_off",
+        "ΔxwOBA": "xwoba_delta", "HardHit%": "hardhit",
+        "Chase%": "chase_off", "Z-Con%": "contact_off",
+    },
+    "team_defense": {
+        "Hits Saved/G": "hits_saved", "IF Saved/G": "hits_saved",
+        "OF Saved/G": "hits_saved", "Frame +Str/G": "frame_strikes",
+        "xBA Allowed": "xba_allowed", "BA Allowed": "ba_allowed",
     },
     "last10": {
         "Result": "winloss",
@@ -8201,19 +10912,59 @@ def _dfs_highlight(column, value):
         return None
 
 
+def _dfs_own_mark(column, value):
+    """Trailing ownership character for a player-name cell, or "" when unavailable.
+
+    Appended to the *displayed* text only. The tint lookup keys off the underlying frame
+    value, so decorating the cell cannot break name matching.
+    """
+    try:
+        from dfs import highlight
+        found = highlight.own_lookup(column, value)
+        return f" {found[0]}" if found else ""
+    except Exception:
+        return ""
+
+
+# Point size for the trailing ownership glyph. Two above the 9pt name it follows: the marks
+# differ by fill *shape* (◔ against ◕) rather than by height, and at 9pt that distinction is
+# the first thing lost when the sheet is zoomed to 85%.
+_OWN_MARK_SIZE = 11
+
+_HEAT_BAD_CUTOFF = 0.15
+_HEAT_GOOD_CUTOFF = 0.85
+_HEAT_BAD_RGB = (218, 86, 76)
+_HEAT_MID_RGB = (255, 229, 145)
+_HEAT_GOOD_RGB = (84, 169, 105)
+
+
 def _heat_rgb(goodness):
-    """Pastel green->amber->red gradient for a goodness in [0,1]; None -> no fill."""
+    """Bounded red->amber->green gradient for goodness in [0,1].
+
+    Values at or below the bad cutoff share one decisive red; values at or above the
+    good cutoff share one decisive green.  The middle 70% receives the full gradient.
+    This is intentionally winsorized at the color layer: an absurd outlier cannot make
+    every merely good or bad value look neutral, while direction remains controlled by
+    each metric's league-reference anchors in ``_HEAT_METRICS``.
+    """
     if goodness is None:
         return None
-    low = (228, 106, 92)     # clear red
-    mid = (247, 208, 96)     # clear amber/gold
-    high = (110, 187, 116)   # clear green
-    if goodness <= 0.5:
-        t = goodness / 0.5
-        a, b = low, mid
+    try:
+        score = float(goodness)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(score):
+        return None
+    if score <= _HEAT_BAD_CUTOFF:
+        return _HEAT_BAD_RGB
+    if score >= _HEAT_GOOD_CUTOFF:
+        return _HEAT_GOOD_RGB
+    if score <= 0.5:
+        t = (score - _HEAT_BAD_CUTOFF) / (0.5 - _HEAT_BAD_CUTOFF)
+        a, b = _HEAT_BAD_RGB, _HEAT_MID_RGB
     else:
-        t = (goodness - 0.5) / 0.5
-        a, b = mid, high
+        t = (score - 0.5) / (_HEAT_GOOD_CUTOFF - 0.5)
+        a, b = _HEAT_MID_RGB, _HEAT_GOOD_RGB
     return tuple(int(round(a[i] + (b[i] - a[i]) * t)) for i in range(3))
 
 
@@ -8224,6 +10975,10 @@ def _resolve_heat_context(heading_text):
     text = str(heading_text).lower()
     if "pitch-type" in text or "per-batter" in text or "swing decision" in text:
         return "pitch_matchup"
+    # Checked before the "allowed" rule: the team-defence heading also says "allowed",
+    # and pitching_allowed would colour hits-saved as though it were a pitching stat.
+    if "team defense" in text:
+        return "team_defense"
     if "opposing pitching allowed" in text or "allowed" in text:
         return "pitching_allowed"
     if "offense" in text or "lineup" in text or "hot" in text or "batter arsenal" in text or "hitter" in text:
@@ -8441,12 +11196,16 @@ class ScoutingPDF(FPDF):
             k_pct = round(extract_val(info.get('K%', 0.0)), 3)
             bb_pct = round(extract_val(info.get('BB%', 0.0)), 3)
             whip = round(extract_val(info.get('WHIP', 0.0)), 2)
+            hr = extract_val(info.get('HR', 'N/A'))
+            hr9 = extract_val(info.get('HR/9', 'N/A'))
         except:
             ip = era = fip = k_pct = bb_pct = whip = 0
+            hr = hr9 = 'N/A'
 
         line = (
             f"{name} ({throws})  |  GS: {gs}  |  IP: {ip}  |  ERA: {era}  |  "
-            f"FIP: {fip}  |  K%: {k_pct}%  |  BB%: {bb_pct}%  |  WHIP: {whip}"
+            f"FIP: {fip}  |  K%: {k_pct}%  |  BB%: {bb_pct}%  |  WHIP: {whip}  |  "
+            f"HR: {hr}  |  HR/9: {hr9}"
         )
 
         self.multi_cell(0, 5, line)
@@ -8718,12 +11477,12 @@ def generate_report_with_fpdf(
         team_splits = lineup_splits_by_team.get(team, pd.DataFrame())
         if team_splits is not None and not team_splits.empty:
             pdf.section_title(f'{team} - Lineup Offense Splits (Home/Away park-adj; * = opp SP hand)')
-            pdf.add_dataframe(team_splits[["Split", "PA", "OPS", "xwOBA"]], max_rows=8, heat="offense")
+            pdf.add_dataframe(team_splits[["Split", "PA", "OPS", "xwOBA", "ISO", "K%", "BB%", "HardHit%", "HR%"]], max_rows=8, heat="offense")
 
         team_opp_pitching = opp_pitching_by_team.get(team, pd.DataFrame())
         if team_opp_pitching is not None and not team_opp_pitching.empty:
             pdf.section_title(f'{team} - Opposing Pitching Allowed (Starter + Bullpen)')
-            pdf.add_dataframe(team_opp_pitching[["Unit", "Split", "PA", "OPS", "xwOBA"]], max_rows=14, heat="pitching_allowed")
+            pdf.add_dataframe(team_opp_pitching[["Unit", "Split", "PA", "OPS", "xwOBA", "ISO", "K%", "BB%", "HardHit%", "HR%"]], max_rows=14, heat="pitching_allowed")
 
         opp_sp_name = opp_sp_by_team.get(team, "SP")
         team_matchup = arsenal_matchup_by_team.get(team, pd.DataFrame())
@@ -8766,8 +11525,13 @@ def generate_report_with_fpdf(
         else:
             pdf.cell(0, 8, "No split data available.", ln=True)
 
-        pdf.section_title(f'{team} - Hot / Cold Hitters (Last 14 Days)')
-        pdf.add_dataframe(hotcold_df[['Name', 'PA', 'AVG', 'OBP', 'SLG', 'OPS', 'xwOBA', 'HardHit%', 'Status']].sort_values('xwOBA', ascending=False), heat="offense")
+        pdf.section_title(f"{team} - Hot / Cold Hitters (Last 14 Days vs own season)")
+        pdf.add_dataframe(
+            _hot_cold_sorted(hotcold_df)[
+                [c for c in ['Name', 'PA', 'OPS', 'xwOBA', 'Szn xwOBA', 'ΔxwOBA',
+                             'HardHit%', 'Chase%', 'Z-Con%', 'Status']
+                 if c in hotcold_df.columns]],
+            heat="hot_cold")
         pdf.add_matchup_summaries(hotcold_df, pitcher)
 
         pdf.section_title(f'{team} - Starter Info')
@@ -9074,6 +11838,25 @@ def cmp_game_environment(environment):
     add('Park Run Factor', round(_safe_number(park.get('Runs'), 1.0), 2),
         _env_factor_fill(park.get('Runs')))
 
+    umpire = environment.get('hp_umpire')
+    if umpire:
+        add('HP Umpire', umpire)
+    tag = environment.get('umpire_tag') or get_umpire_tag(umpire)
+    if tag:
+        rating = tag.get('Rating', '')
+        rating_low = str(rating).lower()
+        fill = (_ENV_GOOD if 'hitter' in rating_low else
+                _ENV_BAD if 'pitcher' in rating_low else None)
+        add('Umpire Tag', rating, fill)
+        tag_era = _safe_number(tag.get('ERA'), None)
+        if tag_era is not None:
+            add('Umpire Tag ERA', round(tag_era, 2), fill)
+    tendency = environment.get('ump_tendency') or {}
+    if tendency:
+        add('Umpire Live R/G',
+            f"{tendency.get('R/G')} ({_safe_number(tendency.get('vs Avg'), 0):+.2f} vs avg, "
+            f"{tendency.get('Games')}g)")
+
     # 3-year handedness splits (100 = neutral). These are where a park actually bites:
     # Camden plays 122 HR for LHB and 92 for RHB off the same ~neutral overall factor.
     # Fall back to a direct lookup so contexts cached before park_handed existed still
@@ -9156,7 +11939,8 @@ def _arsenal_archetype(arsenal_df):
     return archetype, mix_text, fb_velo
 
 
-def cmp_pitcher_type_view(starter_info, arsenal_df, type_results, vs_arsenal, opener=None):
+def cmp_pitcher_type_view(starter_info, arsenal_df, type_results, vs_arsenal, opener=None,
+                          batter_arsenal=None, lineup_df=None):
     """What kind of pitcher tonight's starter is, and how this lineup has hit that type.
 
     Sits next to the Team Hitting Summary so the splits above have a described opponent
@@ -9177,9 +11961,10 @@ def cmp_pitcher_type_view(starter_info, arsenal_df, type_results, vs_arsenal, op
         add('⚠ Opener', f"{opener.get('role')} — {opener.get('opener_rate')}% of starts, "
                         f"avg {opener.get('avg_first_inn')} inn")
         if bulk:
-            add('⚠ Real matchup', f"{bulk.get('name')} in bulk ({bulk.get('share')}% of his "
-                                  f"opener games, avg {bulk.get('avg_inn')} inn) — see the "
-                                  f"Starting Pitchers tab")
+            add('⚠ Real matchup', f"{bulk.get('name')} has followed {bulk.get('share')}% of "
+                                  f"his opener games, avg {bulk.get('avg_inn')} inn "
+                                  f"(~{round(OPENER_BULK_REPEAT_RATE * 100)}% repeat rate) "
+                                  f"— see the Starting Pitchers tab")
     archetype, mix_text, fb_velo = _arsenal_archetype(arsenal_df)
     add('Type', archetype)
     add('Mix', mix_text)
@@ -9219,6 +12004,18 @@ def cmp_pitcher_type_view(starter_info, arsenal_df, type_results, vs_arsenal, op
     if va.get('Arsenal Tag'):
         add('vs This Arsenal', f"{va.get('Arsenal Tag')} — {va.get('OPS')} OPS, "
                               f"{va.get('League OPS Pctl')}")
+
+    # The one arsenal number that predicted anything over three seasons. Stated from the
+    # hitters' side here, because this panel is read by someone choosing bats.
+    measured = _lineup_k_edge_points(batter_arsenal, lineup_df)
+    if measured:
+        edge, hitters = measured
+        direction = ("strikes out more" if edge > 0 else "strikes out less")
+        # `Throws` is the long form ("Left"), which read as "LeftHP".
+        hand = _pitcher_throw_code(starter_info) or "same-handed "
+        add('K Edge vs Shapes',
+            f"{edge:+.1f} pts — this lineup {direction} vs his pitch shapes than vs "
+            f"{hand}HP generally ({hitters} bats)")
 
     return pd.DataFrame(rows, columns=columns)
 
@@ -9288,6 +12085,92 @@ def cmp_starter_batted_fills(profile):
     return fills
 
 
+_PEN_BATTED_COLS = ['Name', 'T', 'BIP', 'GB%', 'FB%', 'LD%', 'HH%', 'Avg EV', 'Max EV', 'Brl%']
+_PEN_BATTED_ARMS = 8          # arms shown under the group row, by batted balls allowed
+
+
+def build_bullpen_batted(bullpen_df, statcast_df, team_abbr=None, as_of_date=None):
+    """Batted-ball profile for the pen: the group, then arm by arm.
+
+    The mirror of the starter's per-start block, with the one change the subject demands.
+    A starter is one arm across several starts, so his block is sliced by start against his
+    own season baseline. A bullpen is several arms in one night, so this is sliced by ARM
+    against the pen's own aggregate -- which is the comparison that matters when the
+    question is "who comes in if this game turns, and does he give up air".
+
+    Costs nothing: it slices the league-wide statcast frame the pipeline already loaded
+    rather than pulling per-pitcher, so the arms come free with the report.
+    """
+    if (bullpen_df is None or bullpen_df.empty or statcast_df is None
+            or statcast_df.empty or "pitcher" not in statcast_df.columns):
+        return pd.DataFrame(columns=_PEN_BATTED_COLS), {}
+
+    # Reindexed rather than read with .get: a frame cached before MLBAM was carried has no
+    # such column, .get returns None, and pd.to_numeric(None) is a scalar NaN with no
+    # .dropna() -- which is a crash rather than the empty result it should be.
+    keys = pd.to_numeric(bullpen_df.reindex(columns=["MLBAM"])["MLBAM"], errors="coerce")
+    if keys.isna().all() and team_abbr:
+        # Payloads cached before MLBAM was carried on the pen frame. Resolving off the
+        # roster costs one cached request and is what lets the block appear on a re-render
+        # instead of waiting for the next full generation of every game.
+        try:
+            roster = get_team_roster(team_abbr, as_of_date=as_of_date)
+            by_name = {remove_accents(p.get("person", {}).get("fullName", "")):
+                       p.get("person", {}).get("id") for p in roster}
+            keys = bullpen_df.reindex(columns=["Name"])["Name"].map(
+                lambda n: by_name.get(remove_accents(str(n))))
+            keys = pd.to_numeric(keys, errors="coerce")
+        except Exception:
+            pass
+    ids = keys.dropna().astype(int)
+    if ids.empty:
+        return pd.DataFrame(columns=_PEN_BATTED_COLS), {}
+    pitcher_col = pd.to_numeric(statcast_df["pitcher"], errors="coerce")
+    pen_rows = statcast_df[pitcher_col.isin(set(ids))]
+    if pen_rows.empty:
+        return pd.DataFrame(columns=_PEN_BATTED_COLS), {}
+
+    group = _pitch_rate_block(pen_rows)
+    hands = dict(zip(keys, bullpen_df.reindex(columns=["Throws"])["Throws"]))
+    names = dict(zip(keys, bullpen_df.reindex(columns=["Name"])["Name"]))
+
+    rows = [{"Name": "BULLPEN", "T": "", **group}]
+    per_arm = []
+    for pitcher_id in ids.unique():
+        arm_rows = statcast_df[pitcher_col == pitcher_id]
+        if arm_rows.empty:
+            continue
+        block = _pitch_rate_block(arm_rows)
+        if not block["BIP"]:
+            continue
+        per_arm.append({"Name": names.get(pitcher_id, str(pitcher_id)),
+                        "T": _pen_hand(hands.get(pitcher_id)), **block})
+    # By sample, so the arms whose rates mean anything sit at the top.
+    per_arm.sort(key=lambda r: -r["BIP"])
+    rows.extend(per_arm[:_PEN_BATTED_ARMS])
+
+    return pd.DataFrame(rows, columns=_PEN_BATTED_COLS), group
+
+
+def cmp_bullpen_batted_fills(table, group):
+    """Each arm's batted-ball rates shaded against the pen's own aggregate."""
+    if table is None or table.empty or not group:
+        return {}
+    bands = {"GB%": (5.0, 12.0), "FB%": (5.0, 12.0), "LD%": (4.0, 9.0),
+             "HH%": (5.0, 12.0), "Avg EV": (1.5, 3.5), "Brl%": (3.0, 7.0)}
+    bip = pd.to_numeric(table.get("BIP"), errors="coerce").fillna(0)
+    fills = {}
+    for col, (mild, strong) in bands.items():
+        if col not in table.columns:
+            continue
+        # Row 0 is the baseline itself; a thin sample produces 50% rates and is left plain.
+        fills[col] = [None] + [
+            _delta_fill(v, group.get(col), mild, strong) if bip.iloc[i] >= _BATTED_MIN else None
+            for i, v in enumerate(table[col].iloc[1:], start=1)
+        ]
+    return fills
+
+
 _OPENER_ALERT = (250, 214, 150)      # amber: the listed starter isn't the real matchup
 
 
@@ -9310,13 +12193,19 @@ def cmp_opener_view(profile, starter_info):
                         f"{profile.get('opener_rate', 0)}%)")
     if profile.get('avg_first_inn') is not None:
         add('Avg innings as starter', f"{profile['avg_first_inn']} innings")
+    # "Likely" overstated it. Across 371 opener games the arm who most often followed
+    # before follows again about a third of the time, and that does not improve with more
+    # history -- so these are labelled as what they are, a record of who has followed.
     for i, cand in enumerate(profile.get('candidates', [])):
-        label = 'Likely bulk arm' if i == 0 else f'Alt bulk arm {i}'
-        add(label, f"{cand['name']} — followed {cand['times']}x ({cand['share']}%), "
-                   f"avg {cand['avg_inn']} inn",
+        label = 'Has followed' if i == 0 else f'Also followed {i}'
+        add(label, f"{cand['name']} — {cand['times']}x ({cand['share']}% of his opener "
+                   f"games), avg {cand['avg_inn']} inn",
             _OPENER_ALERT if i == 0 else None)
     if profile.get('is_opener'):
+        repeat = round(profile.get('bulk_repeat_rate', OPENER_BULK_REPEAT_RATE) * 100)
         add('Read', 'Scout the bulk arm below — the lineup sees him most of the night.')
+        add('Confidence', f"who follows repeats only ~{repeat}% of the time; treat the "
+                          f"bulk arm as confirmed only if the team has announced it")
     return pd.DataFrame(rows, columns=columns), {'Value': fills}
 
 
@@ -9334,6 +12223,11 @@ def cmp_bulk_arm_view(bulk, season, context_end, statcast_pitches_df=None):
     hand = _pitcher_throw_code(bulk['id']) or ''
     add('Pitcher', f"{bulk['name']}" + (f" ({hand}HP)" if hand else ''))
     add('Follows opener', f"{bulk['times']}x, avg {bulk['avg_inn']} innings")
+    # The DFS case for this arm, and its condition. Min-priced relief innings are the
+    # cheapest real innings on the board -- but only if he is actually the one who pitches.
+    add('DFS angle', f"priced as a reliever (~DK minimum) for ~{bulk['avg_inn']} innings; "
+                     f"followers average 11.9 DK pts, ~3.0 per $1k vs ~2.3 for a "
+                     f"conventional starter — worth it only on a confirmed bulk assignment")
 
     line = _pitcher_season_line(bulk['id'], season)
     if line:
@@ -9360,8 +12254,19 @@ def cmp_bulk_arm_view(bulk, season, context_end, statcast_pitches_df=None):
 
 
 def cmp_starter_l5_log(info, season, last_n=5):
-    """Last N starts with the quality of the offense faced attached to each line."""
-    cols = ["Date", "Opp", "IP", "H", "R", "ER", "BB", "K", "HR", "P", "GSc",
+    """Last N starts, with the quality of the offense faced attached to each line.
+
+    Closes with a TOTAL/AVG row. The two used to be separate tables on separate sheets --
+    one carried the totals, the other the opponent context -- which is how a 2.40 ERA over
+    five starts gets read without noticing all five came against bottom-eight offenses.
+    The averaged Opp Rk on the TOTAL row is shaded by the same rule as the rows above, so
+    the summary line says outright how hard the stretch was.
+
+    ERA is blank per start on purpose: a one-inning three-run outing reads as 27.00 and
+    tells you nothing the GSc column does not already say better. It is the combined
+    figure on the TOTAL row that is worth having.
+    """
+    cols = ["Date", "Opp", "IP", "H", "R", "ER", "BB", "K", "HR", "P", "ERA", "GSc",
             "Opp OPS", "Opp R/G", "Opp Rk"]
     logs = pd.DataFrame((info or {}).get("Last Starts", []))
     if logs.empty:
@@ -9374,11 +12279,32 @@ def cmp_starter_l5_log(info, season, last_n=5):
             "Date": str(g.get("Date", ""))[5:], "Opp": opponent,
             "IP": _float_to_ip(g.get("IP", "")), "H": g.get("H", ""), "R": g.get("R", ""),
             "ER": g.get("ER", ""), "BB": g.get("BB", ""), "K": g.get("SO", ""),
-            "HR": g.get("HR", ""), "P": g.get("Pitches", ""), "GSc": g.get("Game Score", ""),
+            "HR": g.get("HR", ""), "P": g.get("Pitches", ""), "ERA": "",
+            "GSc": g.get("Game Score", ""),
             "Opp OPS": ctx.get("OPS", ""), "Opp R/G": ctx.get("R/G", ""),
             "Opp Rk": ctx.get("OPS Rank", ""),
         })
-    return pd.DataFrame(rows, columns=cols)
+    table = pd.DataFrame(rows, columns=cols)
+
+    def _sum(column):
+        return int(pd.to_numeric(table[column], errors="coerce").fillna(0).sum())
+
+    def _mean(column, digits=3):
+        values = pd.to_numeric(table[column], errors="coerce").dropna()
+        return round(float(values.mean()), digits) if not values.empty else ""
+
+    total_ip = sum(_ip_to_float(v) for v in table["IP"])
+    total_er = _sum("ER")
+    summary = {
+        "Date": "TOTAL / AVG", "Opp": f"{len(table)} starts",
+        "IP": _float_to_ip(total_ip), "H": _sum("H"), "R": _sum("R"), "ER": total_er,
+        "BB": _sum("BB"), "K": _sum("K"), "HR": _sum("HR"), "P": _sum("P"),
+        "ERA": round(total_er * 9 / total_ip, 2) if total_ip else "",
+        "GSc": _mean("GSc", 1),
+        "Opp OPS": _mean("Opp OPS"), "Opp R/G": _mean("Opp R/G", 2),
+        "Opp Rk": _mean("Opp Rk", 1),
+    }
+    return pd.concat([table, pd.DataFrame([summary])], ignore_index=True)[cols]
 
 
 def cmp_starter_l5_fills(table):
@@ -9459,7 +12385,59 @@ def cmp_starter_row(info):
         'GS': info.get('GS', ''), 'IP': info.get('IP', ''), 'ERA': info.get('ERA', ''),
         'FIP': info.get('FIP', ''), 'K%': round(k, 1) if k is not None else '',
         'BB%': round(b, 1) if b is not None else '', 'WHIP': info.get('WHIP', ''),
+        'HR': info.get('HR', ''), 'HR/9': info.get('HR/9', ''),
     }])
+
+
+def cmp_starter_provisional(advanced_context, side):
+    """This side's starter pick if it is not an announced probable, else None.
+
+    Reports built before MLB posts a probable are the reason this exists. Naming the source
+    on the page is not decoration: a projected starter and a confirmed one carry the same
+    tables, and only the label tells them apart.
+    """
+    pick = ((advanced_context or {}).get("starter_provenance") or {}).get(side) or {}
+    return pick if pick.get("provisional") and pick.get("name") else None
+
+
+def _starter_pick_reason(pick):
+    """`salary` / `rotation, 44% on 6 days rest` -- the source plus what it is standing on.
+
+    The rotation model's own note is carried through rather than reduced to "projected",
+    because the confidence is renormalised over whoever survives availability gating: a club
+    whose start-order history has only ever gone one way returns 100% for an arm on a month's
+    rest. The number is doing real work on most clubs and is nonsense on a few, and the only
+    way a reader can tell which is to see the rest alongside it.
+    """
+    source = STARTER_SOURCE_LABEL.get(pick.get("source"), pick.get("source"))
+    if pick.get("source") not in ("rotation", "bulk"):
+        # DK's flag is a statement, not an estimate -- naming the file says all of it.
+        return source
+    # The model writes its own preamble; the label already says no probable was posted.
+    detail = str(pick.get("note") or "").split(";")[-1].strip()
+    if detail.startswith("rotation model gives"):
+        detail = detail.replace("rotation model gives ", "").replace(f"{pick.get('name')} ", "")
+    return f"{source}, {detail}" if detail else source
+
+
+def cmp_starter_provisional_tag(advanced_context, side):
+    """The inline marker for a panel header, or '' when the probable is announced."""
+    pick = cmp_starter_provisional(advanced_context, side)
+    if not pick:
+        return ""
+    return f"   ⚠ PROJECTED STARTER — {_starter_pick_reason(pick)}"
+
+
+def cmp_starter_provisional_note(advanced_context, away_team, home_team):
+    """A title suffix naming every projected starter in the game, or ''."""
+    parts = []
+    for side, team in (("away", away_team), ("home", home_team)):
+        pick = cmp_starter_provisional(advanced_context, side)
+        if pick:
+            parts.append(f"{team} {pick['name']} ({_starter_pick_reason(pick)})")
+    if not parts:
+        return ""
+    return " | ⚠ PROJECTED, no probable announced: " + "; ".join(parts)
 
 
 def cmp_recent_starts(info, last_n=5):
@@ -9549,6 +12527,60 @@ def cmp_bullpen_view(frame):
             app_fills.append(None)
     display = pd.concat([summary, shown[cols]], ignore_index=True)[cols]
     return display, {'L7': l7_fills, 'App': app_fills, 'T': hand_fills}
+
+
+# Pen workload thresholds, per game. A pen asked for 4+ innings has spent a bullpen day;
+# 3 is a normal modern night. P/Out above 6.0 is a pen that is not getting quick outs,
+# which costs pitches now and arms tomorrow.
+_PEN_HEAVY_IP, _PEN_BUSY_IP = 4.0, 3.0
+_PEN_POOR_POUT, _PEN_SOFT_POUT = 6.5, 5.75
+
+
+def cmp_pen_l5_fills(group):
+    """Shade the pen's workload and efficiency columns on the L5 group table.
+
+    Red is "this cost them", not "this was a loss": a pen can throw five clean innings and
+    still be unavailable tomorrow, and that is exactly what this table is for.
+    """
+    if group is None or group.empty:
+        return {}
+    ip_fills, pout_fills = [], []
+    for _, row in group.iterrows():
+        innings = _ip_to_float(row.get("Pen IP", 0))
+        if innings >= _PEN_HEAVY_IP:
+            ip_fills.append(_DELTA_DOWN_STRONG)
+        elif innings >= _PEN_BUSY_IP:
+            ip_fills.append(_DELTA_DOWN_MILD)
+        else:
+            ip_fills.append(None)
+        per_out = _safe_number(row.get("P/Out"), None)
+        if per_out is None:
+            pout_fills.append(None)
+        elif per_out >= _PEN_POOR_POUT:
+            pout_fills.append(_DELTA_DOWN_STRONG)
+        elif per_out >= _PEN_SOFT_POUT:
+            pout_fills.append(_DELTA_DOWN_MILD)
+        else:
+            pout_fills.append(_DELTA_UP_MILD)
+    return {"Pen IP": ip_fills, "P/Out": pout_fills}
+
+
+def cmp_pen_arms_fills(arms):
+    """Shade the per-arm L5 grid: availability by status, pitch total by workload."""
+    if arms is None or arms.empty:
+        return {}
+    avail_fills = [_CMP_AVAIL_COLOR.get(str(v)) for v in arms.get("Avail", [])]
+    hand_fills = [_CMP_HAND_COLOR.get(str(v)) for v in arms.get("T", [])]
+    pit_fills = []
+    for total in pd.to_numeric(arms.get("Pit"), errors="coerce").fillna(0):
+        # Over five games: 50+ pitches is a heavily used arm, 35+ is a working one.
+        if total >= 50:
+            pit_fills.append(_DELTA_DOWN_STRONG)
+        elif total >= 35:
+            pit_fills.append(_DELTA_DOWN_MILD)
+        else:
+            pit_fills.append(None)
+    return {"Avail": avail_fills, "T": hand_fills, "Pit": pit_fills}
 
 
 def cmp_defense_view(frame):
@@ -9755,6 +12787,29 @@ def generate_comparison_report_with_fpdf(
     pdf.set_font('DejaVu', '', 8)
     pdf.cell(0, 5, f"{game_date} | Away left, home right | HP Umpire: {hp_umpire_line}", ln=True, align='C')
     pdf.ln(3)
+
+    # The same figure set the workbook's Visuals tab carries: offense, the arms, bullpen
+    # availability, and which bats to back. Best-effort -- a missing table or a matplotlib
+    # failure drops a figure, never the report.
+    try:
+        from report_visuals import build_report_figures, figure_aspect
+        _usable = pdf.w - pdf.l_margin - pdf.r_margin
+        for _caption, _path in build_report_figures(
+                away_team, home_team, advanced_context,
+                os.path.join(output_dir, "figures"), game_date=game_date,
+                dh_suffix=_dh_suffix(dh_game)):
+            _px_w, _px_h = figure_aspect(_path)
+            _drawn_h = _usable * _px_h / _px_w
+            # Break before a figure that would run off the page rather than letting it be
+            # clipped -- an image, unlike a table, has no row to break on.
+            if pdf.get_y() + _drawn_h + 10 > pdf.h - pdf.b_margin:
+                pdf.add_page()
+            pdf.set_font('DejaVu', 'B', 10)
+            pdf.cell(0, 6, _caption, ln=True)
+            pdf.image(_path, x=pdf.l_margin, y=pdf.get_y(), w=_usable)
+            pdf.set_y(pdf.get_y() + _drawn_h + 4)
+    except Exception as _viz_error:
+        print(f"⚠️ Key-metric visuals unavailable: {_viz_error}")
 
     # Packing constants: compact landscape row height and per-section chrome (section
     # title + panel caption). Used to estimate a block's height so we only break to a
@@ -10069,15 +13124,17 @@ def generate_comparison_report_with_fpdf(
     lineup_cols = ['Spot', 'Name', 'Pos', 'Bats', 'OPS', 'Off Szn', 'Off L28', 'ISO', 'HR', 'SB']
     compare('Projected Lineups', available(away_lineup, lineup_cols, 9), available(home_lineup, lineup_cols, 9), heat='offense')
 
-    hot_cols = ['Name', 'PA', 'AVG', 'OPS', 'xwOBA', 'HardHit%', 'Status']
+    hot_cols = ['Name', 'PA', 'OPS', 'xwOBA', 'Szn xwOBA', 'ΔxwOBA', 'HardHit%',
+            'Chase%', 'Z-Con%', 'Status']
     compare(
-        'Hot / Cold Hitters | Last 14 Days',
-        available(away_hotcold_df.sort_values('xwOBA', ascending=False), hot_cols, 9),
-        available(home_hotcold_df.sort_values('xwOBA', ascending=False), hot_cols, 9),
-        heat='offense',
+        "Hot / Cold Hitters | Last 14 Days vs each hitter's own season "
+        "(HOT/COLD = +/-40 pts of xwOBA against his own norm)",
+        available(_hot_cold_sorted(away_hotcold_df), hot_cols, 9),
+        available(_hot_cold_sorted(home_hotcold_df), hot_cols, 9),
+        heat='hot_cold',
     )
 
-    hitting_cols = ['Split', 'PA', 'OPS', 'xwOBA']
+    hitting_cols = ['Split', 'PA', 'OPS', 'xwOBA', 'ISO', 'K%', 'BB%', 'HardHit%', 'HR%']
     compare(
         'Team Hitting Summary | Home/Away and opposing starter hand',
         available(advanced_context.get('away_lineup_splits', pd.DataFrame()), hitting_cols, 8),
@@ -10107,7 +13164,7 @@ def generate_comparison_report_with_fpdf(
         heat='offense',
     )
 
-    pitching_cols = ['Unit', 'Split', 'PA', 'OPS', 'xwOBA']
+    pitching_cols = ['Unit', 'Split', 'PA', 'OPS', 'xwOBA', 'ISO', 'K%', 'BB%', 'HardHit%', 'HR%']
     compare(
         'Opposing Pitching Allowed Summary | Starter and bullpen (colored from hitters\' view: high allowed = green)',
         available(advanced_context.get('away_opp_pitching', pd.DataFrame()), pitching_cols, 14),
@@ -10135,7 +13192,9 @@ def generate_comparison_report_with_fpdf(
     # =====================================================================
     phase_banner('3  ·  STARTING PITCHING   |   Probables, recent form & arsenals')
 
-    compare('Probable Starter Comparison', starter_row(away_starter_info), starter_row(home_starter_info), heat='pitching')
+    compare('Probable Starter Comparison'
+            + cmp_starter_provisional_note(advanced_context, away_team, home_team),
+            starter_row(away_starter_info), starter_row(home_starter_info), heat='pitching')
     compare(
         'Last Five Starts',
         recent_starts_table(away_starter_info),
@@ -10181,8 +13240,17 @@ def generate_comparison_report_with_fpdf(
         available(home_baserunning_df, run_cols, 8),
         heat='baserunning',
     )
+    team_def_cols = ['Team', 'BIP', 'xBA Allowed', 'BA Allowed', 'Hits Saved/G',
+                     'IF Saved/G', 'OF Saved/G', 'Frame +Str/G', 'Grade']
     compare(
-        'Defense | A+ = position-adj assists (IF only, sample-gated); catcher run game colored',
+        'Team Defense | expected minus actual hits on balls in play, vs league '
+        '(errors excluded: DK charges earned runs only)',
+        available(advanced_context.get('away_team_defense', pd.DataFrame()), team_def_cols, 1),
+        available(advanced_context.get('home_team_defense', pd.DataFrame()), team_def_cols, 1),
+        heat='team_defense',
+    )
+    compare(
+        'Defense | fielding-stat view: chances and errors, not range',
         away_def_disp, home_def_disp,
         col_fills={'away': away_def_fill, 'home': home_def_fill},
     )
@@ -10225,6 +13293,8 @@ def generate_comparison_report_excel(
     heat coloring as the PDF applied via conditional cell fills. No page breaks, so
     there is no page-driven whitespace."""
     from openpyxl import Workbook
+    from openpyxl.cell.rich_text import CellRichText, TextBlock
+    from openpyxl.cell.text import InlineFont
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
 
@@ -10234,19 +13304,75 @@ def generate_comparison_report_excel(
         output_dir, f"scouting_report_{game_date}_{away_team}_{home_team}{_dh_suffix(dh_game)}.xlsx")
 
     wb = Workbook()
-    ws = wb.active
-    ws.title = "Scouting Report"
-    ws.sheet_view.showGridLines = False
-    ws.sheet_format.defaultRowHeight = 12.75
-    # Open compactly and print one page wide while remaining a normal scrollable sheet.
-    # Every sheet opens at 85%: the column bounds above are tuned so a full panel pair
-    # fits on a standard screen at that zoom without clipping any cell.
-    ws.sheet_view.zoomScale = 85
-    ws.sheet_view.zoomScaleNormal = 85
-    ws.page_setup.orientation = "landscape"
-    ws.page_setup.fitToWidth = 1
-    ws.page_setup.fitToHeight = 0
-    ws.sheet_properties.pageSetUpPr.fitToPage = True
+
+    def _prepare_sheet(sheet):
+        sheet.sheet_view.showGridLines = False
+        sheet.sheet_format.defaultRowHeight = 12.75
+        # Open compactly and print one page wide while remaining a normal scrollable sheet.
+        # Every sheet opens at 85%: the column bounds above are tuned so a full panel pair
+        # fits on a standard screen at that zoom without clipping any cell.
+        sheet.sheet_view.zoomScale = 85
+        sheet.sheet_view.zoomScaleNormal = 85
+        sheet.page_setup.orientation = "landscape"
+        sheet.page_setup.fitToWidth = 1
+        sheet.page_setup.fitToHeight = 0
+        sheet.sheet_properties.pageSetUpPr.fitToPage = True
+        return sheet
+
+    # One sheet per section group, each with its OWN column widths.
+    #
+    # This is the fix for the report's worst readability problem, and the cause is structural
+    # rather than cosmetic: an Excel column width is a property of the sheet, not of a table.
+    # Every section used to be laid into the same twelve-column grid, so column A's width was
+    # the widest first cell of *any* table on the sheet. In practice a handful of long prose
+    # cells set the grid for all ~250 rows -- a 116-character team-defense note forced column
+    # A to 21.1 and a 101-character matchup note forced column B to 17.1, stretching the
+    # lineup and pitching tables that had no long text in them at all. Observed table widths
+    # ran from three to eleven columns sharing one grid, which no single set of widths can
+    # serve.
+    #
+    # Splitting by section means only similarly-shaped tables share a grid, and the prose-heavy
+    # sections (game context, roster alerts) can be as wide as they need without dragging the
+    # stat tables with them.
+    # Bands 3 (starting pitching) and 4 (bullpen) are absent on purpose: they are written
+    # to their own "Pitching" sheet by `_write_pitching_sheet`, which is slotted into
+    # position below. Everything else routes by its leading number.
+    _SHEET_FOR_BAND = {
+        "1": "Game Context",
+        "2": "Offense",
+        "5": "Run & Defense",
+        "6": "Roster Alerts",
+    }
+    # Where the pitching sheet belongs once it exists, so the tab order still reads in
+    # phase order rather than in the order the sheets happened to be created.
+    _PITCHING_SHEET_AFTER = "Offense"
+    sheets = {}
+    ws = None
+    col_widths = {}
+    # Set once the title/legend logic below is in scope, so every new sheet gets the same
+    # header. Late-bound because the header needs `env` and the DFS legend, which are
+    # resolved further down than this.
+    _header_writer = {"fn": None}
+
+    def use_sheet(name):
+        """Point the writers at `name`, creating it on first use. Row and width state
+        follow the sheet, which is the whole point of the split."""
+        nonlocal ws, col_widths
+        if ws is not None:
+            sheets[ws.title]["row"] = state["row"]
+        fresh = name not in sheets
+        if fresh:
+            sheet = _prepare_sheet(wb.active if not sheets else wb.create_sheet(name))
+            sheet.title = name
+            sheets[name] = {"ws": sheet, "widths": {}, "row": 1}
+        entry = sheets[name]
+        ws = entry["ws"]
+        col_widths = entry["widths"]
+        state["row"] = entry["row"]
+        if fresh and _header_writer["fn"]:
+            # Repeated on every tab on purpose: a sheet that does not say which game it
+            # belongs to is a trap once there are six of them.
+            _header_writer["fn"]()
 
     thin = Side(style="thin", color="C8C8C8")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
@@ -10275,7 +13401,8 @@ def generate_comparison_report_excel(
         return v
 
     # Column-width accumulator (in Excel width units ~ chars).
-    col_widths = {}
+    # (per-sheet; bound by use_sheet above -- do not rebind here or the widths
+    #  stop following the sheet)
 
     _NARROW_FIELDS = {
         'Spot', 'Pos', 'Bats', 'Throws', 'T', 'GS', 'G', 'IP', 'H', 'R', 'ER', 'BB',
@@ -10299,7 +13426,11 @@ def generate_comparison_report_excel(
         if field == 'Date':
             return 7.0, 9.0
         if field in {'Name', 'Player'}:
-            return 9.0, 22.0      # fits the longest real names ("Vladimir Guerrero Jr.")
+            # Longest real names ("Vladimir Guerrero Jr.") plus the trailing ownership
+            # glyph and its space. At the old cap of 22 the name exactly filled the column
+            # and the mark -- the one character that is there on every priced player --
+            # was the part that got clipped.
+            return 9.0, 24.5
         if field in {'Opponent', 'Opp', 'Metric', 'Context', 'Split', 'Pitch', 'Unit', 'Trip Spot'}:
             return 7.0, 12.0
         if field in {'Status', 'Consistency', 'Edge', 'Result'}:
@@ -10364,8 +13495,14 @@ def generate_comparison_report_excel(
         for i, (_, row) in enumerate(df.iterrows(), start=1):
             for j, c in enumerate(cols):
                 val = fmt(row[c])
-                cell = ws.cell(row=top_row + i, column=left_col + j, value=val)
+                # Projected ownership rides along as one trailing character on player names.
+                # Every priced player gets it, which is why it is not a colour: two tint
+                # families already cover a third of a slate and a third would be unreadable.
+                own_mark = _dfs_own_mark(c, row[c])
+                cell = ws.cell(row=top_row + i, column=left_col + j,
+                               value=(f"{val}{own_mark}" if own_mark else val))
                 cell.font = Font(size=9)
+                name_bold = False
                 if c in {'Move', 'Impact', 'Note'}:
                     cell.alignment = left_wrap
                     # These columns are narrow and wrapped, so a long transaction note
@@ -10402,11 +13539,23 @@ def generate_comparison_report_excel(
                     if tint is not None:
                         f = _fill_from_rgb(tint[1])
                         cell.font = Font(size=9, bold=True)
+                        name_bold = True
                 if f is not None:
                     cell.fill = f
-                # In a Metric/Value table the value columns are named after the team
-                # ("ATL"), but they hold Value-shaped text, so size them as Value.
-                note_width(left_col + j, val, 'Value' if (is_metric_table and c != 'Metric') else c)
+                # The ownership glyph is set one size larger than the name it trails, which
+                # needs rich text: a cell-level font would drag the name up with it and the
+                # names are already at the size the column widths were built for. Applied
+                # after the tint branch so a highlighted name keeps its bold.
+                if own_mark:
+                    cell.value = CellRichText(
+                        TextBlock(InlineFont(sz=9, b=name_bold), str(val)),
+                        TextBlock(InlineFont(sz=_OWN_MARK_SIZE), str(own_mark)),
+                    )
+                # Width is measured against the DISPLAYED text. Measuring `val` alone left
+                # no room for the trailing glyph, which is what clipped it on the longest
+                # name in a column.
+                note_width(left_col + j, f"{val}{own_mark}",
+                           'Value' if (is_metric_table and c != 'Metric') else c)
         return len(df) + 1, len(cols)
 
     _PANEL_COLS = 12
@@ -10417,6 +13566,11 @@ def generate_comparison_report_excel(
     state = {"row": 1}
 
     def band(text):
+        # The leading number routes the section to its sheet. Sections that share a sheet
+        # (bullpen joins starting pitching) still get their band as an in-sheet divider.
+        target = _SHEET_FOR_BAND.get(str(text).strip()[:1])
+        if target and (ws is None or ws.title != target):
+            use_sheet(target)
         r = state["row"]
         cell = ws.cell(row=r, column=1, value=text)
         cell.font = Font(bold=True, size=12, color="FFFFFF")
@@ -10469,34 +13623,94 @@ def generate_comparison_report_excel(
     # ---- title ----
     env = advanced_context.get("environment", {})
     hp = env.get("hp_umpire_line", env.get("hp_umpire", "Not yet assigned"))
-    t = ws.cell(row=1, column=1, value=f"{away_team} at {home_team}  |  {game_date}  |  HP Umpire: {hp}")
-    t.font = Font(bold=True, size=14)
-    state["row"] = 3
 
-    # Legend for the DFS value tint, written only when highlighting is actually on --
-    # an unexplained colored name is worse than an uncolored one.
-    _dfs_legend = _dfs_highlight_legend()
-    if _dfs_legend:
+    def write_sheet_header():
+        """Title row and legends, on whichever sheet is current."""
+        t = ws.cell(row=1, column=1,
+                    value=f"{away_team} at {home_team}  |  {game_date}  |  HP Umpire: {hp}")
+        t.font = Font(bold=True, size=14)
+        state["row"] = 3
+
+        # The stat scale is always visible: its hard endpoints are part of the meaning of
+        # the report, not just decoration. DFS tint follows it when that layer is on.
         col = 1
-        label = ws.cell(row=2, column=col, value="DFS value:")
+        label = ws.cell(row=2, column=col, value="Stat heat:")
         label.font = Font(bold=True, size=8.5)
         col += 1
-        for tier, rgb in _dfs_legend:
-            swatch = ws.cell(row=2, column=col, value=tier)
+        for heat_label, score in (("Very bad", 0.0), ("Average", 0.5), ("Very good", 1.0)):
+            rgb = _heat_rgb(score)
+            swatch = ws.cell(row=2, column=col, value=heat_label)
             swatch.font = Font(bold=True, size=8.5)
             swatch.fill = PatternFill("solid", fgColor="{:02X}{:02X}{:02X}".format(*rgb))
             swatch.alignment = center
             swatch.border = border
             col += 1
-        note = ws.cell(row=2, column=col,
-                       value="  teal = raw projection, indigo = points per $1k, violet = both"
-                             "  (ranked within pitchers / hitters)")
-        note.font = Font(italic=True, size=8)
+
+        # Legend for the DFS value tint, written only when highlighting is actually on --
+        # an unexplained colored name is worse than an uncolored one.
+        legend_tiers = _dfs_highlight_legend()
+        if legend_tiers:
+            col += 1
+            label = ws.cell(row=2, column=col, value="DFS value:")
+            label.font = Font(bold=True, size=8.5)
+            col += 1
+            for tier, rgb in legend_tiers:
+                swatch = ws.cell(row=2, column=col, value=tier)
+                swatch.font = Font(bold=True, size=8.5)
+                swatch.fill = PatternFill("solid", fgColor="{:02X}{:02X}{:02X}".format(*rgb))
+                swatch.alignment = center
+                swatch.border = border
+                col += 1
+            note = ws.cell(row=2, column=col,
+                           value="  teal = raw projection, indigo = points per $1k, "
+                                 "violet = both  (ranked within pitchers / hitters)")
+            note.font = Font(italic=True, size=8)
+
+    _header_writer["fn"] = write_sheet_header
+
+    # The visuals get their own tab and lead the workbook: they are the at-a-glance read
+    # of platoon splits, the arms, bullpen availability and which bats to back, and they
+    # were crowding the top of Game Context. Rendered once here and reused by the PDF.
+    # Best-effort throughout -- a missing table or a matplotlib failure drops a figure,
+    # never the report.
+    figure_paths = []
+    try:
+        from report_visuals import build_report_figures
+        figure_paths = build_report_figures(
+            away_team, home_team, advanced_context,
+            os.path.join(output_dir, "figures"), game_date=game_date,
+            dh_suffix=_dh_suffix(dh_game))
+    except Exception as _viz_error:
+        print(f"⚠️ Key-metric visuals unavailable: {_viz_error}")
+
+    if figure_paths:
+        try:
+            from openpyxl.drawing.image import Image as XLImage
+            use_sheet("Visuals")
+            for _caption, _path in figure_paths:
+                _title = ws.cell(row=state["row"], column=1, value=_caption)
+                _title.font = Font(bold=True, size=11, color="1C2A4A")
+                state["row"] += 1
+                _img = XLImage(_path)
+                # Sized to the ~290-unit sheet budget at 85% zoom (see the width notes
+                # above), so a figure lands in the same span the tables use rather than
+                # forcing a horizontal scroll.
+                _target_w = 1380
+                _img.height = int(_img.height * _target_w / _img.width)
+                _img.width = _target_w
+                ws.add_image(_img, f"A{state['row']}")
+                # An anchored image floats over cells rather than occupying them, so the
+                # rows underneath must be reserved by hand or the next caption lands on
+                # top of it. 17px is the default row height (12.75pt) at 96dpi.
+                state["row"] += -(-_img.height // 17) + 2
+        except Exception as _viz_error:
+            print(f"⚠️ Could not place visuals tab: {_viz_error}")
+
+    use_sheet("Game Context")
 
     # Table transforms come from the shared cmp_* helpers (same source as the PDF) so
     # columns like defense A+ and the Last-5 TOTAL/AVG row stay in lockstep across outputs.
     starter_row = cmp_starter_row
-    recent_starts = cmp_recent_starts
 
     ac = advanced_context
     hitter_composite = ac.get('hitter_composite', pd.DataFrame())
@@ -10529,6 +13743,23 @@ def generate_comparison_report_excel(
     section("Last 10 Games (L10 R/RA = runs for/against per game; L10 SoS = avg opponent win %)",
             cmp_l10_table(away_last_10, ac.get('away_recent_detail', pd.DataFrame())),
             cmp_l10_table(home_last_10, ac.get('home_recent_detail', pd.DataFrame())), heat='last10')
+    away_relevant = ac.get('away_relevant_games', pd.DataFrame())
+    home_relevant = ac.get('home_relevant_games', pd.DataFrame())
+    if not (away_relevant.empty and home_relevant.empty):
+        # Stacked full width, not paired side by side. At fifteen columns this table is
+        # wider than a panel (_PANEL_COLS is 12), so laying it out as an away/home pair put
+        # the away side's last column underneath the home side's first -- Rk was silently
+        # overwritten by the home panel's Date. Each club gets the full width instead.
+        _relevant_caption = ("  ·  Match flags P=park run factor, T=opposing starter hand, "
+                             "H=home/away, L=7+ of tonight's nine started (· = tested and "
+                             "differed). Rk is the similarity rank driving the Comps tab; "
+                             "blank = failed the lineup gate. FIP/HR-9 are context, not "
+                             "ranking inputs. If MATCHED's R equals TOTAL's, conditioning "
+                             "is telling you nothing tonight")
+        for _team, _frame in ((away_team, away_relevant), (home_team, home_relevant)):
+            if _frame is not None and not _frame.empty:
+                solo(f"{_team} — Last 10 vs Tonight's Conditions{_relevant_caption}",
+                     _frame, col_fills=cmp_relevant_games_fills(_frame))
     section("Rest & Schedule Spot",
             av(ac.get('away_rest_schedule', pd.DataFrame()), ['Rest', 'SP Rest', 'Note', 'Pen A/T']),
             av(ac.get('home_rest_schedule', pd.DataFrame()), ['Rest', 'SP Rest', 'Note', 'Pen A/T']))
@@ -10570,24 +13801,29 @@ def generate_comparison_report_excel(
     section("Projected Lineups",
             av(_lineup_with_offense(away_lineup_df, hitter_composite), lineup_cols, 9),
             av(_lineup_with_offense(home_lineup_df, hitter_composite), lineup_cols, 9), heat='offense')
-    hot_cols = ['Name', 'PA', 'AVG', 'OPS', 'xwOBA', 'HardHit%', 'Status']
-    section("Hot / Cold Hitters (Last 14 Days)",
-            av(away_hotcold_df.sort_values('xwOBA', ascending=False), hot_cols, 9),
-            av(home_hotcold_df.sort_values('xwOBA', ascending=False), hot_cols, 9), heat='offense')
+    hot_cols = ['Name', 'PA', 'OPS', 'xwOBA', 'Szn xwOBA', 'ΔxwOBA', 'HardHit%',
+            'Chase%', 'Z-Con%', 'Status']
+    section("Hot / Cold Hitters (Last 14 Days — vs each hitter's own season)",
+            av(_hot_cold_sorted(away_hotcold_df), hot_cols, 9),
+            av(_hot_cold_sorted(home_hotcold_df), hot_cols, 9), heat='hot_cold')
     section("Team Hitting Summary (Home/Away and opposing hand)",
-            av(ac.get('away_lineup_splits', pd.DataFrame()), ['Split', 'PA', 'OPS', 'xwOBA'], 8),
-            av(ac.get('home_lineup_splits', pd.DataFrame()), ['Split', 'PA', 'OPS', 'xwOBA'], 8), heat='offense')
+            av(ac.get('away_lineup_splits', pd.DataFrame()), ['Split', 'PA', 'OPS', 'xwOBA', 'ISO', 'K%', 'BB%', 'HardHit%', 'HR%'], 8),
+            av(ac.get('home_lineup_splits', pd.DataFrame()), ['Split', 'PA', 'OPS', 'xwOBA', 'ISO', 'K%', 'BB%', 'HardHit%', 'HR%'], 8), heat='offense')
     # Each lineup faces the *other* club's starter, so the away panel describes the home
     # starter. Sits right under the hitting splits to give those splits a named opponent.
     pair("Opposing Starter Type (what each lineup is actually facing tonight)",
          f"{away_team} faces {away_sp_vs}",
          cmp_pitcher_type_view(home_starter_info, home_arsenal_df,
                                ac.get('away_type_results'), ac.get('away_vs_home_arsenal'),
-                               opener=opener_profiles['home']),
+                               opener=opener_profiles['home'],
+                               batter_arsenal=ac.get('away_batter_arsenal'),
+                               lineup_df=away_lineup_df),
          f"{home_team} faces {home_sp_vs}",
          cmp_pitcher_type_view(away_starter_info, away_arsenal_df,
                                ac.get('home_type_results'), ac.get('home_vs_away_arsenal'),
-                               opener=opener_profiles['away']))
+                               opener=opener_profiles['away'],
+                               batter_arsenal=ac.get('home_batter_arsenal'),
+                               lineup_df=home_lineup_df))
     ha = get_pitcher_handedness(home_pitcher) or 'R'
     hh = get_pitcher_handedness(away_pitcher) or 'R'
 
@@ -10618,7 +13854,7 @@ def generate_comparison_report_excel(
          f"{away_team} vs {away_sp_vs}", av(ac.get('away_bvp', pd.DataFrame()), bvp_cols, 5),
          f"{home_team} vs {home_sp_vs}", av(ac.get('home_bvp', pd.DataFrame()), bvp_cols, 5),
          heat='offense')
-    opp_cols = ['Unit', 'Split', 'PA', 'OPS', 'xwOBA']
+    opp_cols = ['Unit', 'Split', 'PA', 'OPS', 'xwOBA', 'ISO', 'K%', 'BB%', 'HardHit%', 'HR%']
 
     def named_units(frame, starter_info):
         """Cached contexts may still carry the generic "Starter" unit label; swap in the
@@ -10645,35 +13881,28 @@ def generate_comparison_report_excel(
          heat='pitch_matchup')
 
     # ===== PHASE 3: STARTING PITCHING =====
-    band("3  ·  STARTING PITCHING")
-    section("Probable Starter Comparison", starter_row(away_starter_info), starter_row(home_starter_info), heat='pitching')
-    pair("Last Five Starts",
-         f"{away_sp} — {away_team}", recent_starts(away_starter_info),
-         f"{home_sp} — {home_team}", recent_starts(home_starter_info), heat='pitching')
-    arsenal_cols = ['Pitch', 'Usage %', 'release_speed', 'Horiz. Break', 'Vert. Break', 'CSW%', 'Stuff+']
-    pair("Condensed Pitch Arsenal",
-         f"{away_sp} — {away_team}", av(away_arsenal_df.sort_values('Usage %', ascending=False), arsenal_cols, 7),
-         f"{home_sp} — {home_team}", av(home_arsenal_df.sort_values('Usage %', ascending=False), arsenal_cols, 7),
-         heat='arsenal')
-
-    # ===== PHASE 4: BULLPEN =====
-    band("4  ·  BULLPEN")
-    section("Bullpen Summary and Availability (R/L = full pen mix; Avail R/L = mix usable tonight)",
-            ac.get('away_bullpen_form', pd.DataFrame()), ac.get('home_bullpen_form', pd.DataFrame()), heat='pitching')
-    away_pen_disp, away_pen_fills = cmp_bullpen_view(away_bullpen_df)
-    home_pen_disp, home_pen_fills = cmp_bullpen_view(home_bullpen_df)
-    section("Bullpen Scouting (T = throws, LHP tinted; IP-weighted totals + L7 usage)",
-            away_pen_disp, home_pen_disp, heat='pitching',
-            col_fills={'away': away_pen_fills, 'home': home_pen_fills})
+    # ===== PHASES 3 & 4: PITCHING =====
+    # Both live on their own sheet, written by `_write_pitching_sheet` further down. They
+    # were emitted here too until the duplication became the problem: the starter's season
+    # line was written by the same `starter_row` call on both tabs, and the L5 totals and
+    # the quality of the offenses faced ended up on opposite sheets.
 
     # ===== PHASE 5: RUN GAME & DEFENSE =====
     band("5  ·  RUN GAME & DEFENSE")
     section("Baserunning",
             av(away_baserunning_df, ['Name', 'SB', 'CS', 'SB_Att', 'SB%', 'Runs', 'Triples'], 8),
             av(home_baserunning_df, ['Name', 'SB', 'CS', 'SB_Att', 'SB%', 'Runs', 'Triples'], 8), heat='baserunning')
+    team_def_cols = ['Team', 'BIP', 'xBA Allowed', 'BA Allowed', 'Hits Saved/G',
+                     'IF Saved/G', 'OF Saved/G', 'Frame +Str/G', 'Grade']
+    section("Team Defense (expected minus actual hits on balls in play, vs league; "
+            "errors excluded — DK charges earned runs only)",
+            av(ac.get('away_team_defense', pd.DataFrame()), team_def_cols, 1),
+            av(ac.get('home_team_defense', pd.DataFrame()), team_def_cols, 1),
+            heat='team_defense')
     away_def_disp, away_def_fills = cmp_defense_view(away_defense_df)
     home_def_disp, home_def_fills = cmp_defense_view(home_defense_df)
-    section("Defense", away_def_disp, home_def_disp,
+    section("Defense (fielding-stat view: chances and errors, not range)",
+            away_def_disp, home_def_disp,
             col_fills={'away': away_def_fills, 'home': home_def_fills})
 
     # ===== PHASE 6: ROSTER ALERTS =====
@@ -10688,15 +13917,40 @@ def generate_comparison_report_excel(
             away_txn, home_txn,
             col_fills={'away': away_txn_fills, 'home': home_txn_fills})
 
-    for idx, w in col_widths.items():
-        ws.column_dimensions[get_column_letter(idx)].width = w
-    ws.freeze_panes = "A3"
+    # ---- DFS leverage: sub-5%-owned players the model still likes ----
+    #
+    # Low ownership alone is not a finding: most of a slate's cheap end is unowned for the
+    # obvious reason. Gated on a top-quartile projection, the same cut the star mark uses, so
+    # this table and the glyphs on the name cells can never disagree. The reason column is the
+    # board's own `Why` text -- park and wind, opposing starter FIP, platoon split, batting
+    # order, arsenal fit -- rather than a second explanation invented here.
+    try:
+        from dfs import highlight as _dfs_hl
+        _lev = _dfs_hl.leverage_table(_dfs_hl.slate_frame(),
+                                      games=[f"{away_team}@{home_team}"])
+    except Exception:
+        _lev = None
+    if _lev is not None and not _lev.empty:
+        use_sheet("DFS Leverage")
+        band("7  ·  DFS LEVERAGE  ·  under 5% projected ownership, top-quartile projection")
+        solo("Players the field is off that the model is not — Why = the factors behind the "
+             "projection", _lev)
 
-    # ---- expanded starter tab: both probables side by side ----
+    for entry in sheets.values():
+        sheet, widths = entry["ws"], entry["widths"]
+        for idx, w in widths.items():
+            sheet.column_dimensions[get_column_letter(idx)].width = w
+        sheet.freeze_panes = "A3"
+
+    # ---- merged pitching tab: both starters and both bullpens, side by side ----
+    arsenal_cols = ['Pitch', 'Usage %', 'release_speed', 'Horiz. Break', 'Vert. Break',
+                    'CSW%', 'Stuff+']
     sp_panels = []
-    for side, team, pitcher, info, caption in (
-        ('away', away_team, away_pitcher, away_starter_info, away_sp),
-        ('home', home_team, home_pitcher, home_starter_info, home_sp),
+    for side, team, pitcher, info, caption, arsenal_df, pen_df in (
+        ('away', away_team, away_pitcher, away_starter_info, away_sp,
+         away_arsenal_df, away_bullpen_df),
+        ('home', home_team, home_pitcher, home_starter_info, home_sp,
+         home_arsenal_df, home_bullpen_df),
     ):
         profile = ac.get(f'{side}_sp_profile')
         if profile is None:
@@ -10708,50 +13962,125 @@ def generate_comparison_report_excel(
         opener_view, opener_fills = cmp_opener_view(opener, info)
         bulk_view = (cmp_bulk_arm_view(opener.get('bulk'), season, _sp_context_end)
                      if opener.get('is_opener') else pd.DataFrame())
+        pen_view, pen_fills = cmp_bullpen_view(pen_df)
+        # Older cached contexts predate the pen L5; rebuild on demand so a re-render from
+        # cache still gets the block. Shares the boxscore cache, so it is cheap.
+        pen_l5 = ac.get(f'{side}_bullpen_l5')
+        if pen_l5 is None:
+            pen_l5 = build_bullpen_l5(get_team_id(team), team, game_date, bullpen_df=pen_df)
+        pen_group, pen_arms = pen_l5
+        # Sliced off the league-wide statcast frame during context assembly, so it rides in
+        # the cached payload. An older payload simply has no block, which the panel loop
+        # skips rather than printing an empty table.
+        pen_batted, pen_batted_base = ac.get(f'{side}_bullpen_batted') or (pd.DataFrame(), {})
         sp_panels.append({
-            'title': f"{away_team} at {home_team} — {game_date} — starting pitchers",
+            'title': f"{away_team} at {home_team} — {game_date} — pitching",
             'header': (f"{caption} — {team}"
-                       + ("   ⚠ LIKELY OPENER" if opener.get('is_opener') else "")),
+                       + ("   ⚠ LIKELY OPENER" if opener.get('is_opener') else "")
+                       + cmp_starter_provisional_tag(ac, side)),
             'season': starter_row(info),
             'opener': opener_view,
             'opener_fills': opener_fills,
             'bulk': bulk_view,
             'l5': l5,
             'l5_fills': cmp_starter_l5_fills(l5),
+            'arsenal': av(arsenal_df.sort_values('Usage %', ascending=False),
+                          arsenal_cols, 7),
             'mix': profile.get('mix', pd.DataFrame()),
             'mix_fills': cmp_starter_mix_fills(profile),
             'batted': profile.get('batted', pd.DataFrame()),
             'batted_fills': cmp_starter_batted_fills(profile),
+            'pen_form': ac.get(f'{side}_bullpen_form', pd.DataFrame()),
+            'pen_l5': pen_group,
+            'pen_l5_fills': cmp_pen_l5_fills(pen_group),
+            'pen_arms': pen_arms,
+            'pen_arms_fills': cmp_pen_arms_fills(pen_arms),
+            'pen': pen_view,
+            'pen_fills': pen_fills,
+            'pen_batted': pen_batted,
+            'pen_batted_fills': cmp_bullpen_batted_fills(pen_batted, pen_batted_base),
         })
-    if any(not p['l5'].empty or not p['mix'].empty for p in sp_panels):
-        _write_pitching_sheet(wb, sp_panels, hdr_fill, band_fill, subhdr_fill,
-                              border, center, left, get_column_letter)
+    pitching_ws = _write_pitching_sheet(wb, sp_panels, hdr_fill, band_fill, subhdr_fill,
+                                        border, center, left, get_column_letter)
+    # created last, so slide it back to where phases 3-4 sit in the narrative
+    if pitching_ws is not None and _PITCHING_SHEET_AFTER in wb.sheetnames:
+        target = wb.sheetnames.index(_PITCHING_SHEET_AFTER) + 1
+        wb.move_sheet(pitching_ws, offset=target - wb.sheetnames.index(pitching_ws.title))
 
-    # ---- one box-score tab per team: last 3 completed games, both clubs, stacked ----
+    # ---- one box-score tab per team: the games most like tonight, both clubs, stacked ----
+    # Was "last 3 completed games". Three chronological games spanning a different park, a
+    # different handedness and two roster moves are three box scores, not a comparison.
     for side, team, team_id in (('away', away_team, away_team_id), ('home', home_team, home_team_id)):
-        games = ac.get(f'{side}_recent_boxscores')
-        if games is None:
-            # Older cached contexts predate this section; pull on demand so a re-render
-            # from cache still gets the tabs.
-            games = build_recent_boxscores(team_id, team, game_date)
+        bundle = ac.get(f'{side}_comparable_games')
+        if bundle is None:
+            # Older cached contexts predate this tab; fall back to the chronological
+            # boxscores they do carry rather than dropping the sheet.
+            legacy = ac.get(f'{side}_recent_boxscores') or build_recent_boxscores(
+                team_id, team, game_date)
+            if legacy:
+                _write_boxscore_sheet(wb, f"{team} Last 3", legacy, hdr_fill, band_fill,
+                                      subhdr_fill, border, center, left, get_column_letter)
+            continue
+        games, summary, note = bundle
         if games:
-            _write_boxscore_sheet(wb, f"{team} Last 3", games, hdr_fill, band_fill,
-                                  subhdr_fill, border, center, left, get_column_letter)
+            _write_boxscore_sheet(wb, f"{team} Comps", games, hdr_fill, band_fill,
+                                  subhdr_fill, border, center, left, get_column_letter,
+                                  summary=summary,
+                                  summary_fills=cmp_comparable_summary_fills(summary),
+                                  note=note)
 
     wb.save(output_path)
     return output_path
 
 
+# Blocks on the merged pitching sheet, in reading order: who starts, what he throws, how
+# he has been going, then the pen behind him. (panel key, stripe label, fills key, heat).
+#
+# This used to be two sheets. "Starting Pitchers" held the season line, L5 log and
+# per-start mix; the "Pitching" band held a second copy of the season line (the same
+# `cmp_starter_row` call), a second L5 table off the same `Last Starts` source, and the
+# season arsenal. Three of the six blocks were duplicates, and the two halves of the L5
+# story -- the totals and the quality of the offenses faced -- were on different tabs.
+_PITCHING_BLOCKS = (
+    ("season", "Season Line", None, "pitching"),
+    ("opener", "Opener Check  ·  is the listed starter actually the matchup?",
+     "opener_fills", None),
+    ("bulk", "Likely Bulk Arm  ·  who the lineup really faces when an opener starts",
+     None, "pitching"),
+    ("l5", "Last 5 Starts  ·  Opp OPS/R-G/Rk = quality of the offense faced "
+           "(green = strong lineup); TOTAL row carries the combined ERA", "l5_fills", None),
+    ("arsenal", "Pitch Arsenal  ·  season usage and shape", None, "arsenal"),
+    ("mix", "Pitch Mix & Velocity by Start  ·  drift against the season baseline above",
+     "mix_fills", None),
+    ("batted", "Batted Ball by Start", "batted_fills", None),
+    ("pen_form", "Bullpen Summary and Availability  ·  R/L = full pen mix, "
+                 "Avail R/L = mix usable tonight", None, "pitching"),
+    ("pen_l5", "Bullpen Last 5 Games  ·  what the pen was asked for "
+               "(P/Out = pitches per out, IR = inherited runners scored/inherited)",
+     "pen_l5_fills", None),
+    ("pen_arms", "Bullpen Last 5 Games by Arm  ·  pitch count per game, newest first; "
+                 "+ = outing of 3+ IP, * = position player", "pen_arms_fills", None),
+    ("pen", "Bullpen Scouting  ·  T = throws, LHP tinted; IP-weighted totals + L7 usage",
+     "pen_fills", "pitching"),
+    ("pen_batted", "Bullpen Batted Ball  ·  bold BULLPEN row is the group baseline; "
+                   "each arm shaded against it (direction, not good/bad)",
+     "pen_batted_fills", None),
+)
+
+# First-cell labels that mark a summary line rather than a data row.
+_PITCHING_SUMMARY_ROWS = {"SEASON", "TOTAL", "TOTAL / AVG", "BULLPEN"}
+
+
 def _write_pitching_sheet(wb, panels, hdr_fill, band_fill, subhdr_fill,
                           border, center, left, get_column_letter):
-    """Expanded starter breakdown: both probables side by side on one tab.
+    """The whole pitching picture for one game: both probables and both pens, side by side.
 
-    panels is a list of two dicts (away first) with the pitcher's caption plus the
-    season line, L5 log, per-start pitch mix and per-start batted-ball tables.
+    panels is a list of two dicts (away first) holding the blocks named in
+    `_PITCHING_BLOCKS` for one club, plus the pitcher's caption.
     """
     from openpyxl.styles import Font, PatternFill, Alignment
 
-    ws = wb.create_sheet("Starting Pitchers")
+    ws = wb.create_sheet("Pitching")
     ws.sheet_view.showGridLines = False
     ws.sheet_format.defaultRowHeight = 12.75
     ws.sheet_view.zoomScale = 85
@@ -10763,7 +14092,7 @@ def _write_pitching_sheet(wb, panels, hdr_fill, band_fill, subhdr_fill,
     # pitch) sets the floor, so both starters get identical geometry.
     panel_w = max(
         [len(p[key].columns) for p in panels
-         for key in ("season", "l5", "mix", "batted")
+         for key, *_ in _PITCHING_BLOCKS
          if isinstance(p.get(key), pd.DataFrame) and not p[key].empty] or [12]
     )
     lefts = [1, 1 + panel_w + gap]
@@ -10801,7 +14130,7 @@ def _write_pitching_sheet(wb, panels, hdr_fill, band_fill, subhdr_fill,
         for c in range(2, total_w + 1):
             ws.cell(row=row, column=c).fill = subhdr_fill
 
-    def table(df, top_row, left_col, col_fills=None):
+    def table(df, top_row, left_col, col_fills=None, heat=None):
         col_fills = col_fills or {}
         if df is None or df.empty:
             ws.cell(row=top_row, column=left_col, value="No data.").font = Font(italic=True, size=9)
@@ -10827,29 +14156,41 @@ def _write_pitching_sheet(wb, panels, hdr_fill, band_fill, subhdr_fill,
             note_width(left_col + j, c, c, is_header=True)
         merge_value(top_row)
         for i, (_, row) in enumerate(df.iterrows(), start=1):
-            baseline = str(row[cols[0]]).strip() == "SEASON"
+            # SEASON is the starter's baseline; TOTAL / TOTAL AVG close the L5 and pen
+            # tables. All three are summary lines and are bolded, but -- unlike before --
+            # an explicit fill still wins over the grey, so the averaged Opp Rk on a
+            # TOTAL row is shaded by the same rule as the starts above it.
+            summary = str(row[cols[0]]).strip().upper() in _PITCHING_SUMMARY_ROWS
             for j, c in enumerate(cols):
                 value = row[c]
                 cell = ws.cell(row=top_row + i, column=left_col + j,
                                value="" if value is None or (isinstance(value, float) and pd.isna(value)) else value)
-                cell.font = Font(size=9, bold=baseline)
+                cell.font = Font(size=9, bold=summary)
                 cell.alignment = left if (j == 0 or (is_metric and j == 1)) else center
                 cell.border = border
-                if baseline:
-                    cell.fill = PatternFill("solid", fgColor="E8E8E8")
-                else:
-                    forced = col_fills.get(c)
-                    if forced is not None and i < len(forced) + 1 and forced[i - 1] is not None:
-                        cell.fill = PatternFill("solid", fgColor="{:02X}{:02X}{:02X}".format(*forced[i - 1]))
+                fill = None
+                forced = col_fills.get(c)
+                if forced is not None and i < len(forced) + 1 and forced[i - 1] is not None:
+                    fill = PatternFill("solid", fgColor="{:02X}{:02X}{:02X}".format(*forced[i - 1]))
+                elif heat:
+                    metric = _heat_metric_for(heat, c)
+                    rgb = _heat_rgb(_stat_percentile(metric, value)) if metric else None
+                    if rgb is not None:
+                        fill = PatternFill("solid", fgColor="{:02X}{:02X}{:02X}".format(*rgb))
+                if fill is None and summary:
+                    fill = PatternFill("solid", fgColor="E8E8E8")
+                if fill is not None:
+                    cell.fill = fill
                 note_width(left_col + j, value, c)
             merge_value(top_row + i)
         return len(df) + 1
 
-    title = ws.cell(row=1, column=1, value=panels[0].get("title", "Starting Pitchers"))
+    title = ws.cell(row=1, column=1, value=panels[0].get("title", "Pitching"))
     title.font = Font(bold=True, size=13)
     row = 2
-    band(row, "STARTING PITCHERS  ·  bold SEASON row is the baseline; "
-              "green = above his season norm, red = below (direction, not good/bad)")
+    band(row, "PITCHING  ·  starters then bullpens, away left / home right.  "
+              "In the per-start blocks, bold SEASON is the baseline and green = above his "
+              "season norm, red = below (direction, not good/bad)")
     row += 1
 
     for idx, panel in enumerate(panels):
@@ -10858,17 +14199,11 @@ def _write_pitching_sheet(wb, panels, hdr_fill, band_fill, subhdr_fill,
         cell.alignment = left
     row += 1
 
-    for key, label, fills_key in (
-        ("season", "Season Line", None),
-        ("opener", "Opener Check  ·  is the listed starter actually the matchup?", "opener_fills"),
-        ("bulk", "Likely Bulk Arm  ·  who the lineup really faces when an opener starts", None),
-        ("l5", "Last 5 Starts  ·  Opp OPS/R-G/Rk = quality of the offense faced (green = strong lineup)", "l5_fills"),
-        ("mix", "Pitch Mix & Velocity by Start", "mix_fills"),
-        ("batted", "Batted Ball by Start", "batted_fills"),
-    ):
+    for key, label, fills_key, heat in _PITCHING_BLOCKS:
         frames = [panel.get(key) for panel in panels]
-        # The bulk-arm block only exists when an opener was detected; skip it entirely
-        # rather than printing two "No data." cells on every normal game.
+        # Blocks that only exist in some games -- the bulk arm on an opener night, the pen
+        # L5 when the boxscores would not load -- are skipped entirely rather than printing
+        # two "No data." cells on every normal game.
         if all(f is None or (isinstance(f, pd.DataFrame) and f.empty) for f in frames):
             continue
         stripe(row, label)
@@ -10876,7 +14211,8 @@ def _write_pitching_sheet(wb, panels, hdr_fill, band_fill, subhdr_fill,
         used = 1
         for idx, panel in enumerate(panels):
             used = max(used, table(panel.get(key), row, lefts[idx],
-                                   col_fills=panel.get(fills_key) if fills_key else None))
+                                   col_fills=panel.get(fills_key) if fills_key else None,
+                                   heat=heat))
         row += used + 1
 
     for idx, w in widths.items():
@@ -10888,12 +14224,17 @@ def _write_pitching_sheet(wb, panels, hdr_fill, band_fill, subhdr_fill,
 
 
 def _write_boxscore_sheet(wb, title, games, hdr_fill, band_fill, subhdr_fill,
-                          border, center, left, get_column_letter):
+                          border, center, left, get_column_letter,
+                          summary=None, summary_fills=None, note=None):
     """One worksheet holding several full box scores stacked top to bottom.
 
     Each game is a dark banner, a line score, then away batting / away pitching /
     home batting / home pitching stacked vertically (not side by side) so every table
-    shares the same narrow column set and the sheet reads as one column of blocks."""
+    shares the same narrow column set and the sheet reads as one column of blocks.
+
+    `summary` and `note` head the sheet when the games were selected rather than merely
+    taken in order -- the reader has to be able to see why these five and not the last
+    five, and the note is where a relaxed lineup gate declares itself."""
     from openpyxl.styles import Font, PatternFill
 
     totals_fill = PatternFill("solid", fgColor="E8E8E8")
@@ -10931,7 +14272,8 @@ def _write_boxscore_sheet(wb, title, games, hdr_fill, band_fill, subhdr_fill,
         ws.row_dimensions[r].height = height
         state["row"] = r + 1
 
-    def table(df):
+    def table(df, col_fills=None):
+        col_fills = col_fills or {}
         if df is None or df.empty:
             ws.cell(row=state["row"], column=1, value="No data.").font = Font(italic=True, size=9)
             state["row"] += 2
@@ -10946,7 +14288,7 @@ def _write_boxscore_sheet(wb, title, games, hdr_fill, band_fill, subhdr_fill,
             cell.border = border
             note_width(j, c)
         for i, (_, row) in enumerate(df.iterrows(), start=1):
-            is_totals = str(row[cols[0]]).strip() == "TEAM TOTALS"
+            is_totals = str(row[cols[0]]).strip() in {"TEAM TOTALS", "AVG"}
             for j, c in enumerate(cols, start=1):
                 value = row[c]
                 cell = ws.cell(row=r + i, column=j,
@@ -10954,10 +14296,23 @@ def _write_boxscore_sheet(wb, title, games, hdr_fill, band_fill, subhdr_fill,
                 cell.font = Font(size=9, bold=is_totals)
                 cell.alignment = left if j == 1 else center
                 cell.border = border
-                if is_totals:
+                forced = col_fills.get(c)
+                if forced is not None and i <= len(forced) and forced[i - 1] is not None:
+                    cell.fill = PatternFill("solid", fgColor="{:02X}{:02X}{:02X}".format(*forced[i - 1]))
+                elif is_totals:
                     cell.fill = totals_fill
                 note_width(j, value)
         state["row"] = r + len(df) + 2
+
+    if summary is not None and not summary.empty:
+        banner("WHY THESE GAMES  ·  ranked by similarity to tonight, best first",
+               band_fill)
+        if note:
+            cell = ws.cell(row=state["row"], column=1, value=note)
+            cell.font = Font(size=9, italic=True)
+            cell.alignment = left
+            state["row"] += 2
+        table(summary, col_fills=summary_fills)
 
     for game in games:
         banner(game.get("title", ""), band_fill)
@@ -11156,7 +14511,7 @@ def generate_report_markdown(
             _markdown_table(advanced_context.get("hitter_watchlist"), columns=["Team", "Name", "Why", "OPS", "ISO", "Platoon", "Similar Sample", "OPS Pctl", "HardHit Pctl"], sort_col="Priority", max_rows=6),
             "",
             "### Pitchers To Watch",
-            _markdown_table(advanced_context.get("pitcher_watchlist"), columns=["Team", "Pitcher", "Role", "Why", "FIP", "K-BB", "Opponent Arsenal"], sort_col="Score", max_rows=2),
+            _markdown_table(advanced_context.get("pitcher_watchlist"), columns=["Team", "Pitcher", "Role", "Why", "FIP", "K-BB", "Opponent Arsenal", "K Edge"], sort_col="Score", max_rows=2),
             "",
         ])
 
@@ -11179,7 +14534,7 @@ def generate_report_markdown(
                 "",
                 "### Split Summary",
                 "_Aggregate lineup OPS/xwOBA. Home/Away park-factor adjusted; `*` marks the opposing starter's handedness._",
-                _markdown_table(splits, columns=["Split", "PA", "OPS", "xwOBA"], max_rows=8),
+                _markdown_table(splits, columns=["Split", "PA", "OPS", "xwOBA", "ISO", "K%", "BB%", "HardHit%", "HR%"], max_rows=8),
                 "",
                 f"### Pitch-Type Value & Swing Decisions vs {_clean_markdown(opp_sp)}",
                 "_Lineup RV/100 (batter run value; higher = better), Whiff/Chase/Contact and xwOBA per pitch he throws._",
@@ -11190,7 +14545,7 @@ def generate_report_markdown(
                 "",
                 "### Opposing Pitching Allowed (Starter + Bullpen)",
                 "_OPS/xwOBA allowed by the pitching staff this lineup faces. Home/Away park-factor adjusted._",
-                _markdown_table(opp_pitching, columns=["Unit", "Split", "PA", "OPS", "xwOBA"], max_rows=14),
+                _markdown_table(opp_pitching, columns=["Unit", "Split", "PA", "OPS", "xwOBA", "ISO", "K%", "BB%", "HardHit%", "HR%"], max_rows=14),
                 "",
             ])
 
@@ -11225,7 +14580,7 @@ def generate_report_markdown(
             f"### {away_team} Batter Arsenal Fits",
             _markdown_table(
                 advanced_context.get("away_batter_arsenal"),
-                columns=["Name", "PA", "OPS", "xwOBA", "SLG", "HR", "K%", "HardHit%", "Whiff%", "Fit"],
+                columns=["Name", "PA", "OPS", "xwOBA", "SLG", "HR", "K%", "K Edge", "HardHit%", "Whiff%", "Fit"],
                 sort_col="Arsenal Score",
                 max_rows=5,
             ),
@@ -11233,7 +14588,7 @@ def generate_report_markdown(
             f"### {home_team} Batter Arsenal Fits",
             _markdown_table(
                 advanced_context.get("home_batter_arsenal"),
-                columns=["Name", "PA", "OPS", "xwOBA", "SLG", "HR", "K%", "HardHit%", "Whiff%", "Fit"],
+                columns=["Name", "PA", "OPS", "xwOBA", "SLG", "HR", "K%", "K Edge", "HardHit%", "Whiff%", "Fit"],
                 sort_col="Arsenal Score",
                 max_rows=5,
             ),
@@ -11299,6 +14654,21 @@ def generate_report_markdown(
             "",
             "### Park And Weather Impact",
             _markdown_bullets(env.get("notes", [])),
+            "",
+            "### Team Defense (batted-ball outcomes vs expectation, league-centred)",
+            "_Hits Saved/G is (expected hits - actual hits) on balls in play, against league "
+            "average. Positive means this defence turns more balls into outs than the "
+            "contact quality it faced deserved. Errors are deliberately absent: they produce "
+            "unearned runs, and DK charges a pitcher for earned runs only._",
+            _markdown_table(
+                pd.concat([
+                    advanced_context.get("away_team_defense", pd.DataFrame()),
+                    advanced_context.get("home_team_defense", pd.DataFrame()),
+                ], ignore_index=True),
+                columns=["Team", "BIP", "xBA Allowed", "BA Allowed", "Hits Saved/G",
+                         "IF Saved/G", "OF Saved/G", "Frame +Str/G", "Grade", "DFS Read"],
+                max_rows=2,
+            ),
             "",
             "### Park/Defense Impact",
             _markdown_table(
@@ -12184,7 +15554,7 @@ def load_statcast_splits(season=None, end_date=None):
     if cache_key in _STATCAST_SPLITS_MEMORY_CACHE:
         return _STATCAST_SPLITS_MEMORY_CACHE[cache_key].copy()
     start_date = f"{season}-03-01"
-    df = cached_dataframe_call("statcast", statcast, start_date, end_date)
+    df = load_statcast_range(start_date, end_date)
 
     df = df[df['events'].notna()]
     df = df[df['p_throws'].isin(['R', 'L'])]
@@ -12280,92 +15650,623 @@ def _team_runs_per_game(team_id, season, as_of_date):
     return 4.4, 4.4
 
 
+def _weather_calibration_features(environment):
+    """Numeric pregame weather/umpire inputs shared by fitting and live prediction.
+
+    Historical schedule weather is the observed first-pitch reading.  Live reports use
+    MLB's posted reading when available and the Open-Meteo forecast otherwise.  Keeping
+    the transformation here ensures the fitted coefficients see the same units at report
+    time.  Missing readings are explicit rather than silently looking like perfect 72F,
+    still-air weather.
+    """
+    environment = environment if isinstance(environment, dict) else {}
+    weather = environment.get("weather") or {}
+    forecast = environment.get("forecast") or {}
+
+    temperature = _safe_number(weather.get("temp"), None)
+    if temperature is None:
+        temperature = _safe_number(forecast.get("temp_f"), None)
+
+    wind_text = str(weather.get("wind") or forecast.get("wind") or "").strip()
+    speed_match = re.match(r"\s*(\d+(?:\.\d+)?)", wind_text)
+    wind_speed = float(speed_match.group(1)) if speed_match else 0.0
+    wind_direction = wind_text.casefold()
+    signed_wind = 0.0
+    if "out to" in wind_direction:
+        signed_wind = min(wind_speed, 25.0)
+    elif "in from" in wind_direction:
+        signed_wind = -min(wind_speed, 25.0)
+
+    roof = str(
+        forecast.get("roof")
+        or environment.get("roof")
+        or PARK_ROOF.get(environment.get("park_name"), "")
+        or ""
+    ).strip().casefold()
+    roof_closed = float(roof in {"cover", "fixed", "closed", "dome"})
+    weather_available = float(temperature is not None or bool(wind_text))
+    if roof_closed:
+        # Outdoor conditions must not move a game played in controlled air.
+        temperature_delta = 0.0
+        signed_wind = 0.0
+    else:
+        temperature_delta = ((temperature - 72.0) / 10.0) if temperature is not None else 0.0
+
+    umpire = environment.get("ump_tendency") or {}
+    umpire_games = int(_safe_number(umpire.get("Games"), 0) or 0)
+    umpire_delta = _safe_number(umpire.get("vs Avg"), 0.0) or 0.0
+    return {
+        "temperature_f": float(temperature) if temperature is not None else 72.0,
+        "temperature_delta_10f": float(temperature_delta),
+        "wind_out_mph": float(signed_wind),
+        "roof_closed": roof_closed,
+        "weather_available": weather_available,
+        "umpire_run_delta": float(umpire_delta),
+        "umpire_available": float(umpire_games > 0),
+        "umpire_games": umpire_games,
+    }
+
+
+def _assemble_calibration_features(home, away, environment):
+    """Build model inputs from two leakage-free, pregame team snapshots."""
+    environment = environment if isinstance(environment, dict) else {}
+    park_runs = _safe_number((environment.get("park") or {}).get("Runs"), 1.0) or 1.0
+    edge_diff = (
+        1.8 * (home["record_pct"] - away["record_pct"])
+        + 0.7 * (home["last10_pct"] - away["last10_pct"])
+        + 0.03 * (home["run_diff_per_game"] - away["run_diff_per_game"])
+        + 0.18
+    )
+    raw_home_runs = ((home["rpg"] + away["rapg"]) / 2) * park_runs
+    raw_away_runs = ((away["rpg"] + home["rapg"]) / 2) * park_runs
+    features = {
+        "edge_diff": edge_diff,
+        "raw_total": raw_home_runs + raw_away_runs,
+        "raw_home_runs": raw_home_runs,
+        "raw_away_runs": raw_away_runs,
+        "home_rpg": home["rpg"],
+        "away_rpg": away["rpg"],
+        "home_rapg": home["rapg"],
+        "away_rapg": away["rapg"],
+        "park_runs": park_runs,
+    }
+    features.update(_weather_calibration_features(environment))
+    return features
+
+
+def _shrunk_team_calibration_snapshot(wins, losses, runs, allowed, recent_results):
+    """Pregame team rates with league priors that fade as the season grows.
+
+    Unshrunk Opening Week records created the largest 2026 win edges (up to 27
+    probability points) without better accuracy.  Twenty neutral team-games keeps a 1-0
+    record from looking decisive while contributing less than one-sixth of a full-season
+    rate.  L10 gets a lighter five-game prior because it is intentionally more reactive.
+    """
+    games = max(0, int(wins) + int(losses))
+    recent = [int(bool(value)) for value in recent_results]
+    team_k = CALIBRATION_TEAM_PRIOR_GAMES
+    recent_k = CALIBRATION_RECENT_PRIOR_GAMES
+    return {
+        "record_pct": (float(wins) + 0.5 * team_k) / (games + team_k),
+        "last10_pct": (sum(recent) + 0.5 * recent_k) / (len(recent) + recent_k),
+        "run_diff_per_game": (float(runs) - float(allowed)) / (games + team_k),
+        "rpg": (float(runs) + CALIBRATION_RUNS_PRIOR * team_k) / (games + team_k),
+        "rapg": (float(allowed) + CALIBRATION_RUNS_PRIOR * team_k) / (games + team_k),
+    }
+
+
+def _performance_calibration_snapshot(perf, rpg, rapg):
+    wins, losses = _record_components(perf)
+    games = wins + losses
+    run_diff = _safe_number(
+        perf.get("Run Differential") if isinstance(perf, dict) else 0, 0
+    ) or 0
+    try:
+        recent_wins, recent_losses = str(
+            perf.get("Last 10 Games", "") if isinstance(perf, dict) else ""
+        ).split("-")
+        recent = [1] * int(recent_wins) + [0] * int(recent_losses)
+    except (ValueError, TypeError):
+        recent = []
+    observed_runs = float(rpg) * games if games else 0.0
+    observed_allowed = float(rapg) * games if games else 0.0
+    # Preserve the standings run differential when the endpoint omits cumulative runs.
+    if games and observed_runs == 0.0 and observed_allowed == 0.0 and run_diff:
+        observed_runs = CALIBRATION_RUNS_PRIOR * games + run_diff / 2
+        observed_allowed = CALIBRATION_RUNS_PRIOR * games - run_diff / 2
+    return _shrunk_team_calibration_snapshot(
+        wins, losses, observed_runs, observed_allowed, recent
+    )
+
+
 def _calibration_features(home_team, away_team, season, as_of_date, environment):
+    """Live/report-time feature builder using data available before first pitch."""
     home_id = get_team_id(home_team)
     away_id = get_team_id(away_team)
     home_perf = get_team_performance(home_id, season=season, as_of_date=as_of_date)
     away_perf = get_team_performance(away_id, season=season, as_of_date=as_of_date)
     home_rpg, home_rapg = _team_runs_per_game(home_id, season, as_of_date)
     away_rpg, away_rapg = _team_runs_per_game(away_id, season, as_of_date)
-    park_runs = environment.get("park", {}).get("Runs", 1.0) if isinstance(environment, dict) else 1.0
+    home = _performance_calibration_snapshot(home_perf, home_rpg, home_rapg)
+    away = _performance_calibration_snapshot(away_perf, away_rpg, away_rapg)
+    return _assemble_calibration_features(home, away, environment)
 
-    edge_diff = (
-        1.8 * (_record_pct(home_perf) - _record_pct(away_perf))
-        + 0.7 * (_last10_pct(home_perf) - _last10_pct(away_perf))
-        + 0.03 * (_run_diff_per_game(home_perf) - _run_diff_per_game(away_perf))
-        + 0.18
+
+def _month_ranges(start_date, end_date):
+    cursor = datetime.strptime(start_date, "%Y-%m-%d")
+    finish = datetime.strptime(end_date, "%Y-%m-%d")
+    while cursor <= finish:
+        next_month = (cursor.replace(day=28) + timedelta(days=4)).replace(day=1)
+        chunk_end = min(finish, next_month - timedelta(days=1))
+        yield cursor.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d")
+        cursor = next_month
+
+
+def _calibration_schedule(start_date, end_date):
+    """Fetch regular-season finals in monthly, disk-cached batches.
+
+    The hydrated schedule already contains venue, first-pitch weather, officials and the
+    final line.  That replaces the old per-day schedule plus several per-game requests.
+    """
+    url = "https://statsapi.mlb.com/api/v1/schedule"
+    games = []
+    for chunk_start, chunk_end in _month_ranges(start_date, end_date):
+        data = cached_json_request(
+            url,
+            params={
+                "sportId": 1,
+                "startDate": chunk_start,
+                "endDate": chunk_end,
+                "gameType": "R",
+                "hydrate": "venue,linescore,weather,officials",
+            },
+            namespace="calibration_schedule",
+        )
+        for date_entry in data.get("dates", []):
+            for game in date_entry.get("games", []):
+                if str(game.get("gameType", "")).upper() != "R":
+                    continue
+                status = game.get("status", {}) or {}
+                if str(status.get("abstractGameState", "")).casefold() != "final" and \
+                        str(status.get("detailedState", "")).casefold() not in {"final", "game over"}:
+                    continue
+                teams = game.get("teams", {}) or {}
+                home = teams.get("home", {}) or {}
+                away = teams.get("away", {}) or {}
+                if home.get("score") is None or away.get("score") is None:
+                    continue
+                hp_umpire = next(
+                    (
+                        (official.get("official") or {}).get("fullName")
+                        for official in game.get("officials", [])
+                        if official.get("officialType") == "Home Plate"
+                    ),
+                    "",
+                )
+                home_team = home.get("team", {}) or {}
+                away_team = away.get("team", {}) or {}
+                venue = game.get("venue", {}) or {}
+                games.append({
+                    "game_id": int(game["gamePk"]),
+                    "date": str(game.get("officialDate") or date_entry.get("date")),
+                    "game_datetime": str(game.get("gameDate") or ""),
+                    "game_number": int(game.get("gameNumber", 1) or 1),
+                    "game_type": "R",
+                    "home_team": TEAM_ID_MAP.get(home_team.get("id")) or get_team_abbreviation(home_team.get("name", "")),
+                    "away_team": TEAM_ID_MAP.get(away_team.get("id")) or get_team_abbreviation(away_team.get("name", "")),
+                    "home_score": int(home["score"]),
+                    "away_score": int(away["score"]),
+                    "venue": str(venue.get("name") or ""),
+                    "venue_id": venue.get("id"),
+                    "weather": game.get("weather", {}) or {},
+                    "hp_umpire": str(hp_umpire or ""),
+                })
+    ordered = sorted(games, key=lambda game: (
+        game["date"], game.get("game_datetime", ""), game.get("game_number", 1), game["game_id"]
+    ))
+    # Suspended/resumed games can appear in two monthly responses with the same gamePk.
+    # Keep the later, completed listing and never let one result train or validate twice.
+    unique = {game["game_id"]: game for game in ordered}
+    return sorted(unique.values(), key=lambda game: (
+        game["date"], game.get("game_datetime", ""), game.get("game_number", 1), game["game_id"]
+    ))
+
+
+def _empty_team_history():
+    return {"games": 0, "wins": 0, "runs": 0, "allowed": 0, "recent": deque(maxlen=10)}
+
+
+def _team_history_snapshot(state):
+    losses = state["games"] - state["wins"]
+    return _shrunk_team_calibration_snapshot(
+        state["wins"], losses, state["runs"], state["allowed"], list(state["recent"])
     )
-    raw_home_runs = ((home_rpg + away_rapg) / 2) * park_runs
-    raw_away_runs = ((away_rpg + home_rapg) / 2) * park_runs
-    raw_total = raw_home_runs + raw_away_runs
+
+
+def _update_team_history(state, runs, allowed):
+    state["games"] += 1
+    state["wins"] += int(runs > allowed)
+    state["runs"] += runs
+    state["allowed"] += allowed
+    state["recent"].append(int(runs > allowed))
+
+
+def _umpire_history_snapshot(umpire_state, league_state, umpire_name):
+    umpire = umpire_state.get(umpire_name) if umpire_name else None
+    if not umpire or not league_state["games"]:
+        return None
+    umpire_average = umpire["runs"] / umpire["games"]
+    league_average = league_state["runs"] / league_state["games"]
+    # Early-season umpire samples are volatile.  Shrink the observed difference toward
+    # neutral while retaining Games so the artifact records how much evidence backed it.
+    weight = umpire["games"] / (umpire["games"] + 10.0)
     return {
-        "edge_diff": edge_diff,
-        "raw_total": raw_total,
-        "raw_home_runs": raw_home_runs,
-        "raw_away_runs": raw_away_runs,
-        "home_rpg": home_rpg,
-        "away_rpg": away_rpg,
-        "home_rapg": home_rapg,
-        "away_rapg": away_rapg,
-        "park_runs": park_runs,
+        "Games": umpire["games"],
+        "R/G": round(umpire_average, 3),
+        "Lg R/G": round(league_average, 3),
+        "vs Avg": round((umpire_average - league_average) * weight, 4),
     }
 
 
-def calibrate_model(start_date=None, end_date=None, days=30, max_games=80, output_path=CALIBRATION_PATH):
+def _load_calibration_dataset(path):
+    if not path or not os.path.exists(path):
+        return pd.DataFrame()
+    try:
+        frame = pd.read_csv(path)
+    except Exception as exc:
+        print(f"Ignoring unreadable calibration dataset {path}: {exc}")
+        return pd.DataFrame()
+    if "game_id" in frame:
+        frame["game_id"] = pd.to_numeric(frame["game_id"], errors="coerce").astype("Int64")
+        frame = frame.dropna(subset=["game_id"]).copy()
+        frame["game_id"] = frame["game_id"].astype(int)
+    return frame
+
+
+def _save_calibration_dataset(frame, path):
+    if not path:
+        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    frame.sort_values(["date", "game_datetime", "game_id"]).to_csv(path, index=False)
+
+
+def collect_calibration_dataset(start_date, end_date, max_games=0,
+                                data_path=CALIBRATION_DATA_PATH, checkpoint_every=100):
+    """Materialize reusable, leakage-free historical game features.
+
+    Schedule context starts on March 1 of the first requested season so a midseason run
+    still reconstructs season-to-date records and umpire priors correctly.  `max_games`
+    limits the newest eligible games; zero means the complete date range.
+    """
+    context_start = f"{int(start_date[:4])}-03-01"
+    schedule = _calibration_schedule(context_start, end_date)
+    eligible = [game for game in schedule if start_date <= game["date"] <= end_date]
+    if max_games and max_games > 0:
+        eligible = eligible[-max_games:]
+    selected_ids = {game["game_id"] for game in eligible}
+
+    cached = _load_calibration_dataset(data_path)
+    reusable = {}
+    if not cached.empty and "feature_version" in cached:
+        for _, row in cached[cached["feature_version"] == CALIBRATION_FEATURE_VERSION].iterrows():
+            reusable[int(row["game_id"])] = row.to_dict()
+
+    team_history = {}
+    umpire_history = {}
+    league_history = {}
+    requested_rows = []
+    new_rows = []
+    for game in schedule:
+        season = int(game["date"][:4])
+        home_team, away_team = game["home_team"], game["away_team"]
+        if not home_team or not away_team:
+            continue
+        home_state = team_history.setdefault((season, home_team), _empty_team_history())
+        away_state = team_history.setdefault((season, away_team), _empty_team_history())
+        season_umpires = umpire_history.setdefault(season, {})
+        league_state = league_history.setdefault(season, {"games": 0, "runs": 0})
+        total_runs = game["home_score"] + game["away_score"]
+
+        if game["game_id"] in selected_ids:
+            cached_row = reusable.get(game["game_id"])
+            if cached_row is not None:
+                requested_rows.append(cached_row)
+            else:
+                park, matched_park = _park_context_for_venue(game["venue"])
+                ump_tendency = _umpire_history_snapshot(
+                    season_umpires, league_state, game["hp_umpire"]
+                )
+                environment = {
+                    "park": park,
+                    "park_name": matched_park,
+                    "roof": PARK_ROOF.get(matched_park, ""),
+                    "weather": game["weather"],
+                    "ump_tendency": ump_tendency,
+                }
+                features = _assemble_calibration_features(
+                    _team_history_snapshot(home_state),
+                    _team_history_snapshot(away_state),
+                    environment,
+                )
+                row = {
+                    "feature_version": CALIBRATION_FEATURE_VERSION,
+                    "game_id": game["game_id"],
+                    "date": game["date"],
+                    "game_datetime": game["game_datetime"],
+                    "season": season,
+                    "game": f"{away_team}@{home_team}",
+                    "away_team": away_team,
+                    "home_team": home_team,
+                    "venue": game["venue"],
+                    "hp_umpire": game["hp_umpire"],
+                    "weather_text": json.dumps(game["weather"], sort_keys=True),
+                    "home_win": int(game["home_score"] > game["away_score"]),
+                    "home_runs": game["home_score"],
+                    "away_runs": game["away_score"],
+                    "total_runs": total_runs,
+                    **features,
+                }
+                requested_rows.append(row)
+                new_rows.append(row)
+                if data_path and checkpoint_every and len(new_rows) % checkpoint_every == 0:
+                    combined = pd.concat([cached, pd.DataFrame(new_rows)], ignore_index=True)
+                    combined = combined.drop_duplicates(subset=["game_id"], keep="last")
+                    _save_calibration_dataset(combined, data_path)
+
+        # Update only after feature construction: no game can inform its own prediction.
+        _update_team_history(home_state, game["home_score"], game["away_score"])
+        _update_team_history(away_state, game["away_score"], game["home_score"])
+        if game["hp_umpire"]:
+            umpire = season_umpires.setdefault(game["hp_umpire"], {"games": 0, "runs": 0})
+            umpire["games"] += 1
+            umpire["runs"] += total_runs
+        league_state["games"] += 1
+        league_state["runs"] += total_runs
+
+    if new_rows and data_path:
+        combined = pd.concat([cached, pd.DataFrame(new_rows)], ignore_index=True)
+        combined = combined.drop_duplicates(subset=["game_id"], keep="last")
+        _save_calibration_dataset(combined, data_path)
+    return pd.DataFrame(requested_rows).sort_values(["date", "game", "game_id"]).reset_index(drop=True)
+
+
+def _frame_model_predictions(model, frame):
+    values = np.full(len(frame), float(model.get("intercept", 0.0)), dtype=float)
+    for feature, coef in zip(model.get("features", []), model.get("coef", [])):
+        column = pd.to_numeric(frame.get(feature, 0.0), errors="coerce")
+        if not isinstance(column, pd.Series):
+            column = pd.Series(float(column), index=frame.index)
+        values += column.fillna(0.0).to_numpy() * float(coef)
+    return values
+
+
+def _magnitude_bucket_summary(magnitude, correct, metrics, buckets=5):
+    """Equal-count signal buckets plus a continuous rank-trend test."""
+    from scipy.stats import norm, spearmanr
+
+    work = pd.DataFrame({
+        "magnitude": pd.to_numeric(magnitude, errors="coerce"),
+        "correct": pd.to_numeric(correct, errors="coerce"),
+        **{name: pd.to_numeric(values, errors="coerce") for name, values in metrics.items()},
+    }).dropna(subset=["magnitude", "correct"])
+    if work.empty:
+        return {"games": 0, "buckets": []}
+
+    count = min(int(buckets), len(work))
+    # Ranking guarantees balanced groups even when neutral/missing signals create ties.
+    work["bucket"] = pd.qcut(
+        work["magnitude"].rank(method="first"), count, labels=False, duplicates="drop"
+    )
+    rows = []
+    for bucket, group in work.groupby("bucket", sort=True):
+        n = len(group)
+        successes = int(group["correct"].sum())
+        rate = successes / n
+        z = 1.96
+        denominator = 1 + z * z / n
+        center = (rate + z * z / (2 * n)) / denominator
+        radius = z * math.sqrt(rate * (1 - rate) / n + z * z / (4 * n * n)) / denominator
+        row = {
+            "bucket": int(bucket) + 1,
+            "games": int(n),
+            "magnitude_min": round(float(group["magnitude"].min()), 4),
+            "magnitude_max": round(float(group["magnitude"].max()), 4),
+            "magnitude_mean": round(float(group["magnitude"].mean()), 4),
+            "direction_accuracy_pct": round(rate * 100, 2),
+            "accuracy_ci95_pct": [round((center - radius) * 100, 2), round((center + radius) * 100, 2)],
+        }
+        for name in metrics:
+            row[name] = round(float(group[name].mean()), 4)
+        rows.append(row)
+
+    if work["magnitude"].nunique() < 2 or work["correct"].nunique() < 2:
+        rho, trend_p = float("nan"), float("nan")
+    else:
+        rho, trend_p = spearmanr(work["magnitude"], work["correct"])
+    first, last = rows[0], rows[-1]
+    first_group = work[work["bucket"] == 0]["correct"]
+    last_group = work[work["bucket"] == work["bucket"].max()]["correct"]
+    p1, p2 = float(first_group.mean()), float(last_group.mean())
+    pooled = float((first_group.sum() + last_group.sum()) / (len(first_group) + len(last_group)))
+    standard_error = math.sqrt(
+        pooled * (1 - pooled) * (1 / len(first_group) + 1 / len(last_group))
+    ) if 0 < pooled < 1 else 0.0
+    z_score = (p2 - p1) / standard_error if standard_error else 0.0
+    top_bottom_p = float(2 * norm.sf(abs(z_score)))
+    accuracies = [row["direction_accuracy_pct"] for row in rows]
+    return {
+        "games": int(len(work)),
+        "spearman_rho": round(float(rho), 4) if np.isfinite(rho) else None,
+        "spearman_p": round(float(trend_p), 6) if np.isfinite(trend_p) else None,
+        "top_minus_bottom_accuracy_pp": round((p2 - p1) * 100, 2),
+        "top_vs_bottom_p": round(top_bottom_p, 6),
+        "monotonic_accuracy": all(b >= a for a, b in zip(accuracies, accuracies[1:])),
+        "magnitude_validated": bool(
+            np.isfinite(trend_p)
+            and trend_p < 0.05
+            and top_bottom_p < 0.05
+            and p2 > p1
+        ),
+        "buckets": rows,
+    }
+
+
+def _holdout_signal_analysis(win_model, total_model, holdout_df):
+    """Out-of-time evidence that larger model signals actually earn more trust."""
+    if holdout_df is None or holdout_df.empty:
+        return {}
+    frame = holdout_df.copy()
+
+    logits = _frame_model_predictions({
+        "intercept": float(win_model.intercept_[0]),
+        "features": ["edge_diff"],
+        "coef": [float(win_model.coef_[0][0])],
+    }, frame)
+    home_probability = 1 / (1 + np.exp(-logits))
+    favorite_correct = np.where(
+        home_probability >= 0.5,
+        frame["home_win"].to_numpy(),
+        1 - frame["home_win"].to_numpy(),
+    )
+    win_magnitude = np.abs(home_probability - 0.5) * 100
+    win = _magnitude_bucket_summary(
+        win_magnitude,
+        favorite_correct,
+        {
+            "predicted_confidence_pct": np.maximum(home_probability, 1 - home_probability) * 100,
+            "brier": (home_probability - frame["home_win"].to_numpy()) ** 2,
+        },
+    )
+    win["magnitude_unit"] = "probability points from 50%"
+
+    total_spec = {
+        "intercept": float(total_model.intercept_),
+        "features": list(total_model.feature_names_in_),
+        "coef": [float(value) for value in total_model.coef_],
+    }
+    predicted_total = _frame_model_predictions(total_spec, frame)
+    actual_total = frame["total_runs"].to_numpy(dtype=float)
+    raw_total = frame["raw_total"].to_numpy(dtype=float)
+    adjustment = predicted_total - raw_total
+    raw_error = np.abs(raw_total - actual_total)
+    model_error = np.abs(predicted_total - actual_total)
+    total = _magnitude_bucket_summary(
+        np.abs(adjustment),
+        (adjustment * (actual_total - raw_total) > 0).astype(int),
+        {
+            "raw_mae": raw_error,
+            "model_mae": model_error,
+            "mae_gain": raw_error - model_error,
+            "model_beats_raw_pct": (model_error < raw_error).astype(float) * 100,
+        },
+    )
+    total["magnitude_unit"] = "runs from raw total"
+
+    coefficients = dict(zip(total_spec["features"], total_spec["coef"]))
+    neutral_total = np.full(len(frame), total_spec["intercept"], dtype=float)
+    neutral_total += raw_total * coefficients.get("raw_total", 0.0)
+    context_delta = predicted_total - neutral_total
+    neutral_error = np.abs(neutral_total - actual_total)
+    context_error = np.abs(predicted_total - actual_total)
+    context = _magnitude_bucket_summary(
+        np.abs(context_delta),
+        (context_delta * (actual_total - neutral_total) > 0).astype(int),
+        {
+            "neutral_mae": neutral_error,
+            "context_mae": context_error,
+            "mae_gain": neutral_error - context_error,
+        },
+    )
+    context["magnitude_unit"] = "runs from weather/roof/umpire context"
+
+    components = {}
+    component_terms = {
+        "weather": ["temperature_delta_10f", "wind_out_mph", "roof_closed"],
+        # Availability is bookkeeping; only the measured pregame tendency is evidence
+        # that a larger umpire signal deserves more weight.
+        "umpire_tendency": ["umpire_run_delta"],
+    }
+    for name, feature_names in component_terms.items():
+        delta = np.zeros(len(frame), dtype=float)
+        for feature in feature_names:
+            delta += frame[feature].fillna(0).to_numpy(dtype=float) * coefficients.get(feature, 0.0)
+        nonzero = np.abs(delta) > 1e-12
+        if not nonzero.any():
+            components[name] = {"games": 0, "buckets": []}
+            continue
+        component_base = predicted_total - delta
+        components[name] = _magnitude_bucket_summary(
+            np.abs(delta[nonzero]),
+            (delta[nonzero] * (actual_total[nonzero] - component_base[nonzero]) > 0).astype(int),
+            {
+                "base_mae": np.abs(component_base[nonzero] - actual_total[nonzero]),
+                "component_mae": np.abs(predicted_total[nonzero] - actual_total[nonzero]),
+                "mae_gain": (
+                    np.abs(component_base[nonzero] - actual_total[nonzero])
+                    - np.abs(predicted_total[nonzero] - actual_total[nonzero])
+                ),
+            },
+            buckets=4,
+        )
+        components[name]["magnitude_unit"] = "runs"
+    context["components"] = components
+    return {"win": win, "total_adjustment": total, "context": context}
+
+
+def calibrate_model(start_date=None, end_date=None, days=30, max_games=0,
+                    output_path=CALIBRATION_PATH, data_path=CALIBRATION_DATA_PATH):
     end_date = end_date or (datetime.today() - timedelta(days=1)).strftime("%Y-%m-%d")
     if not start_date:
         start_date = (datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=days)).strftime("%Y-%m-%d")
 
-    rows = []
-    for date in _date_range(start_date, end_date):
-        if len(rows) >= max_games:
-            break
-        season = int(date[:4])
-        context_date = _pregame_end_date(date)
-        if not context_date or context_date < _season_start_date(season):
-            continue
-        schedule = statsapi.schedule(start_date=date, end_date=date)
-        for game in schedule:
-            if len(rows) >= max_games:
-                break
-            if str(game.get("status", "")).lower() != "final":
-                continue
-            home_team = get_team_abbreviation(game.get("home_name", ""))
-            away_team = get_team_abbreviation(game.get("away_name", ""))
-            if not home_team or not away_team:
-                continue
-            try:
-                home_score = int(game.get("home_score"))
-                away_score = int(game.get("away_score"))
-                environment = get_game_environment(game["game_id"], date)
-                features = _calibration_features(home_team, away_team, season, context_date, environment)
-                rows.append({
-                    **features,
-                    "home_win": 1 if home_score > away_score else 0,
-                    "home_runs": home_score,
-                    "away_runs": away_score,
-                    "total_runs": home_score + away_score,
-                    "date": date,
-                    "game": f"{away_team}@{home_team}",
-                })
-            except Exception as e:
-                print(f"Skipping calibration game {date} {away_team}@{home_team}: {e}")
-                continue
-
-    df = pd.DataFrame(rows)
+    df = collect_calibration_dataset(
+        start_date=start_date,
+        end_date=end_date,
+        max_games=max_games,
+        data_path=data_path,
+    )
     if len(df) < 12:
         raise RuntimeError(f"Not enough completed games to calibrate ({len(df)} found).")
 
     win_features = ["edge_diff"]
-    total_features = ["raw_total"]
-    home_run_features = ["raw_home_runs"]
-    away_run_features = ["raw_away_runs"]
+    context_features = [
+        "temperature_delta_10f",
+        "wind_out_mph",
+        "roof_closed",
+        "weather_available",
+        "umpire_run_delta",
+        "umpire_available",
+    ]
+    total_features = ["raw_total", *context_features]
+    home_run_features = ["raw_home_runs", *context_features]
+    away_run_features = ["raw_away_runs", *context_features]
+    model_features = set(win_features + total_features + home_run_features + away_run_features)
+    for column in model_features:
+        df[column] = pd.to_numeric(df[column], errors="coerce").fillna(0.0)
     df = df.sort_values(["date", "game"]).reset_index(drop=True)
-    split_idx = max(12, int(len(df) * 0.75))
-    if len(df) - split_idx < 8:
-        split_idx = len(df)
-    train_df = df.iloc[:split_idx].copy()
-    holdout_df = df.iloc[split_idx:].copy()
+
+    # With multiple seasons, the newest season is a clean out-of-time test.  A short
+    # single-season run falls back to the previous chronological 75/25 split.
+    seasons = pd.to_numeric(df.get("season", df["date"].str[:4]), errors="coerce")
+    newest_season = int(seasons.max())
+    season_holdout = df[seasons == newest_season]
+    prior_seasons = df[seasons < newest_season]
+    if len(season_holdout) >= 20 and len(prior_seasons) >= 20:
+        train_df = prior_seasons.copy()
+        holdout_df = season_holdout.copy()
+        validation_method = "latest_season_holdout"
+        holdout_label = str(newest_season)
+    else:
+        split_idx = max(12, int(len(df) * 0.75))
+        if len(df) - split_idx < 8:
+            split_idx = len(df)
+        train_df = df.iloc[:split_idx].copy()
+        holdout_df = df.iloc[split_idx:].copy()
+        validation_method = "chronological_holdout" if not holdout_df.empty else "in_sample_only"
+        holdout_label = (
+            f"{holdout_df['date'].min()}..{holdout_df['date'].max()}"
+            if not holdout_df.empty else ""
+        )
 
     win_model = LogisticRegression(max_iter=1000)
     win_model.fit(train_df[win_features], train_df["home_win"])
@@ -12388,7 +16289,8 @@ def calibrate_model(start_date=None, end_date=None, days=30, max_games=80, outpu
     baseline_brier = float(np.mean((baseline_home_rate - train_df["home_win"]) ** 2))
 
     validation = {
-        "method": "chronological_holdout" if not holdout_df.empty else "in_sample_only",
+        "method": validation_method,
+        "holdout_period": holdout_label,
         "train_games": int(len(train_df)),
         "holdout_games": int(len(holdout_df)),
         "baseline_brier": round(baseline_brier, 4),
@@ -12421,6 +16323,9 @@ def calibrate_model(start_date=None, end_date=None, days=30, max_games=80, outpu
             "holdout_raw_away_runs_mae": round(holdout_raw_away_runs_mae, 3),
             "holdout_model_away_runs_mae": round(holdout_away_runs_mae, 3),
         })
+        validation["signal_analysis"] = _holdout_signal_analysis(
+            win_model, total_model, holdout_df
+        )
 
     if validation.get("holdout_games", 0) >= 20:
         better_win = validation.get("holdout_model_brier", 1) <= validation.get("holdout_baseline_brier", 0) + 0.02
@@ -12444,6 +16349,8 @@ def calibrate_model(start_date=None, end_date=None, days=30, max_games=80, outpu
 
     payload = {
         "created_at": datetime.today().strftime("%Y-%m-%d %H:%M:%S"),
+        "feature_version": CALIBRATION_FEATURE_VERSION,
+        "data_path": os.path.abspath(data_path) if data_path else None,
         "start_date": start_date,
         "end_date": end_date,
         "games": int(len(df)),
@@ -12472,9 +16379,10 @@ def calibrate_model(start_date=None, end_date=None, days=30, max_games=80, outpu
             "coef": [float(x) for x in final_away_run_model.coef_],
         },
     }
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
+    if output_path:
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
     return payload
 
 
@@ -12514,61 +16422,57 @@ def _calibrated_prediction_from_features(features, calibration=None):
     }
 
 
-def backtest_model(start_date=None, end_date=None, days=30, max_games=120, output_path="scouting_reports/model_backtest.csv"):
+def backtest_model(start_date=None, end_date=None, days=30, max_games=120,
+                   output_path="scouting_reports/model_backtest.csv",
+                   data_path=CALIBRATION_DATA_PATH):
     end_date = end_date or (datetime.today() - timedelta(days=1)).strftime("%Y-%m-%d")
     if not start_date:
         start_date = (datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=days)).strftime("%Y-%m-%d")
     calibration = load_model_calibration()
+    source = collect_calibration_dataset(
+        start_date=start_date,
+        end_date=end_date,
+        max_games=max_games,
+        data_path=data_path,
+    )
     rows = []
-    for date in _date_range(start_date, end_date):
-        if len(rows) >= max_games:
-            break
-        season = int(date[:4])
-        context_date = _pregame_end_date(date)
-        if not context_date or context_date < _season_start_date(season):
-            continue
-        schedule = statsapi.schedule(start_date=date, end_date=date)
-        for game in schedule:
-            if len(rows) >= max_games:
-                break
-            if str(game.get("status", "")).lower() != "final":
-                continue
-            home_team = get_team_abbreviation(game.get("home_name", ""))
-            away_team = get_team_abbreviation(game.get("away_name", ""))
-            if not home_team or not away_team:
-                continue
-            try:
-                home_score = int(game.get("home_score"))
-                away_score = int(game.get("away_score"))
-                environment = get_game_environment(game["game_id"], date)
-                features = _calibration_features(home_team, away_team, season, context_date, environment)
-                pred = _calibrated_prediction_from_features(features, calibration)
-                pick = home_team if pred["home_win_prob"] >= 0.5 else away_team
-                actual_winner = home_team if home_score > away_score else away_team
-                rows.append({
-                    "date": date,
-                    "game": f"{away_team}@{home_team}",
-                    "away_team": away_team,
-                    "home_team": home_team,
-                    "pick": pick,
-                    "actual_winner": actual_winner,
-                    "pick_correct": int(pick == actual_winner),
-                    "home_win_prob": pred["home_win_prob"],
-                    "away_win_prob": pred["away_win_prob"],
-                    "away_runs_pred": pred["away_runs_pred"],
-                    "home_runs_pred": pred["home_runs_pred"],
-                    "total_runs_pred": pred["total_runs_pred"],
-                    "away_score": away_score,
-                    "home_score": home_score,
-                    "total_runs": away_score + home_score,
-                    "away_run_error": round(pred["away_runs_pred"] - away_score, 2),
-                    "home_run_error": round(pred["home_runs_pred"] - home_score, 2),
-                    "total_error": round(pred["total_runs_pred"] - (away_score + home_score), 2),
-                    **{key: round(value, 4) for key, value in features.items()},
-                })
-            except Exception as e:
-                print(f"Skipping backtest game {date} {away_team}@{home_team}: {e}")
-                continue
+    target_columns = {
+        "feature_version", "game_id", "date", "game_datetime", "season", "game",
+        "away_team", "home_team", "venue", "hp_umpire", "weather_text", "home_win",
+        "home_runs", "away_runs", "total_runs",
+    }
+    for _, game in source.iterrows():
+        features = {
+            key: float(value)
+            for key, value in game.items()
+            if key not in target_columns and pd.notna(value) and isinstance(value, (int, float, np.number))
+        }
+        pred = _calibrated_prediction_from_features(features, calibration)
+        home_team, away_team = game["home_team"], game["away_team"]
+        home_score, away_score = int(game["home_runs"]), int(game["away_runs"])
+        pick = home_team if pred["home_win_prob"] >= 0.5 else away_team
+        actual_winner = home_team if home_score > away_score else away_team
+        rows.append({
+            "date": game["date"],
+            "game": game["game"],
+            "away_team": away_team,
+            "home_team": home_team,
+            "pick": pick,
+            "actual_winner": actual_winner,
+            "pick_correct": int(pick == actual_winner),
+            "home_win_prob": pred["home_win_prob"],
+            "away_win_prob": pred["away_win_prob"],
+            "away_runs_pred": pred["away_runs_pred"],
+            "home_runs_pred": pred["home_runs_pred"],
+            "total_runs_pred": pred["total_runs_pred"],
+            "away_score": away_score,
+            "home_score": home_score,
+            "total_runs": away_score + home_score,
+            "away_run_error": round(pred["away_runs_pred"] - away_score, 2),
+            "home_run_error": round(pred["home_runs_pred"] - home_score, 2),
+            "total_error": round(pred["total_runs_pred"] - (away_score + home_score), 2),
+            **{key: round(value, 4) for key, value in features.items()},
+        })
 
     df = pd.DataFrame(rows)
     if df.empty:
@@ -12633,6 +16537,70 @@ def _resolve_pitcher_override(value, team_abbr):
     return pitcher_id
 
 
+def resolve_starter(selected_game, side, team_abbr, date, override=None,
+                    exclude_ids=None, season=None, context_end=None,
+                    allow_projected=True):
+    """Who to build this side of the report against, and where the name came from.
+
+    Ladder, most authoritative first:
+
+        override    --away-pitcher / --home-pitcher
+        announced   StatsAPI probable, then the validated probable-pitchers page
+        salary      the arm DraftKings flagged as starting tonight
+        rotation    `effective_starter` over `build_rotation`
+
+    Returns `{"id", "name", "source", "provisional", "note"}`, with `id` None only when even
+    the rotation model has nothing to offer -- which is the one case that still skips.
+
+    `provisional` is True for anything below `announced`. That flag is the whole point: the
+    report gets built and *labelled* instead of skipped, and `refresh_cached_lineups` knows
+    to rebuild it once MLB actually posts a probable.
+
+    `allow_projected=False` stops after the announced branch, which is the old behaviour --
+    worth having for a date far enough out that a rotation guess is not worth the eight
+    minutes a game costs.
+    """
+    exclude_ids = {int(p) for p in (exclude_ids or []) if p}
+    season = int(season or str(date)[:4])
+    context_end = context_end or _pregame_end_date(date) or date
+
+    def result(pitcher_id, source, name=None, note=""):
+        pitcher_id = int(pitcher_id)
+        return {"id": pitcher_id,
+                "name": name or _player_name_from_id(pitcher_id),
+                "source": source, "provisional": source not in ("announced", "override"),
+                "note": note}
+
+    forced = _resolve_pitcher_override(override, team_abbr)
+    if forced:
+        return result(forced, "override")
+
+    announced = resolve_probable_pitcher_v2(selected_game, side, team_abbr, exclude_ids,
+                                            date=date)
+    if announced:
+        return result(announced, "announced")
+
+    if not allow_projected:
+        return {"id": None, "name": "TBD", "source": "unknown", "provisional": True,
+                "note": "no probable announced (projected starters disabled)"}
+
+    from_dk = starter_from_salary_file(date, team_abbr, exclude_ids=exclude_ids)
+    if from_dk:
+        name = _player_name_from_id(from_dk)
+        print(f"ℹ️ No probable posted for {team_abbr}; DraftKings has {name} starting.")
+        return result(from_dk, "salary", name=name,
+                      note="MLB has not posted a probable; DraftKings lists him as starting")
+
+    pitcher_id, name, source, note = starter_from_rotation(
+        team_abbr, season, context_end, as_of_date=date, exclude_ids=exclude_ids)
+    if pitcher_id:
+        print(f"ℹ️ No probable posted for {team_abbr}; rotation model projects {name}.")
+        return result(pitcher_id, source or "rotation", name=name, note=note)
+
+    return {"id": None, "name": "TBD", "source": "unknown", "provisional": True,
+            "note": note or "no probable, no DK listing and no usable rotation history"}
+
+
 def generate_scouting_report_for_game(
     date,
     game_number=None,
@@ -12648,6 +16616,7 @@ def generate_scouting_report_for_game(
     dfs_highlight=True,
     dh_game=None,
     dfs_slate=None,
+    allow_projected_starters=True,
 ):
     selected_game = choose_game(date, game_number=game_number, away_team=away_team,
                                 home_team=home_team, dh_game=dh_game)
@@ -12672,17 +16641,36 @@ def generate_scouting_report_for_game(
     # page-scrape fallback cannot hand back the same arm for both.
     sibling_starters = _doubleheader_sibling_starters(date, selected_game)
 
-    home_pitcher = _resolve_pitcher_override(home_pitcher_override, home_team) \
-        or resolve_probable_pitcher_v2(selected_game, "home", home_team, sibling_starters)
-    away_pitcher = _resolve_pitcher_override(away_pitcher_override, away_team) \
-        or resolve_probable_pitcher_v2(selected_game, "away", away_team, sibling_starters)
+    home_start = resolve_starter(selected_game, "home", home_team, date,
+                                 override=home_pitcher_override,
+                                 exclude_ids=sibling_starters,
+                                 season=season, context_end=context_date,
+                                 allow_projected=allow_projected_starters)
+    # The home pick joins the exclusion set so a provisional source cannot hand the same arm
+    # to both clubs; the announced branch already guards this for itself.
+    away_start = resolve_starter(selected_game, "away", away_team, date,
+                                 override=away_pitcher_override,
+                                 exclude_ids=list(sibling_starters) + [home_start["id"]],
+                                 season=season, context_end=context_date,
+                                 allow_projected=allow_projected_starters)
+    home_pitcher, away_pitcher = home_start["id"], away_start["id"]
 
     if not home_pitcher or not away_pitcher:
-        print(f"⚠️ Could not resolve both probable pitchers for {away_team} at {home_team} on {date}.")
+        missing = ", ".join(team for team, pick in ((home_team, home_start), (away_team, away_start))
+                            if not pick["id"])
+        print(f"⚠️ No starter could be resolved for {missing} in {away_team} at {home_team} "
+              f"on {date} — not even from the DK salary file or the rotation model.")
         return
     if int(home_pitcher) == int(away_pitcher):
         print(f"⚠️ Probable pitcher conflict for {away_team} at {home_team} on {date}: both sides resolved to {_player_name_from_id(home_pitcher)}.")
         return
+
+    starter_provenance = {"home": home_start, "away": away_start}
+    for team, pick in ((home_team, home_start), (away_team, away_start)):
+        if pick["provisional"]:
+            print(f"⚠️ {team}'s starter is PROVISIONAL: {pick['name']} "
+                  f"({STARTER_SOURCE_LABEL.get(pick['source'], pick['source'])}). "
+                  f"Re-run with --refresh-lineups once the probable posts.")
     
     
     print(f"\nGenerating report for {home_team} vs {away_team} ({date})...\n")
@@ -12746,6 +16734,7 @@ def generate_scouting_report_for_game(
         statcast_detail_df,
         statcast_similarity_df,
         dh_game=selected_game.get("game_num"),
+        starter_provenance=starter_provenance,
     )
 
     outputs = []
@@ -12802,6 +16791,7 @@ def generate_all_scouting_reports_for_date(
     similarity_lookback=3,
     upcoming_only=False,
     dfs_slate=None,
+    allow_projected_starters=True,
 ):
     games = get_available_games(date)
     if not games:
@@ -12864,6 +16854,7 @@ def generate_all_scouting_reports_for_date(
                 similarity_lookback=similarity_lookback,
                 dh_game=dh_game,
                 dfs_slate=dfs_slate,
+                allow_projected_starters=allow_projected_starters,
             ) or []
             if outputs:
                 all_outputs.extend(outputs)
@@ -13008,7 +16999,20 @@ def parse_args():
     parser.add_argument(
         "--refresh-lineups",
         action="store_true",
-        help="With --from-cache, re-pull lineups first so confirmed lineups actually appear.",
+        help="With --from-cache, re-pull lineups first so confirmed lineups actually appear. "
+             "Checks the cards first and keeps the cached report when nothing has changed.",
+    )
+    parser.add_argument(
+        "--force-lineup-refresh",
+        action="store_true",
+        help="With --refresh-lineups, rebuild even when the posted cards match the cache.",
+    )
+    parser.add_argument(
+        "--strict-probables",
+        action="store_true",
+        help="Skip a game unless MLB has posted a probable, instead of falling back to the "
+             "DK salary file and then the rotation model. The old behaviour; worth using for "
+             "a date far enough out that a projected starter is not worth generating.",
     )
     parser.add_argument(
         "--no-dfs-highlight",
@@ -13102,8 +17106,13 @@ def parse_args():
     parser.add_argument(
         "--calibration-max-games",
         type=int,
-        default=80,
-        help="Maximum completed games to include.",
+        default=0,
+        help="Maximum completed games to include, keeping the newest games; 0 uses the full date range.",
+    )
+    parser.add_argument(
+        "--calibration-data",
+        default=CALIBRATION_DATA_PATH,
+        help="Reusable per-game calibration feature dataset.",
     )
     parser.add_argument(
         "--backtest",
@@ -13140,10 +17149,20 @@ def main():
             end_date=args.calibration_end,
             days=args.calibration_days,
             max_games=args.calibration_max_games,
+            data_path=args.calibration_data,
         )
+        validation = payload.get("validation", {})
+        holdout = ""
+        if validation.get("holdout_games"):
+            holdout = (
+                f", holdout Brier {validation.get('holdout_model_brier')}"
+                f", holdout total MAE {validation.get('holdout_model_total_mae')}"
+            )
         print(
             f"Saved calibration: {CALIBRATION_PATH} "
-            f"({payload['games']} games, Brier {payload['brier']}, total MAE {payload['total_mae']}, reliability {payload.get('reliability')})"
+            f"({payload['games']} games, in-sample Brier {payload['brier']}, "
+            f"in-sample total MAE {payload['total_mae']}{holdout}, "
+            f"reliability {payload.get('reliability')})"
         )
         return
 
@@ -13215,6 +17234,7 @@ def main():
                     reports_root=args.output_dir, dated_output=not args.flat_output,
                     formats=formats, dfs_highlight=not args.no_dfs_highlight,
                     fast=args.fast, refresh_lineups=args.refresh_lineups,
+                    force_lineup_refresh=args.force_lineup_refresh,
                     dfs_slate=args.dfs_slate,
                 ):
                     print(f"  -> {path}")
@@ -13239,6 +17259,7 @@ def main():
             similarity_lookback=args.similarity_lookback,
             upcoming_only=args.upcoming_only,
             dfs_slate=args.dfs_slate,
+            allow_projected_starters=not args.strict_probables,
         )
         return
 
@@ -13257,6 +17278,7 @@ def main():
         dfs_highlight=not args.no_dfs_highlight,
         dh_game=args.dh_game,
         dfs_slate=args.dfs_slate,
+        allow_projected_starters=not args.strict_probables,
     )
 
 

@@ -1,0 +1,102 @@
+{
+  "generated_utc": "2026-08-08T17:58:42+00:00",
+  "what": "Ownership model vs measured %Drafted, and the refit that did not move it.",
+  "fit_set": {
+    "slates": 14,
+    "player_slates": 1724,
+    "note": "one contest per slate, the largest field, matched by dfs.results.contest_night"
+  },
+  "shipped": {
+    "temperature": 40.0,
+    "max_ownership": 60.0,
+    "appeal_weights": {
+      "value": 0.15,
+      "dk_avg": 0.3,
+      "salary": 0.5,
+      "order": 0.05
+    }
+  },
+  "accuracy": {
+    "MAE": 4.67,
+    "bias": -0.93,
+    "spearman": 0.61,
+    "hitters": {
+      "n": 1552,
+      "MAE": 4.3,
+      "spearman": 0.574
+    },
+    "pitchers": {
+      "n": 172,
+      "MAE": 7.95,
+      "spearman": 0.784
+    },
+    "top10_chalk_recall": 4.1
+  },
+  "by_real_ownership_band": [
+    {
+      "band": "<1%",
+      "n": 312,
+      "mean_real": 0.5,
+      "mean_est": 3.7,
+      "MAE": 3.25,
+      "bias": -3.25
+    },
+    {
+      "band": "1-5%",
+      "n": 680,
+      "mean_real": 2.6,
+      "mean_est": 5.7,
+      "MAE": 3.39,
+      "bias": -3.12
+    },
+    {
+      "band": "5-15%",
+      "n": 503,
+      "mean_real": 8.8,
+      "mean_est": 9.7,
+      "MAE": 4.37,
+      "bias": -0.93
+    },
+    {
+      "band": "15-30%",
+      "n": 176,
+      "mean_real": 20.7,
+      "mean_est": 14.9,
+      "MAE": 8.78,
+      "bias": 5.8
+    },
+    {
+      "band": "30%+",
+      "n": 53,
+      "mean_real": 42.3,
+      "mean_est": 23.8,
+      "MAE": 18.62,
+      "bias": 18.47
+    }
+  ],
+  "temperature_sweep": {
+    "10": 7.42,
+    "14": 6.4,
+    "18": 5.7,
+    "22": 5.24,
+    "26": 4.96,
+    "30": 4.8,
+    "34": 4.72,
+    "38": 4.68,
+    "40": 4.67,
+    "44": 4.67,
+    "50": 4.7
+  },
+  "ruled_out": [
+    "lower temperature: MAE rises monotonically below 34; chalk bias barely moves",
+    "appeal weights: 1771-point simplex sweep x T in {30,40,50}; best MAE 4.652 vs shipped 4.669",
+    "z-score and min-max in place of the percentile transform: same MAE/chalk-bias frontier",
+    "raising MAX_OWNERSHIP: cap never binds at T=40 (40 -> 100 moves MAE by 0.05)"
+  ],
+  "diagnosis": "The residual is ranking quality, not sharpness. field_appeal ranks the field's chalk at Spearman 0.56 and recovers 4.1 of its top ten, so concentrating ownership concentrates it on the wrong player. At T=8 the model's top estimate averages 64% against a real 43% -- capability is not the limit, knowing who is.",
+  "would_move_it": [
+    "Vegas implied team runs",
+    "a public consensus projection",
+    "the same player's measured ownership on recent slates"
+  ]
+}

@@ -168,7 +168,26 @@ def find_salary_file(date, path=None, salary_dirs=None, slate=None):
 
     if slate:
         needle = str(slate).lower()
-        matched = [c for c in candidates if needle in c["name"].lower()]
+        # A path is a reasonable thing to reach for when a night has two slates of the
+        # same kind, and every match below reads a bare filename, so reduce it to one.
+        if "/" in needle or "\\" in needle:
+            needle = os.path.basename(needle.replace("\\", "/"))
+        from .naming import label_slates, slug_from_filename
+        # An exact label beats a substring, because a substring cannot tell two slates of
+        # the same kind apart. A night with two turbos names them turbo and turbo-2, and
+        # "turbo" is a substring of both -- so matching loosely first rejects as ambiguous
+        # the very label the file was renamed to carry.
+        matched = [c for c in candidates if slug_from_filename(c["name"], date) == needle]
+        if not matched:
+            # An export downloaded under DK's own name carries no slate in it, but the
+            # night's exports still resolve to labels when read together -- so
+            # `--slate turbo` picks the turbo out of a folder of unrenamed downloads.
+            labels = label_slates(candidates, date)
+            matched = [c for c in candidates if labels.get(c["path"]) == needle]
+        if not matched:
+            # Loose substring last: it is the convenience path for a partial name, and
+            # only reachable once no export answers to this label exactly.
+            matched = [c for c in candidates if needle in c["name"].lower()]
         if not matched:
             raise AmbiguousSlate(candidates)
         candidates = matched

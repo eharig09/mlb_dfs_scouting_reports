@@ -7,6 +7,7 @@ from datetime import datetime
 from .adopt import DOWNLOADS_DIR, SEARCH_DIRS, adopt_for_date, describe
 from .board import render_board
 from .naming import OUTPUT_ROOT, resolve
+from .profiling import format_report, profiler
 from .salaries import list_salary_files, slate_label
 from .schedule import describe_postponed
 from .slate import REPORT_DATA_DIR, build_slate
@@ -69,7 +70,19 @@ def main():
     parser.add_argument("--top-pitchers", type=int, default=14, help="Pitchers shown on the board.")
     parser.add_argument("--top-per-position", type=int, default=8, help="Hitters shown per position.")
     parser.add_argument("--print", dest="echo", action="store_true", help="Print the board to stdout.")
+    parser.add_argument("--profile", action="store_true",
+                        help="Time each pipeline stage and write docs/benchmarks/profile_*.json.")
     args = parser.parse_args()
+
+    with profiler.session("board", date=args.date, slate=args.slate, enabled=args.profile):
+        _run(args)
+    if args.profile:
+        print("\n=== pipeline profile ===")
+        print(format_report(profiler.last_report))
+        print(f"  -> {profiler.last_report.get('path')}")
+
+
+def _run(args):
 
     # File any stray download before resolving inputs, so a DK export that was never
     # renamed still gets found -- and gets a proper name, which is what stops it from
@@ -94,8 +107,10 @@ def main():
     if meta.get("ambiguous_slates"):
         print_slates(meta["ambiguous_slates"], args.date, ambiguous=True)
         return
-    board = render_board(players, stacks, meta,
-                         top_pitchers=args.top_pitchers, top_per_position=args.top_per_position)
+    with profiler.stage("render", players=len(players)):
+        board = render_board(players, stacks, meta,
+                             top_pitchers=args.top_pitchers,
+                             top_per_position=args.top_per_position)
 
     label = meta.get("slate_label")
     notes = []

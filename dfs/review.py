@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 from .backtest import actual_points
+from .exposure import player_exposure
 from .optimizer import DEFAULT_MAX_OVERLAP, DEFAULT_RANDOMNESS, optimize
 from .slate import build_slate, cached_games
 from .salaries import normalize_name
@@ -112,7 +113,7 @@ def read_entered(path, players):
     them through a float silently corrupts the tail digits on a big draft group.
     """
     from .lateswap import read_filled
-    from .upload import read_template
+    from .upload import SLOT_ORDER, read_template
 
     rows, kind, slot_start, _ = read_template(path)
     by_dk = {}
@@ -125,10 +126,21 @@ def read_entered(path, players):
 
     entered, unknown = {}, set()
     for number, (_row_index, _cells, ids) in enumerate(read_filled(rows, kind, slot_start), start=1):
-        picked = [by_dk[i] for i in ids if i in by_dk]
+        # The ids arrive in DK's slot order, so the slot each player was entered *at* is
+        # known and worth keeping: without it a usage report falls back to DK eligibility
+        # and reports a 3B/OF as "3B/OF" rather than the outfield spot he actually filled.
+        # Zipped rather than filtered separately, so an unresolvable id cannot shift every
+        # slot after it onto the wrong player.
+        picked, slots = [], []
+        for slot, dk_id in zip(SLOT_ORDER, ids):
+            if dk_id in by_dk:
+                picked.append(by_dk[dk_id])
+                slots.append(slot)
         unknown |= {i for i in ids if i and i not in by_dk}
         if picked:
-            entered[number] = pd.DataFrame(picked).reset_index(drop=True)
+            frame = pd.DataFrame(picked).reset_index(drop=True)
+            frame["Roster"] = slots
+            entered[number] = frame
     return entered, sorted(unknown), kind
 
 
@@ -144,10 +156,50 @@ def score_entered(entered, actuals):
             "Salary": int(pd.to_numeric(frame.get("Salary"), errors="coerce").sum() or 0),
             "Proj": round(float(pd.to_numeric(frame["Proj"], errors="coerce").sum()), 1),
             "Ceiling": round(float(pd.to_numeric(frame["Ceiling"], errors="coerce").sum()), 1),
+            # Cumulative ownership, the same measure reported for the buildable best, so the
+            # two are directly comparable: a lineup that scored well on 150% cumulative
+            # ownership won a different night than one that scored well on 60%.
+            # NaN, not 0, when the slate carries no ownership -- a column of zeroes would
+            # read as "nobody rostered these" rather than "we do not know".
+            "Own": (round(float(_own_series(frame).sum()), 0)
+                    if _own_series(frame).notna().any() else float("nan")),
             "Actual": total,
             "Diff": round(total - float(pd.to_numeric(frame["Proj"], errors="coerce").sum()), 1),
         })
     return pd.DataFrame(rows)
+
+
+def player_usage(entered, actuals):
+    """Your most-rostered players: exposure against field ownership, and what they scored.
+
+    The per-lineup table says how the lineups did; this says *who* did it. Exposure only
+    means something next to ownership -- being 50% on a 2%-owned player is the whole bet a
+    tournament pays for, and being 50% on a 40%-owned one is just the field with extra steps
+    -- so Exp%, Own% and the gap between them sit beside the actual result.
+
+    Reuses the optimizer's own exposure counter so "how often did I roster him" is computed
+    one way in this project, not two that can disagree.
+    """
+    lineups = [{"players": frame} for frame in entered.values()]
+    table = player_exposure(lineups)
+    if table.empty:
+        return table
+
+    # Results are per player, not per lineup, so one pass over the slate rows is enough.
+    scored = {}
+    for frame in entered.values():
+        for _, row in frame.iterrows():
+            pid = row.get("MLBAM")
+            if pid is None or pd.isna(pid):
+                continue
+            result = actuals.get(int(pid))
+            if result is not None:
+                scored[row["Name"]] = result["Actual"]
+
+    table["Actual"] = [scored.get(name) for name in table["Name"]]
+    table["Diff"] = (pd.to_numeric(table["Actual"], errors="coerce")
+                     - pd.to_numeric(table["Proj"], errors="coerce")).round(1)
+    return table
 
 
 def parse_criteria(text):
@@ -233,6 +285,127 @@ DEFAULT_CONFIGS = [
 ]
 
 
+def load_slate_for_review(args):
+    """(players, meta, one-line description of where the numbers came from).
+
+    A snapshot wins whenever one exists, because the payload cache is mutated in place by
+    `--refresh-lineups`: rebuilding a past night re-reads whatever those payloads say *now*,
+    so confirmed lineups and late scratches leak backwards into the projections being
+    graded. The review then flatters itself with information it did not have.
+
+    When no snapshot exists the rebuild still happens -- there is nothing else to do, and a
+    rebuilt review is far better than none -- but the source line says so, and the payload
+    digests are checked so a *stale* snapshot is called out too.
+    """
+    from .snapshot import SnapshotError, load_snapshot
+
+    if not args.no_snapshot:
+        try:
+            snap = load_snapshot(args.date, args.slate, stage=args.stage)
+        except SnapshotError:
+            snap = None
+        if snap is not None:
+            note = (f"scoring the {snap.stage} snapshot taken "
+                    f"{snap.manifest.get('taken_utc')} "
+                    f"(model v{snap.manifest.get('versions', {}).get('model')}, "
+                    f"code {snap.manifest.get('versions', {}).get('code')})")
+            stale = snap.stale_payloads()
+            if stale:
+                note += (f"\n  [i] {len(stale)} game payload(s) have been rewritten since; "
+                         f"the snapshot is the only honest copy left.")
+            return snap.players, snap.meta(), note
+
+    players, _, meta = build_slate(args.date, salary_path=args.salaries, slate=args.slate)
+    note = ("[!] no snapshot for this night, so the slate was rebuilt from the payload "
+            "cache.\n    Those payloads are rewritten by --refresh-lineups, so any "
+            "confirmed lineup or\n    scratch that arrived after lock is baked into the "
+            "projections being graded.\n    Take a snapshot before lock next time: "
+            f"python -m dfs.snapshot --date {args.date} --stage final")
+    if args.no_snapshot:
+        note = "rebuilt from the payload cache (--no-snapshot)"
+    return players, meta, note
+
+
+def candidate_report(directory, actuals, best_total=None):
+    """Grade a candidate pool against the night: was the best lineup even reachable?
+
+    This is the diagnostic that separates two failures a points total cannot tell apart. If
+    the pool's best lineup scored near the night's ceiling, generation was fine and the loss
+    was in *selection* or in variance. If it did not, no selection rule could have saved the
+    night -- the winning construction was never on the table.
+    """
+    from .candidates import CandidatePool
+
+    pool = CandidatePool.load(directory)
+    frame = pool.pool
+    scored = frame["MLBAM"].map(
+        lambda pid: None if pd.isna(pid) else (actuals.get(int(pid)) or {}).get("Actual"))
+    points = pd.to_numeric(scored, errors="coerce")
+
+    totals, coverage = [], []
+    for players in pool.lineups["players"]:
+        values = points.iloc[list(players)]
+        totals.append(float(values.fillna(0).sum()))
+        coverage.append(int(values.notna().sum()))
+    result = pool.lineups.copy()
+    result["Actual"] = np.round(totals, 2)
+    result["Scored"] = coverage
+
+    lines = [f"\n=== candidate pool: {os.path.basename(directory)} ===",
+             f"{len(result)} candidates, {result['stack_shape'].nunique()} stack shapes, "
+             f"{result['primary_stack'].nunique()} primary teams, "
+             f"{result['pitcher_pair'].nunique()} pitcher pairs"]
+
+    best = result.nlargest(1, "Actual").iloc[0]
+    pool_best = float(best["Actual"])
+    lines.append(f"best candidate scored {pool_best:.1f} "
+                 f"({best['stack_shape']} {best['primary_stack']}, "
+                 f"proj {best['proj']:.1f}, own {best['own_sum']})")
+    lines.append(f"pool mean {result['Actual'].mean():.1f}, "
+                 f"median {result['Actual'].median():.1f}, "
+                 f"worst {result['Actual'].min():.1f}")
+
+    # What each ranking rule would have picked, scored on the night. The spread between
+    # these and the pool's best is the part selection could have won.
+    lines.append("")
+    lines.append("  if you had entered one lineup, chosen by:")
+    picks = {}
+    for column, label, biggest in (("proj", "highest projection", True),
+                                   ("ceiling", "highest ceiling", True),
+                                   ("own_sum", "lowest total ownership", False),
+                                   ("sim_p99", "highest simulated p99", True)):
+        if column not in result.columns or result[column].isna().all():
+            continue
+        pick = (result.nlargest(1, column) if biggest else result.nsmallest(1, column))
+        picks[label] = float(pick.iloc[0]["Actual"])
+        lines.append(f"    {label:<28} {picks[label]:6.1f}")
+    lines.append(f"    {'random candidate (mean)':<28} {result['Actual'].mean():6.1f}")
+    lines.append(f"    {'ex-post best in the pool':<28} {pool_best:6.1f}")
+
+    if best_total:
+        # Decomposed rather than judged. The best *buildable* lineup is pure hindsight over
+        # every legal combination on the slate -- it is built from players who blew up, not
+        # from players who projected well, so no projection-driven pool will contain it and
+        # "% of the ceiling" is not a pass mark. What the two gaps below separate is which
+        # stage a night was actually lost at.
+        selection_gap = pool_best - max(picks.values()) if picks else 0.0
+        generation_gap = best_total - pool_best
+        lines.append("")
+        lines.append(f"  night's ceiling (hindsight, any legal lineup) {best_total:7.1f}")
+        lines.append(f"  best the pool could have given you            {pool_best:7.1f}"
+                     f"   <- generation headroom {generation_gap:.1f}")
+        if picks:
+            lines.append(f"  best any ranking rule actually picked         "
+                         f"{max(picks.values()):7.1f}   <- selection headroom "
+                         f"{selection_gap:.1f}")
+            lines.append("")
+            lines.append("  Generation headroom is mostly irreducible: the ex-post best "
+                         "lineup is assembled\n  from whoever happened to blow up, and no "
+                         "projection can pre-select them. Selection\n  headroom is the part "
+                         "that was genuinely available on the night.")
+    return "\n".join(lines)
+
+
 def main():
     import argparse
     from datetime import datetime
@@ -245,6 +418,9 @@ def main():
     parser.add_argument("--entered", nargs="?", const="auto", metavar="PATH",
                         help="Score the lineups actually entered. Bare flag finds the "
                              "night's upload/swap file; pass a path for a specific one.")
+    parser.add_argument("--usage-top", type=int, default=20, metavar="N",
+                        help="How many players the entered-lineup usage table shows "
+                             "(default 20; 0 for all). Needs --entered.")
     parser.add_argument("--criteria", metavar="SETTINGS",
                         help="Re-run the optimizer under ad-hoc settings and score the "
                              "result, e.g. 'objective=ceiling,max_overlap=4,randomness=0.2'.")
@@ -252,12 +428,22 @@ def main():
     parser.add_argument("--sweep", action="store_true",
                         help="Also test the shipped optimizer configurations (slow).")
     parser.add_argument("--sweep-lineups", type=int, default=10)
+    parser.add_argument("--no-snapshot", action="store_true",
+                        help="Rebuild the slate from the payload cache instead of reading "
+                             "the night's snapshot. Those payloads are rewritten by "
+                             "--refresh-lineups, so a rebuild scores information that was "
+                             "not available at lock.")
+    parser.add_argument("--stage", help="Which snapshot stage to score against.")
+    parser.add_argument("--candidates", metavar="DIR",
+                        help="Also grade a saved candidate pool: was the night's best "
+                             "lineup reachable from it at all?")
     args = parser.parse_args()
 
-    players, _, meta = build_slate(args.date, salary_path=args.salaries, slate=args.slate)
+    players, meta, source = load_slate_for_review(args)
     if players.empty:
         print(f"No slate data for {args.date}.")
         return
+    print(source)
     actuals = slate_actuals(args.date)
     if not actuals:
         print(f"No finished games for {args.date} yet.")
@@ -302,7 +488,16 @@ def main():
         best_total = float(frame["Actual"].sum())
         print(f"\n=== best lineup that was buildable: {best_total:.1f} pts, "
               f"${best['salary']:,} ===")
-        print(frame[["Roster", "Name", "Team", "Salary", "Proj", "Actual"]].to_string(index=False))
+        columns = [c for c in ("Roster", "Name", "Team", "Salary", "Proj", "Own%", "Actual")
+                   if c in frame.columns]
+        print(frame[columns].to_string(index=False))
+        print(ownership_note(frame))
+
+    if args.candidates:
+        try:
+            print(candidate_report(args.candidates, actuals, best_total))
+        except Exception as error:
+            print(f"\n[!] could not grade the candidate pool at {args.candidates}: {error}")
 
     if args.entered:
         report_entered(args, players, actuals, best_total)
@@ -314,6 +509,49 @@ def main():
         print("\n=== shipped optimizer settings vs actual results ===")
         print(config_sweep(players, actuals, DEFAULT_CONFIGS,
                            n_lineups=args.sweep_lineups).to_string(index=False))
+
+
+# A player under this was effectively unowned by the field.
+CONTRARIAN_OWN = 5.0
+
+
+def _own_series(frame):
+    """Own% as a numeric Series, empty when the slate has no ownership at all.
+
+    `frame.get("Own%")` returns None for a missing column and pd.to_numeric then hands back
+    a bare numpy nan, which has no .isna() and silently sums to nan -- so an unpriced or
+    pre-ownership slate would crash the review rather than skip the section.
+    """
+    if "Own%" not in getattr(frame, "columns", []):
+        return pd.Series(dtype=float)
+    return pd.to_numeric(frame["Own%"], errors="coerce")
+
+
+def ownership_note(frame, label="this lineup"):
+    """How owned the field was on a lineup's ten players.
+
+    The number a review is missing without it: whether the night's ceiling was reachable by
+    playing chalk or only by being contrarian. Those are opposite lessons -- one says the
+    projections were fine and the field got there too, the other says the points were
+    sitting somewhere nobody was looking -- and the points total alone cannot tell them
+    apart. Cumulative ownership is the GPP convention, so it is reported alongside the mean.
+    """
+    own = _own_series(frame)
+    if own.empty or own.isna().all():
+        return "  (no ownership data on this slate — run the board so Own% is estimated)"
+
+    # 'est' is the model's own guess; anything else came from a real contest export. The
+    # split is printed per player rather than as one blurred label, because a review run
+    # against estimated ownership is measuring the model against itself -- and on a mixed
+    # lineup you need to know how much of it is real before drawing a lesson from it.
+    counts = frame.get("Own Src", pd.Series(dtype=object)).fillna("").replace("", "est")
+    counts = counts.value_counts()
+    source = ", ".join(f"{name} {count}/{len(frame)}"
+                       for name, count in counts.items()) or "source unknown"
+    quiet = int((own < CONTRARIAN_OWN).sum())
+    return (f"  field ownership [{source}] on {label}: mean {own.mean():.1f}%, "
+            f"cumulative {own.sum():.0f}%, {quiet} of {own.notna().sum()} under "
+            f"{CONTRARIAN_OWN:.0f}%")
 
 
 def _pct_of_best(value, best_total):
@@ -352,6 +590,30 @@ def report_entered(args, players, actuals, best_total):
     if best_total:
         print(f"  best buildable was {best_total:.1f}; your best left "
               f"{best_total - totals.max():.1f} on the table.")
+    if "Own" in scored.columns and scored["Own"].notna().any():
+        print(f"  cumulative ownership: mean {scored['Own'].mean():.0f}% per lineup, "
+              f"range {scored['Own'].min():.0f}-{scored['Own'].max():.0f}%")
+
+    usage = player_usage(entered, actuals)
+    if not usage.empty:
+        top = args.usage_top
+        columns = [c for c in ("Name", "Team", "Roster", "Salary", "Lineups", "Exp%",
+                               "Own%", "Lev", "Proj", "Actual", "Diff")
+                   if c in usage.columns]
+        print(f"\n=== who you were actually on ({len(usage)} players across "
+              f"{len(scored)} lineups) ===")
+        print(usage.head(top)[columns].to_string(index=False))
+        if top and len(usage) > top:
+            print(f"  ... {len(usage) - top} more (--usage-top 0 for all)")
+        # The line that turns the table into a decision: heavy exposure the field did not
+        # share is the bet that was made, whether or not it came in.
+        own = pd.to_numeric(usage["Own%"], errors="coerce")
+        lev = pd.to_numeric(usage["Lev"], errors="coerce")
+        heavy = usage[(pd.to_numeric(usage["Exp%"], errors="coerce") >= 25) & (lev >= 10)]
+        if not heavy.empty and own.notna().any():
+            hit = heavy[pd.to_numeric(heavy["Diff"], errors="coerce") > 0]
+            print(f"\n  {len(heavy)} leveraged bet(s) at 25%+ exposure and 10+ over the "
+                  f"field; {len(hit)} beat projection.")
     if unknown:
         print(f"  [!] {len(unknown)} id(s) in the file are not on this slate: "
               f"{', '.join(unknown[:8])}{' ...' if len(unknown) > 8 else ''}")

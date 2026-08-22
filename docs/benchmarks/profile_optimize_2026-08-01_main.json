@@ -1,0 +1,60 @@
+{
+  "run": {
+    "label": "optimize",
+    "date": "2026-08-01",
+    "slate": "main",
+    "started_utc": "2026-08-03T00:15:48+00:00",
+    "python": "3.14.4",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "n": 20
+  },
+  "profile": {
+    "stage": "optimize",
+    "cumulative_s": 15.200627,
+    "self_s": 2.140276,
+    "calls": 1,
+    "meta": {
+      "games": 15,
+      "players": 300
+    },
+    "children": [
+      {
+        "stage": "normalize",
+        "cumulative_s": 0.326536,
+        "self_s": 0.326536,
+        "calls": 15
+      },
+      {
+        "stage": "project",
+        "cumulative_s": 0.390406,
+        "self_s": 0.390406,
+        "calls": 15
+      },
+      {
+        "stage": "acquire",
+        "cumulative_s": 0.402353,
+        "self_s": 0.402353,
+        "calls": 1,
+        "meta": {
+          "source": "schedule"
+        }
+      },
+      {
+        "stage": "ownership",
+        "cumulative_s": 0.017467,
+        "self_s": 0.017467,
+        "calls": 1
+      },
+      {
+        "stage": "solve",
+        "cumulative_s": 11.923589,
+        "self_s": 11.923589,
+        "calls": 20,
+        "meta": {
+          "vars": 1486,
+          "players": 198
+        }
+      }
+    ]
+  }
+}

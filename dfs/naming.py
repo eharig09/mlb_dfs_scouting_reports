@@ -15,6 +15,7 @@ file you uploaded from. Pass overwrite=True to replace in place.
 
 import os
 import re
+from collections import defaultdict
 
 OUTPUT_ROOT = "dfs_boards"
 
@@ -26,6 +27,7 @@ KINDS = {
     "stacks":  (".csv", "team stacks ranked"),
     "pool":    (".csv", "editable pool: Lock / Exclude / Boost / Min% / Max%"),
     "lineups": (".csv", "optimizer output, one row per player per lineup"),
+    "exposure": (".csv", "per-player and per-team exposure across the lineup set"),
     "upload":  (".csv", "DraftKings upload file, one row per lineup"),
     "swap":    (".csv", "late-swap upload file"),
     "review":  (".md",  "post-game scoring vs actual results"),
@@ -34,6 +36,11 @@ KINDS = {
 # A slate that cannot be identified from a filename or its own contents. Deliberately not
 # "main": a wrong-but-plausible label is harder to notice than an obviously unknown one.
 UNKNOWN_SLATE = "unknown"
+
+# The short block DK runs alongside the main slate. It is not a start-time bucket -- it
+# overlaps the main slate's window -- so it can only be identified by comparing a night's
+# exports to each other. See `label_slates`.
+TURBO_SLATE = "turbo"
 
 DATE_RE = re.compile(r"(20\d{2})[-_]?(\d{2})[-_]?(\d{2})")
 VERSION_RE = re.compile(r"^(?P<stem>.+?)\.r(?P<n>\d+)$")
@@ -69,6 +76,9 @@ def slug_from_contents(info):
     a single game is a Showdown, the big evening block is the main slate, and the smaller
     blocks either side of it are early and late -- so it is reconstructed from first pitch
     and game count rather than invented.
+
+    First pitch cannot see a turbo, which overlaps the main slate's window; that needs the
+    night's other exports for comparison and lives in `label_slates`.
     """
     games = info.get("games") or []
     if len(games) == 1:
@@ -83,16 +93,99 @@ def slug_from_contents(info):
     return "main"
 
 
-def slate_for(info=None, requested=None, date=None):
+def _key(info):
+    """Identity of one export within a night's set."""
+    return info.get("path") or info.get("name")
+
+
+def _first(info):
+    value = info.get("first")
+    return value if value is not None else -1
+
+
+def label_slates(infos, date=None):
+    """{path: slate label} for one night's exports, resolved against each other.
+
+    `slug_from_contents` sees one file at a time and so cannot see a collision. On
+    2026-08-07 the 12-game main slate (7:05PM) and the 3-game turbo (6:40PM) both fall in
+    the evening bucket and both come back "main"; the only thing separating them is that
+    one is a fragment of the other's night. So a date's exports are labelled together, and
+    where two land on the same label the smaller block -- fewer games -- is the turbo.
+
+    Late blocks are decided before that, because "late" is a real slate and being small is
+    not what makes it one: a block whose games all start after every game on the bigger
+    slate has begun is late, not turbo, however few of them there are.
+
+    A label taken from a filename is never overridden. Renaming an export is an explicit
+    decision and this function only ever resolves guesses.
+    """
+    labels, guessed = {}, {}
+    for info in infos:
+        named = slug_from_filename(info.get("name"), date)
+        labels[_key(info)] = named or slug_from_contents(info)
+        guessed[_key(info)] = not named
+
+    by_key = {_key(info): info for info in infos}
+    groups = defaultdict(list)
+    for key, label in labels.items():
+        groups[label].append(key)
+
+    def claim(preferred):
+        """`preferred` if it is free, else preferred-2, -3, ... Resolving one collision by
+        creating another would defeat the point of labelling the night as a set."""
+        taken = set(labels.values())
+        if preferred not in taken:
+            return preferred
+        suffix = 2
+        while f"{preferred}-{suffix}" in taken:
+            suffix += 1
+        return f"{preferred}-{suffix}"
+
+    for keys in groups.values():
+        if len(keys) < 2:
+            continue
+        # Most games wins the plain label; ties broken by player count, then name, so the
+        # same set of exports always labels the same way.
+        ordered = sorted(keys, reverse=True,
+                         key=lambda k: (len(by_key[k].get("games") or []),
+                                        by_key[k].get("players") or 0, str(k)))
+        biggest = by_key[ordered[0]]
+        # The last first pitch on the main block: a smaller slate starting at or after it
+        # is not running alongside, it is running after.
+        cutoff = biggest.get("last")
+        for key in ordered[1:]:
+            if not guessed[key]:
+                continue
+            info = by_key[key]
+            late = cutoff is not None and _first(info) >= cutoff
+            labels[key] = claim("late" if late else TURBO_SLATE)
+    return labels
+
+
+def slate_for(info=None, requested=None, date=None, peers=None):
     """The slate label to file a night's output under.
 
     An explicit --slate wins, then the filename the export was saved as, then the contents.
+    `peers` is the night's other exports: pass them and a main/turbo collision is resolved
+    rather than silently filing two contests under one name.
     """
     if requested:
-        return slate_slug(requested)
-    if info:
-        return slug_from_filename(info.get("name"), date) or slug_from_contents(info)
-    return UNKNOWN_SLATE
+        # A --slate that names the chosen export is selecting it, not renaming it. The
+        # flag does double duty -- it picks the file and it labels the output -- so
+        # `--slate DKSalaries_2026-08-18_turbo.csv` would otherwise file the whole night
+        # under "dksalaries-2026-08-18-turbo-csv": a label that no longer resolves back to
+        # any export, which strands the board, the upload and everything read off them.
+        name = os.path.basename(str((info or {}).get("name") or (info or {}).get("path") or ""))
+        given = os.path.basename(str(requested)).lower()
+        if not (name and given in (name.lower(), os.path.splitext(name)[0].lower())):
+            return slate_slug(requested)
+    if info is None:
+        return UNKNOWN_SLATE
+    if peers:
+        labelled = label_slates(peers, date)
+        if _key(info) in labelled:
+            return labelled[_key(info)]
+    return slug_from_filename(info.get("name"), date) or slug_from_contents(info)
 
 
 def night_dir(date, root=OUTPUT_ROOT):

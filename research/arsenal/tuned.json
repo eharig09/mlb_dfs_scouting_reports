@@ -1,0 +1,3 @@
+{"top_n": 3, "min_usage": 0.05, "weight_power": 1.5, "velo_tol": 2.5,
+ "match_by_hand": true, "lookback_days": 730, "arsenal_lookback_days": 365,
+ "metric": "k_rate", "shrink": 25.0, "residualize": true, "min_denom": 0.0}
