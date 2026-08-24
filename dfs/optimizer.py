@@ -25,15 +25,29 @@ MIN_GAMES_REPRESENTED = 2
 # Lineup-set defaults, tuned against actual results rather than left at the DK legal
 # minimum. An overlap cap of ROSTER_SIZE - 1 only forbids exact duplicates, so a set of
 # twenty comes back as twenty near-clones sharing nine players -- structurally useless for
-# a tournament whatever the slate. Objective jitter then explores near-optimal lineups the
-# strict re-solve would never reach.
+# a tournament whatever the slate. **The overlap cap is what makes a lineup set a set.**
 #
-# On the 2026-07-27 review, randomness 0.20 with overlap 6 produced the best set of every
-# configuration tested (best 126.5 / mean 89.3 against 93.0 / 58.1 for the old defaults),
-# and did so while projecting FEWER points -- diversity was worth more than precision.
-# That is a single slate: revisit as more reviews accumulate.
+# Objective jitter used to ride along with it at 0.20. It was wrong, and the way it got
+# there is worth keeping: the 2026-07-27 review compared `rand .20 + overlap 6` against
+# `rand 0 + overlap 9` -- two changes at once -- and credited the win to the jitter. Holding
+# overlap at 6 and varying only randomness, over four snapshot-scored nights (8/17, 8/19,
+# 8/20, 8/21 main, 20 lineups each):
+#
+#     overlap 6, randomness 0     mean 115.7   best 160.5    beat the old default 4 of 4
+#     overlap 6, randomness .20   mean  95.0   best 132.0    (the old default)
+#     overlap 6, randomness .40   mean  91.4   best 134.7
+#
+# Every no-randomness configuration beat every randomness one. It is not a floor-for-tail
+# trade either: the worst lineup of the set improves too (66.2 against 60.6), and rand 0
+# cleared the night's real cash line 4 of 4 against 3 of 4.
+#
+# The reason is upstream. Hitter rank skill is spearman ~0.19 overall and **0.02-0.09 within
+# a salary tier** -- jittering an objective that barely orders its own candidates destroys
+# the little ordering it has. Randomness would earn its place only against a projection good
+# enough that near-optimal lineups were genuinely interchangeable. Revisit it if that
+# changes; diversity now comes from the overlap cap alone.
 DEFAULT_MAX_OVERLAP = 6
-DEFAULT_RANDOMNESS = 0.20
+DEFAULT_RANDOMNESS = 0.0
 
 OBJECTIVES = {"ceiling": "Ceiling", "proj": "Proj", "floor": "Floor",
               "leverage": "Lev Score"}

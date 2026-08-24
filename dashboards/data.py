@@ -99,7 +99,7 @@ def hitters(payload, meta):
     out["game"] = meta["label"]
     out["opponent"] = [meta["home"] if t == meta["away"] else meta["away"]
                        for t in out.get("Team", pd.Series("", index=out.index))]
-    return out
+    return rounded(out)
 
 
 @st.cache_data(max_entries=8, show_spinner="Reading cached games…")
@@ -161,26 +161,62 @@ def arrow_safe(frame):
     return out
 
 
-#: Everything displayed is rounded to this many places. Ratios here are OPS-shaped —
-#: `.766` is the form every one of them is quoted in — and the columns that arrive as raw
-#: floats are the derived ones: a blended allowed-OPS, a surplus, a per-$1k rate. Left alone
-#: they render as `0.76606091193874`, which is seventeen digits of false precision on a
-#: number built from a few hundred at-bats.
-DISPLAY_PLACES = 3
+#: Baseball quotes two kinds of number and mixing them looks wrong to anyone who reads a
+#: box score. **Rate stats carry three decimals** — a .311 average, a .766 OPS — because that
+#: is the form they exist in; three decimals on a strikeout rate or a projection is invented
+#: precision, and one decimal on an OPS reads as a typo.
+RATE_PLACES, OTHER_PLACES = 3, 1
+
+#: The traditional three-decimal family, matched on any word of a column name so the
+#: pipeline's prefixes come along for free: `Platoon OPS`, `Season SLG`, `opp_ops`.
+RATE_STATS = {"AVG", "OBP", "SLG", "OPS", "ISO", "XWOBA", "WOBA", "BABIP", "XBA", "XSLG"}
+
+#: Columns that *are* OPS figures but whose name ends in a handedness instead of the stat —
+#: `Allowed vs L`, `Lineup vs R`, `Edge overall`. Matched on the leading word, and only when
+#: the name carries no count word, since `Allowed PA vs L` and `Bats vs L` are counts.
+RATE_LEADS = {"ALLOWED", "LINEUP", "EDGE"}
+COUNT_WORDS = {"PA", "AB", "BATS", "N", "COUNT", "GAMES", "BIP", "PITCHES"}
+
+#: Park and weather multipliers. These sit within a few points of 1.00, so one decimal
+#: collapses a 1.04 park and a 1.00 one into the same number — they are ratios and take the
+#: ratio treatment.
+FACTORS = {"PARK HR", "PARK RUNS", "PARK FACTOR", "HR ENV", "WEATHER HR", "HR LEVERAGE",
+           "ENV", "CARRY"}
 
 
-def rounded(frame, places=DISPLAY_PLACES):
-    """Round every float column for display. Integers and labels are untouched.
+def _words(column):
+    return [w for w in str(column).replace("_", " ").replace("/", " ").upper().split() if w]
+
+
+def _places(column):
+    """How many decimals a column should carry: three for a ratio, one for everything else."""
+    words = _words(column)
+    if not words:
+        return OTHER_PLACES
+    if " ".join(words) in FACTORS:
+        return RATE_PLACES
+    if set(words) & RATE_STATS:
+        return RATE_PLACES
+    if words[0] in RATE_LEADS and not (set(words) & COUNT_WORDS):
+        return RATE_PLACES
+    return OTHER_PLACES
+
+
+def rounded(frame, places=None):
+    """Round every float column for display: three decimals for rate stats, one otherwise.
 
     Applied where a frame is produced rather than where it is drawn, so the tooltip, the
     table and the chart all quote the same number — a value rounded in one place and not the
     other is how a reader ends up with two different figures for the same thing.
+
+    Pass `places` to force a single precision on everything, which only the rare frame that
+    is entirely one kind of number should need.
     """
     if frame is None or getattr(frame, "empty", True):
         return frame
     out = frame.copy()
     for column in out.select_dtypes("float").columns:
-        out[column] = out[column].round(places)
+        out[column] = out[column].round(places if places is not None else _places(column))
     return out
 
 
@@ -188,10 +224,15 @@ def context_frame(payload, key):
     """One context frame from a payload, ready to render.
 
     Every page pulls raw payload frames through here, so this is where the workbook's
-    blank-for-missing formatting is turned into real nulls.
+    blank-for-missing formatting is turned into real nulls — and, once they are real
+    numbers, where the display precision is settled. Rounding here rather than at each
+    `st.dataframe` call is what keeps a figure identical between a table, a tooltip and a
+    chart axis.
     """
     frame = payload.get("advanced_context", {}).get(key)
-    return arrow_safe(frame) if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+    if not isinstance(frame, pd.DataFrame):
+        return pd.DataFrame()
+    return rounded(arrow_safe(frame))
 
 # --- lineups, pitching and environment -------------------------------------------------
 #

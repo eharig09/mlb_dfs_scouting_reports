@@ -10,14 +10,24 @@ venv/
 .ruff_cache/
 .tmp/
 .matplotlib/
-.cache/
+# The dashboard is deployed from this repo and reads the report payloads at runtime, so
+# `.cache/report_data/` is tracked. Everything else under `.cache/` is derived and large --
+# `statcast_chunk/` alone runs to tens of gigabytes -- so the directory is excluded by
+# contents (`.cache/*`) rather than as a whole: a trailing-slash ignore stops git descending
+# at all, and a negation inside it would never be reached.
+.cache/*
+!.cache/report_data/
 
 plots/
 scouting_reports/
 savant_highlights/
 
 dfs_boards/
-dfs_daily_files/
+# Salary exports are the dashboard's other runtime input (Value page, price tiers, the slate
+# filter), so they ship. Pool files are not read by the app and carry hand-made lock and
+# exclude decisions, so they stay out.
+dfs_daily_files/*
+!dfs_daily_files/DKSalaries_*.csv
 dfs/salaries/
 
 DejaVuSans.pkl

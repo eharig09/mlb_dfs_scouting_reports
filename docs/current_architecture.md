@@ -253,7 +253,9 @@ MAE 7.41 → 5.23, rank correlation 0.51 → 0.63. Deliberately excludes our own
   ≤9 from one game, locks, pins, optional total-ownership cap
 - Multiple lineups: **re-solve from scratch**, accumulating one overlap constraint per
   previously produced lineup. Nothing is warm-started or reused
-- Diversity: `max_overlap=6` and Gaussian objective jitter `randomness=0.20`
+- Diversity: `max_overlap=6` alone. Gaussian objective jitter defaulted to
+  `randomness=0.20` until 2026-08-23, when four snapshot-scored nights showed it cost
+  ~21 points of mean and ~29 of best per night; it is now `0.0`.
 - Exposure: enforced as a *pace* across the set with an urgency-ranked forcing list and
   an infeasibility-driven relaxation loop (`optimizer.py:496-690`)
 

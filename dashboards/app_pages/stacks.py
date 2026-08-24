@@ -8,7 +8,7 @@ scouting one.
 
 import streamlit as st
 
-from dashboards import charts, data, drill, drill_ui, filters, outcomes, salaries
+from dashboards import charts, data, drill, drill_ui, filters, outcomes, salaries, tables
 from dashboards import stacks as stacks_module
 
 st.header("Stacks", anchor=False)
@@ -21,11 +21,7 @@ if games.empty:
     st.info("No cached games found.")
     st.stop()
 
-dates = list(dict.fromkeys(games["date"]))
-with st.sidebar:
-    st.subheader("Slate", anchor=False)
-    date = st.selectbox("Date", dates, key="stacks_date",
-    persist_state="session")
+date, slate, _scoped = filters.scope(games)
 
 table = stacks_module.team_stacks(date)
 if table.empty:
@@ -38,8 +34,12 @@ table = stacks_module.add_composite(table, board)
 dropped = filters.off_slate_teams(table, date)
 with st.sidebar:
     st.subheader("Filter", anchor=False)
-    only_slate = st.toggle("Only clubs on a DK slate", value=True, key="stacks_only",
-    persist_state="session")
+    # With a specific slate picked in Scope the gate is implied — a club off that slate is
+    # already gone — so the toggle only appears when the scope is every slate.
+    only_slate = True
+    if slate == filters.ALL_SLATES:
+        only_slate = st.toggle("Only clubs on a DK slate", value=True, key="stacks_only",
+                               persist_state="session")
     chosen_teams = st.multiselect("Club", sorted(table["Team"].unique()), default=[],
                                   key="stacks_teams", help="Leave empty for every club.",
                                   persist_state="session")
@@ -60,7 +60,7 @@ with st.sidebar:
                            format_func=lambda k: axes[k], key="stacks_size",
                            persist_state="session")
 
-view = filters.on_slate(table, date) if only_slate else table
+view = filters.in_scope(table, date, slate) if only_slate else table
 if chosen_teams:
     view = view[view["Team"].isin(chosen_teams)]
 if view.empty:
@@ -145,7 +145,7 @@ with st.container(border=True):
                "Allowed OPS", "Lineup OPS", "park", "hr_env", "Mean composite",
                "Priority bats"]
     shown = view.reindex(columns=[c for c in columns if c in view.columns])
-    st.dataframe(shown, hide_index=True, column_config={
+    st.dataframe(tables.highlight(shown), hide_index=True, column_config={
         "Opp SP Hand": st.column_config.TextColumn("Throws"),
         "Top5 Salary": st.column_config.NumberColumn("Top5 $", format="$%d"),
         "Top5 Proj": st.column_config.NumberColumn(format="%.1f"),
@@ -163,7 +163,7 @@ with st.container(border=True):
 with st.container(border=True):
     st.markdown(f"**{club} — every bat on the card**")
     if not members.empty:
-        event = st.dataframe(members, hide_index=True, on_select="rerun",
+        event = st.dataframe(tables.highlight(members), hide_index=True, on_select="rerun",
                              selection_mode="single-row", key="stacks_members_table",
                              column_config={
                                  "Slot": st.column_config.NumberColumn("Order",

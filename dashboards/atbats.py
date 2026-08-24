@@ -86,7 +86,20 @@ def arsenal_at_bats(payload, meta, name, team, season_start=None):
     shape filter survived its sample floor — so a reader can see the claim, not just its
     result.
     """
-    import scouting_report as sr
+    # `scouting_report` is imported here rather than at module scope for two reasons. It
+    # costs about four seconds and pulls matplotlib, fpdf and pybaseball, so a reader who
+    # never drills in never pays for it -- and the hosted build installs only the six
+    # packages the dashboard itself needs, so on Render this import is *expected* to fail.
+    # Calling the report's own filters is the whole point (a second implementation would
+    # drift from the published number), so there is nothing to fall back to: the panel says
+    # so and shows nothing rather than showing at-bats it derived some other way.
+    try:
+        import scouting_report as sr
+    except ImportError as error:
+        return pd.DataFrame(), {"unavailable": (
+            "The at-bat drill-down needs the report pipeline, which is not installed on "
+            f"this deployment ({error.name}). It works in the local checkout."
+        )}
     from dashboards import drill
 
     side = drill.side_for_team(meta, team)

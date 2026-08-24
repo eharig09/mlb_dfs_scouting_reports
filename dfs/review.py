@@ -269,10 +269,13 @@ def config_sweep(players, actuals, configs, n_lineups=20, seed=7):
 # Every config states its settings explicitly so the comparison stays readable when the
 # shipped defaults change. The first row IS the current default.
 DEFAULT_CONFIGS = [
-    ("DEFAULT: ceiling, overlap 6, rand .20",
+    ("DEFAULT: ceiling, overlap 6, no rand",
      dict(objective="ceiling", max_overlap=DEFAULT_MAX_OVERLAP, randomness=DEFAULT_RANDOMNESS)),
-    ("ceiling, overlap 6, no randomness",
-     dict(objective="ceiling", max_overlap=6, randomness=0.0)),
+    # Kept as a named row rather than dropped: it was the default until 2026-08-23 and every
+    # review before that date was scored against it, so a sweep that cannot reproduce it
+    # cannot be compared to those.
+    ("retired default: ceiling, overlap 6, rand .20",
+     dict(objective="ceiling", max_overlap=6, randomness=0.20)),
     ("ceiling, overlap 9 (DK minimum), no rand",
      dict(objective="ceiling", max_overlap=9, randomness=0.0)),
     ("ceiling, overlap 4, rand .20",
@@ -280,8 +283,11 @@ DEFAULT_CONFIGS = [
     ("ceiling, rand .40", dict(objective="ceiling", max_overlap=6, randomness=0.40)),
     ("ceiling, no stack bonus",
      dict(objective="ceiling", max_overlap=6, randomness=0.20, stack_bonus=False)),
-    ("proj", dict(objective="proj", max_overlap=6, randomness=0.20)),
-    ("floor (cash)", dict(objective="floor", max_overlap=6, randomness=0.20)),
+    # These two vary the objective and nothing else, so they take whatever randomness is
+    # current. Pinning them at .20 would have confounded an objective test with a jitter
+    # setting now known to cost ~21 points of mean per night.
+    ("proj", dict(objective="proj", max_overlap=6, randomness=DEFAULT_RANDOMNESS)),
+    ("floor (cash)", dict(objective="floor", max_overlap=6, randomness=DEFAULT_RANDOMNESS)),
 ]
 
 

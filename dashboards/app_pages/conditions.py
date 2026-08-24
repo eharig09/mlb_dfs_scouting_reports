@@ -6,7 +6,7 @@ read is, and it is only visible when they share a plane.
 
 import streamlit as st
 
-from dashboards import charts, data, drill_ui, environment as env, filters
+from dashboards import charts, data, drill_ui, environment as env, filters, tables
 
 st.header("Conditions", anchor=False)
 st.caption("Where a batted ball ends up is decided by the park, the air and the defence. "
@@ -18,11 +18,7 @@ if games.empty:
     st.info("No cached games in `.cache/report_data/`.")
     st.stop()
 
-with st.sidebar:
-    st.subheader("Slate", anchor=False)
-    date = st.selectbox("Date", sorted(games["date"].unique(), reverse=True),
-                        key="conditions_date",
-                        persist_state="session")
+date, slate, _scoped = filters.scope(games)
 
 staffs = env.staff_environment(date)
 off_slate = filters.off_slate_teams(staffs, date, team_column="team")
@@ -38,9 +34,13 @@ with st.sidebar:
     teams = st.multiselect("Team", sorted(staffs["team"].unique()), default=[],
                            key="conditions_teams", help="Leave empty for every club.",
                            persist_state="session")
-    only_slate = st.toggle("Only clubs on a DK slate", value=True, key="conditions_only",
-                           help="Clubs with no priced player that day are dropped.",
-                           persist_state="session")
+    # Implied once a specific slate is chosen in Scope, so it only appears otherwise.
+    only_slate = True
+    if slate == filters.ALL_SLATES:
+        only_slate = st.toggle("Only clubs on a DK slate", value=True,
+                               key="conditions_only",
+                               help="Clubs with no priced player that day are dropped.",
+                               persist_state="session")
     roofed = st.checkbox("Include closed roofs", value=True, key="conditions_roof",
                          help="A closed roof pins the weather term to exactly 1.00, so "
                               "those games only carry the park factor.",
@@ -48,7 +48,7 @@ with st.sidebar:
 
 view = staffs.copy()
 if only_slate:
-    view = filters.on_slate(view, date, team_column="team")
+    view = filters.in_scope(view, date, slate, team_column="team")
 if units:
     view = view[view["unit"].isin(units)]
 if teams:

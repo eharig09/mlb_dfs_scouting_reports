@@ -1,0 +1,21 @@
+# Runtime dependencies for the hosted dashboard, and nothing else.
+#
+# The full `requirements.txt` is the *pipeline's* — matplotlib, seaborn, pybaseball, fpdf2,
+# selenium, scikit-learn and the rest are what generate the reports. The dashboard never
+# runs any of that: it reads the payloads the pipeline already wrote. Measured by importing
+# every page and reading `sys.modules`, the running app pulls exactly six third-party
+# packages; everything below them is transitive.
+#
+# Versions are pinned rather than floated because the app's whole job is unpickling frames
+# this stack wrote. A pandas or pyarrow that disagrees with the one that pickled them does
+# not fail at deploy time, it fails on the first game a reader opens.
+
+streamlit==1.62.0
+altair==6.2.2
+pandas==3.0.3
+numpy==2.4.6
+requests==2.34.2
+
+# Not optional. pandas 3.x stores strings as PyArrow-backed by default, so the cached
+# payloads cannot be unpickled at all without it.
+pyarrow==24.0.0

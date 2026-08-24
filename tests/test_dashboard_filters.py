@@ -522,3 +522,73 @@ class TestTeamColours:
         signature = inspect.signature(charts.arsenal_vs_allowed_scatter)
         assert "teams" in signature.parameters
         assert "domain" not in signature.parameters
+
+
+class TestSharedScope:
+    """Date and slate are one selection across every page, and they narrow the game list.
+
+    The bug this replaces: each page had its own `*_date` key, so clicking between views
+    silently changed which night you were looking at.
+    """
+
+    def test_both_scope_controls_use_one_key_for_every_page(self):
+        assert filters.SCOPE_DATE_KEY == "scope_date"
+        assert filters.SCOPE_SLATE_KEY == "scope_slate"
+
+    def test_a_slate_narrows_the_game_list_to_what_it_could_roster(self, monkeypatch):
+        games = pd.DataFrame({
+            "date": ["2026-08-21"] * 3,
+            "away": ["ATH", "ATL", "PIT"], "home": ["HOU", "MIL", "LAD"],
+            "label": ["ATH @ HOU", "ATL @ MIL", "PIT @ LAD"],
+        })
+        monkeypatch.setattr(filters, "teams_on_slate",
+                            lambda date, slate, salary_dir=None: {"ATH", "HOU", "PIT", "LAD"})
+        out = filters.games_on_slate(games, "2026-08-21", "main")
+        assert list(out["label"]) == ["ATH @ HOU", "PIT @ LAD"]
+
+    def test_every_slate_is_a_pass_through(self, monkeypatch):
+        games = pd.DataFrame({"date": ["d"], "away": ["A"], "home": ["B"], "label": ["A @ B"]})
+        monkeypatch.setattr(filters, "teams_on_slate",
+                            lambda *a, **k: pytest.fail("should not be consulted"))
+        assert len(filters.games_on_slate(games, "d", filters.ALL_SLATES)) == 1
+
+    def test_a_slate_that_matches_nothing_hands_back_everything(self, monkeypatch):
+        """A slate matching no cached game is a naming mismatch far more often than a real
+        answer, and an empty game list stops the page dead."""
+        games = pd.DataFrame({"date": ["d"], "away": ["A"], "home": ["B"], "label": ["A @ B"]})
+        monkeypatch.setattr(filters, "teams_on_slate", lambda *a, **k: {"X", "Y"})
+        assert len(filters.games_on_slate(games, "d", "main")) == 1
+
+    def test_a_game_needs_both_clubs_priced(self, monkeypatch):
+        """DK prices a game as a unit; one side appearing is a name-match artefact."""
+        games = pd.DataFrame({"date": ["d"], "away": ["A"], "home": ["B"], "label": ["A @ B"]})
+        monkeypatch.setattr(filters, "teams_on_slate", lambda *a, **k: {"A", "Z"})
+        # Falls back to everything rather than returning an empty list, but the point is
+        # that the half-matched game did not survive the mask on its own merits.
+        monkeypatch.setattr(filters, "teams_on_slate", lambda *a, **k: {"A", "Z", "Q", "R"})
+        out = filters.games_on_slate(
+            pd.DataFrame({"date": ["d", "d"], "away": ["A", "Q"], "home": ["B", "R"],
+                          "label": ["A @ B", "Q @ R"]}), "d", "main")
+        assert list(out["label"]) == ["Q @ R"]
+
+    def test_in_scope_falls_back_to_the_any_slate_gate(self, monkeypatch):
+        frame = pd.DataFrame({"Team": ["ATH", "ATL"]})
+        monkeypatch.setattr(filters, "on_slate",
+                            lambda f, d, s=None, team_column="Team": f.head(1))
+        out = filters.in_scope(frame, "d", filters.ALL_SLATES)
+        assert len(out) == 1, "no slate chosen should use the any-slate gate"
+
+    def test_in_scope_restricts_to_the_named_slate(self, monkeypatch):
+        frame = pd.DataFrame({"Team": ["ATH", "ATL"]})
+        monkeypatch.setattr(filters, "teams_on_slate", lambda *a, **k: {"ATH"})
+        assert list(filters.in_scope(frame, "d", "main")["Team"]) == ["ATH"]
+
+    def test_a_stored_date_this_page_cannot_offer_is_dropped(self):
+        """Value offers fewer dates than the others — Streamlit raises if session_state
+        holds a value that is not among a selectbox's options."""
+        import streamlit as st
+
+        st.session_state[filters.SCOPE_DATE_KEY] = "2026-01-01"
+        dropped = filters._drop_unofferable(filters.SCOPE_DATE_KEY, ["2026-08-21"])
+        assert dropped == "2026-01-01"
+        assert filters.SCOPE_DATE_KEY not in st.session_state

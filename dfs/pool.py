@@ -28,9 +28,16 @@ EDIT_COLUMNS = ["Lock", "Exclude", "Boost", "Min%", "Max%"]
 LEGACY_POOL_DIR = "dfs_daily_files"
 
 # Written left-to-right: your edit columns first so they are visible without scrolling.
+#
+# `Bats` sits next to the player and `Opp SP Hand` next to the arm he draws, because
+# handedness is only a fact about a matchup in pairs -- a lone "L" says nothing without the
+# hand on the other side of it. Pitchers carry a blank `Bats`, which is correct rather than
+# missing. Both come straight off the slate frame; `Bats` resolves to `S` for a switch
+# hitter rather than being flattened to the side he will bat from, so the pool shows what
+# the player is and the pairing is left to read.
 VIEW_COLUMNS = [
-    "Type", "Name", "DK Pos", "Team", "Opp", "Opp SP", "Slot", "Salary",
-    "Proj", "Ceiling", "Floor", "Bust%", "Value", "Ceil Value", "Floor Value",
+    "Type", "Name", "DK Pos", "Bats", "Team", "Opp", "Opp SP", "Opp SP Hand", "Slot",
+    "Salary", "Proj", "Ceiling", "Floor", "Bust%", "Value", "Ceil Value", "Floor Value",
     "GPP", "CASH", "Edge", "Tier", "Role", "Team Runs", "Lineup", "Why",
 ]
 
@@ -297,16 +304,52 @@ def apply_boosts(players, boosts, rng=None):
     return frame
 
 
-def resolve_exposure(players, exposure, n_lineups):
-    """{player name: (min_lineups, max_lineups)} as integer counts."""
+def resolve_exposure(players, exposure, n_lineups, report=None):
+    """{player name: (min_lineups, max_lineups)} as integer counts.
+
+    Keyed off the *current* slate, so a marked-up player who has since left it produces no
+    limit at all. That is the right answer and used to be a silent one: a Min% typed at noon
+    for a hitter scratched at six simply evaporated, with the run reporting nothing. Pass a
+    `report` list to collect `(name, reason)` for every marked-up player the slate cannot
+    honour, so the caller can say so.
+
+    Three ways a player goes missing, and they are worth telling apart:
+
+    * **not on the slate** — he is in no posted or projected lineup any more, which is what a
+      scratch looks like once the payload has been refreshed.
+    * **no DK price** — `load_salaries` drops rows DraftKings marks IL/OUT/NA/SUSP, so an
+      unpriced row is usually DK saying he is not playing. `optimize` filters these out of
+      the roster pool entirely (`players["Salary"].notna()`), so a minimum on one can never
+      be met however hard the solver tries.
+    """
     limits = {}
+    on_slate = {}
     for _, row in players.iterrows():
-        span = exposure.get(normalize_name(row["Name"]))
+        key = normalize_name(row["Name"])
+        on_slate[key] = row
+        span = exposure.get(key)
         if not span:
             continue
         low, high = span
+        if low and pd.isna(row.get("Salary")):
+            if report is not None:
+                report.append((row["Name"], "no DK price — DraftKings lists him unavailable"))
+            continue
+        # Honoured, but said out loud. A minimum forces a roster spot every time it comes
+        # due, and forcing one on a bat that is only *projected* into the card is how a
+        # scratched player ends up in twenty lineups: the projector still has him batting
+        # sixth, DraftKings still has him priced, and nothing in the solve knows better.
+        status = str(row.get("Lineup") or "").strip()
+        if low and status and not status.startswith("Confirmed") and report is not None:
+            report.append((row["Name"],
+                           f"lineup is '{status}', not confirmed — the minimum will still "
+                           f"force him in, so check he is actually playing"))
         limits[row["Name"]] = (
             0 if low is None else int(math.ceil(low * n_lineups)),
             n_lineups if high is None else int(math.floor(high * n_lineups)),
         )
+    if report is not None:
+        for key, (low, _high) in exposure.items():
+            if low and key not in on_slate:
+                report.append((key, "not on the slate — no posted or projected lineup row"))
     return limits

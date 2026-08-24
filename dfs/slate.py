@@ -584,6 +584,15 @@ STACK_WEIGHTS = {"value": 0.55, "ceiling": 0.45}
 def build_stacks(players, has_salary, min_hitters=MIN_STACK_HITTERS):
     """Team stacks, ranked on the top of each lineup -- where GPP stacks actually come from.
 
+    The five are taken by **batting order**, and the reason is simply that those slots score
+    the most and are guaranteed the plate appearances: measured over 704 team-games, slots
+    1-5 average 36.9 with a p90 of 64.7 against 29.2 / 53.0 for slots 5-9.
+
+    It is *not* because a contiguous block correlates more tightly -- pairwise correlation
+    between two slots is flat in the distance between them (0.128 for neighbours, 0.131 eight
+    slots apart), so the correlation a stack is bought for is a team-level effect and is
+    indifferent to which five are taken. `dashboards/stacks.py` carries the full measurement.
+
     Teams with too few priced hitters are dropped: a "stack" assembled from one or two
     matched players carries a meaningless salary and would outrank real stacks on value.
     """

@@ -22,7 +22,7 @@ from .exposure import format_exposure, player_exposure, team_exposure
 from .naming import OUTPUT_ROOT, latest, resolve
 from .pool import pool_path, read_pool, resolve_exposure, write_pool
 from .profiling import format_report, profiler
-from .salaries import canon_team
+from .salaries import canon_team, normalize_name
 from .schedule import describe_postponed
 from .scoring import DK_SALARY_CAP as DK_CAP
 # drop_started now lives in dfs.slate so the candidate, field, contest and
@@ -351,10 +351,24 @@ def _run(args):
         # Pool file and CLI flags combine rather than compete.
         locks = list(dict.fromkeys(locks + pool_locks))
         excludes = list(dict.fromkeys(excludes + pool_excludes))
-        exposure = resolve_exposure(players, exposure_pct, n_lineups)
+        unhonoured = []
+        exposure = resolve_exposure(players, exposure_pct, n_lineups, report=unhonoured)
         ranged = sum(1 for low, high in boosts.values() if high > low)
         print(f"pool {path}: {len(pool_locks)} locked, {len(pool_excludes)} excluded, "
               f"{len(boosts)} boosted ({ranged} ranged), {len(exposure)} exposure-capped")
+        # A minimum the slate cannot honour used to disappear without a word, which is the
+        # worst way for it to go: the run looks like it worked and the player is simply
+        # absent from twenty lineups he was supposed to be in.
+        for who, why in unhonoured:
+            verb = "dropped" if "not on the slate" in why or "no DK price" in why else "kept"
+            print(f"[!] Min% for {str(who).title()} {verb} — {why}.")
+        # A lock on someone unrosterable fails the same way, and the solver's message for it
+        # is "constraints are contradictory", which names nothing.
+        rosterable = set(players[players["Salary"].notna()]["Name"].map(normalize_name))
+        for who in locks:
+            if normalize_name(who) not in rosterable:
+                print(f"[!] Lock on {who} cannot be filled — he is not on the slate with a "
+                      f"DK price.")
 
     team_exposure_spec = args.team_exposure or config.get("team_exposure")
     team_limits = _parse_team_exposure(team_exposure_spec, n_lineups) \

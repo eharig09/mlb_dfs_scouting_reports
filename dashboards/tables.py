@@ -189,3 +189,48 @@ def style(frame, rules):
         styler = styler.apply(function, axis=None, **kwargs)
         applied = True
     return styler if applied else frame
+
+
+# ===================================================================================
+# Curated highlighting per view
+#
+# Ramping every numeric column turns a table into wallpaper: with everything shaded nothing
+# is, and the eye has no entry point. So each view names the handful of columns a reader
+# actually scans, and the rest stay clear.
+#
+# Direction is per column and is not guessable — a low ERA is good, a low K% is bad, and a
+# low `surplus` means the market charged more than the model thinks he is worth. Getting one
+# backwards produces a table that is confidently the wrong colour, which is worse than an
+# unshaded one, so they are written out rather than inferred from the name.
+# ===================================================================================
+
+#: Columns where a bigger number is the better one, from the reader's point of view.
+HIGHER_IS_BETTER = {
+    "Composite", "Proj", "Ceiling", "Floor", "surplus", "per_1k", "Stack Score",
+    "Stack Value", "Top5 Proj", "Top5 Ceiling", "Season OPS", "Platoon OPS", "Arsenal OPS",
+    "Off L28", "Off Szn", "PA", "Lineup OPS", "hr_leverage", "hr_env", "K%",
+}
+
+#: ... and where a smaller one is.
+LOWER_IS_BETTER = {
+    "ERA", "FIP", "WHIP", "Bust%", "Salary", "Own%", "Allowed OPS", "opp_ops", "Slot",
+}
+
+
+def highlight(frame, columns=None, extra=None):
+    """Shade the columns worth scanning in `frame`, leaving the rest clear.
+
+    `columns` restricts the shading to a named subset — pass it when a frame carries a
+    column that is in the vocabulary but is not what this particular table is about.
+    `extra` appends rules (categorical tints, signed columns) after the ramps.
+    """
+    if frame is None or getattr(frame, "empty", True):
+        return frame
+    present = [c for c in frame.columns
+               if (columns is None or c in columns)
+               and (c in HIGHER_IS_BETTER or c in LOWER_IS_BETTER)]
+    rules = [(ranked, {"column": c,
+                       "best": "high" if c in HIGHER_IS_BETTER else "low"})
+             for c in present]
+    rules.extend(extra or [])
+    return style(frame, rules)

@@ -2,7 +2,7 @@ import pandas as pd
 import streamlit as st
 
 from dashboards import bullpen as bullpen_module
-from dashboards import charts, data, drill_ui, filters, tables
+from dashboards import charts, data, drill_ui, filters, strikeouts, tables
 
 st.header("Pitching", anchor=False)
 
@@ -12,14 +12,15 @@ if games.empty:
             "`.cache/report_data/`.")
     st.stop()
 
-dates = list(dict.fromkeys(games["date"]))
+date, slate, in_scope = filters.scope(games)
+on_date = in_scope[in_scope["date"] == date]
+if on_date.empty:
+    st.warning(f"No cached game on the {slate} slate for {date}.")
+    st.stop()
 with st.sidebar:
     st.subheader("Game", anchor=False)
-    date = st.selectbox("Date", dates, key="pitching_date",
-    persist_state="session")
-    on_date = games[games["date"] == date]
     label = st.selectbox("Game", list(on_date["label"]), key="pitching_game",
-    persist_state="session")
+                         persist_state="session")
 
 meta = on_date[on_date["label"] == label].iloc[0].to_dict()
 payload = data.load_payload(meta["path"])
@@ -84,6 +85,89 @@ for column, (_, row) in zip((left, right), starters.iterrows()):
                          help="Start-by-start log with days of rest, and the comparable "
                               "arms his arsenal was scored against"):
                 drill_ui.pitcher_dialog(payload, meta, side)
+
+st.subheader("Strikeouts", anchor=False)
+st.caption("Whether an arm misses bats is only worth knowing against the bats he draws, so "
+           f"all three panels share one reference line at the {strikeouts.LEAGUE_K:.1f}% "
+           "league rate.")
+
+# `data.starters` gives the scouting row but not the raw starter-info dict, which is where
+# the season K% and the start log live. args[2] is the home starter, args[9] the away one.
+_STARTER_INFO = {"home": 2, "away": 9}
+
+for _, row in starters.iterrows():
+    side = row["side"]
+    args = payload.get("report_args") or ()
+    index = _STARTER_INFO[side]
+    info = (args[index] or {}) if len(args) > index else {}
+    # He faces the OTHER club, so the lineup-side frames are crossed.
+    opposing = "away" if side == "home" else "home"
+    hand_splits = strikeouts.platoon(payload, side, meta)
+    head = strikeouts.headline(info, data.context_frame(payload, f"{opposing}_lineup_splits"),
+                               hand_splits)
+
+    with st.container(border=True):
+        st.markdown(f"**{row['pitcher']}** · {row['team']} — striking out {row['faces']}")
+        with st.container(horizontal=True):
+            st.metric("His K%", f"{head['his_k']:.1f}%" if pd.notna(head["his_k"]) else "—",
+                      delta=f"{head['his_k'] - head['league']:+.1f} vs league"
+                            if pd.notna(head["his_k"]) else None,
+                      delta_color="off", border=True)
+            st.metric("Their K%",
+                      f"{head['lineup_k']:.1f}%" if pd.notna(head["lineup_k"]) else "—",
+                      delta="how often this card strikes out", delta_color="off", border=True)
+            st.metric("Edge", f"{head['edge']:+.1f}" if pd.notna(head["edge"]) else "—",
+                      delta="his rate minus theirs", delta_color="off", border=True)
+            if pd.notna(head["split_spread"]):
+                st.metric("Platoon spread", f"{head['split_spread']:.1f}",
+                          delta="gap between his two sides", delta_color="off", border=True)
+
+        left, right = st.columns([3, 2])
+        with left:
+            recent = strikeouts.recent_starts(info)
+            chart = charts.k_recent_starts(recent, season_k=head["his_k"],
+                                           lineup_k=head["lineup_k"],
+                                           league=strikeouts.LEAGUE_K)
+            if chart is not None:
+                st.altair_chart(chart)
+                st.caption("Dashes: league, his season rate, and this card's rate. K% per "
+                           "start uses batters faced approximated as 3·IP + H + BB — the "
+                           "game log carries no TBF — so it runs a shade high on a messy "
+                           "start. K/9 in the tooltip is exact.")
+            else:
+                st.caption("No start log cached for him.")
+        with right:
+            chart = charts.k_platoon_bars(hand_splits, league=strikeouts.LEAGUE_K)
+            if chart is not None:
+                st.altair_chart(chart)
+                st.caption("The number on each bar is how many bats of that side are in "
+                           "tonight's card; switch hitters are counted on the side they "
+                           "will actually bat from.")
+            else:
+                st.caption("No hand splits cached for him.")
+
+        lineup_k = strikeouts.lineup_k(payload, opposing)
+        if not lineup_k.empty:
+            chart = charts.k_lineup_bars(lineup_k, league=strikeouts.LEAGUE_K)
+            if chart is not None:
+                st.altair_chart(chart)
+            st.dataframe(
+                tables.style(lineup_k.round(1), [
+                    (tables.ranked, {"column": "K%", "best": "high"}),
+                    (tables.signed, {"column": "K Edge"}),
+                ]),
+                hide_index=True,
+                column_config={
+                    "K%": st.column_config.NumberColumn("K% vs arsenal", format="%.1f"),
+                    "K% vs Hand": st.column_config.NumberColumn("K% vs hand", format="%.1f"),
+                    "K Edge": st.column_config.NumberColumn(
+                        "K edge", format="%+.1f",
+                        help="Arsenal K% minus his rate against this hand. Positive means "
+                             "the pitch mix gets him out more than the handedness alone."),
+                    "Whiff%": st.column_config.NumberColumn("Whiff%", format="%.1f"),
+                })
+        else:
+            st.caption("No batter-vs-arsenal sample for this lineup.")
 
 with st.container(border=True):
     st.markdown("**Starter batted-ball profile** — league average is roughly 44% ground, "

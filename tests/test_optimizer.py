@@ -328,11 +328,24 @@ class TestDeterminism:
         assert [sorted(l["players"]["Name"]) for l in a] == \
                [sorted(l["players"]["Name"]) for l in b]
 
-    def test_different_seeds_differ(self, slate):
-        a, _, _ = optimize(slate, n_lineups=5, seed=99)
-        b, _, _ = optimize(slate, n_lineups=5, seed=100)
-        assert [sorted(l["players"]["Name"]) for l in a] != \
-               [sorted(l["players"]["Name"]) for l in b]
+    def test_different_seeds_differ_when_jitter_is_on(self, slate):
+        """The seed only has something to act on when randomness is non-zero.
+
+        This used to call `optimize` with no randomness argument and rely on the default
+        being 0.20. That default is now 0.0 -- jitter measured as a net loss across four
+        snapshot-scored nights -- so the test was pinning a property the shipped settings no
+        longer have. The invariant worth keeping is the conditional one.
+        """
+        a, _, _ = optimize(slate, n_lineups=5, randomness=0.20, seed=99)
+        b, _, _ = optimize(slate, n_lineups=5, randomness=0.20, seed=100)
+        assert [sorted(l["players"]["Name"]) for l in a] !=                [sorted(l["players"]["Name"]) for l in b]
+
+    def test_the_shipped_defaults_are_seed_independent(self, slate):
+        """With jitter off the seed cannot change the set, so a board reproduces without
+        anyone having recorded which seed produced it."""
+        a, _, _ = optimize(slate, n_lineups=3, seed=99)
+        b, _, _ = optimize(slate, n_lineups=3, seed=100)
+        assert [sorted(l["players"]["Name"]) for l in a] ==                [sorted(l["players"]["Name"]) for l in b]
 
     def test_zero_randomness_is_the_single_best_lineup(self, slate):
         a, _, _ = optimize(slate, n_lineups=1, randomness=0.0, seed=1)

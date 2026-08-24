@@ -1,0 +1,22 @@
+# Server settings that hold whether the app runs here or on Render. Anything host-specific
+# (port, address) is passed on the command line instead, so this file never has to know
+# where it is running.
+
+[server]
+headless = true
+# The payload pickles are read from disk, never uploaded, so the default upload allowance is
+# dead weight on a 512 MB free instance.
+maxUploadSize = 5
+
+[browser]
+gatherUsageStats = false
+
+[client]
+# A stack trace on a hosted page tells a visitor about the filesystem and nothing useful
+# about the board. Errors still go to the Render logs in full.
+showErrorDetails = false
+
+[theme]
+# Only the base is set. Every chart in `dashboards/charts.py` deliberately leaves its axis
+# and legend ink to whichever theme is live, so pinning a palette here would undo that.
+base = "dark"

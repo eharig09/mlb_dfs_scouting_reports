@@ -260,3 +260,125 @@ def off_slate_teams(frame, date, salary_dir=salaries.SALARY_DIR, team_column="Te
         return []
     present = {str(t).upper() for t in frame[team_column].dropna()}
     return sorted(present - priced)
+
+
+# ===================================================================================
+# Shared scope: one date and one DK slate, for every page
+#
+# Date and slate are not page-level preferences — they are *which night am I looking at*.
+# Keeping a separate `matchup_date` and `slate_date` meant clicking between views silently
+# changed the subject, which is the same class of lie the module docstring opens with.
+#
+# Both controls therefore use **one session key across every page**, which is exactly how a
+# selection carries over a page switch. Team, position and signal keep their per-page keys:
+# a Team filter holds two clubs on Matchup and thirty on Slate, so carrying one across would
+# just empty the frame.
+# ===================================================================================
+
+#: Shared across every page. Same key on both sides of a page switch = same selection.
+SCOPE_DATE_KEY = "scope_date"
+SCOPE_SLATE_KEY = "scope_slate"
+
+#: The "no slate chosen" option. Not None: a selectbox with a None option renders an empty
+#: row that reads as a bug.
+ALL_SLATES = "Every slate"
+
+
+@st.cache_data(ttl="30m", max_entries=16, show_spinner=False)
+def teams_on_slate(date, slate, salary_dir=salaries.SALARY_DIR):
+    """Clubs priced on **one** slate, rather than the union of the night's slates.
+
+    `priced_teams` answers "was this club rosterable at all that day", which is the right
+    question for the on/off gate and the wrong one once a reader has picked a slate: a club
+    on the late slate is not on the main one, and showing it under `main` is the same error
+    the gate exists to prevent.
+    """
+    path = os.path.join(salary_dir, f"DKSalaries_{date}_{slate}.csv")
+    if not os.path.exists(path):
+        return set()
+    try:
+        frame = pd.read_csv(path)
+    except Exception:
+        return set()
+    column = "TeamAbbrev" if "TeamAbbrev" in frame.columns else None
+    return {str(t).upper() for t in frame[column].dropna()} if column else set()
+
+
+def games_on_slate(games, date, slate, salary_dir=salaries.SALARY_DIR):
+    """The cached games DraftKings actually put on this slate.
+
+    Both clubs have to be priced: DK prices a game as a unit, so a single side appearing is
+    a name-matching artefact rather than a game on the slate.
+    """
+    if games is None or games.empty or not slate or slate == ALL_SLATES:
+        return games
+    teams = teams_on_slate(date, slate, salary_dir)
+    if not teams:
+        return games
+    keep = games["away"].astype(str).str.upper().isin(teams) & \
+        games["home"].astype(str).str.upper().isin(teams)
+    narrowed = games[keep]
+    # Never hand back nothing: an empty game list stops the page dead, and a slate that
+    # matches no cached game is far more likely to be a naming mismatch than a real answer.
+    return narrowed if not narrowed.empty else games
+
+
+def in_scope(frame, date, slate, team_column="Team", salary_dir=salaries.SALARY_DIR):
+    """Narrow a player/team frame to the chosen slate, or to any slate when none is chosen."""
+    if frame is None or getattr(frame, "empty", True) or team_column not in frame.columns:
+        return frame
+    if not slate or slate == ALL_SLATES:
+        return on_slate(frame, date, salary_dir, team_column)
+    teams = teams_on_slate(date, slate, salary_dir)
+    if not teams:
+        return frame
+    return frame[frame[team_column].astype(str).str.upper().isin(teams)]
+
+
+def _drop_unofferable(key, options):
+    """Forget a shared selection this page cannot offer, before the widget is drawn.
+
+    Streamlit raises when `session_state[key]` is not among a selectbox's options, and the
+    Value page really does offer fewer dates than the others -- it needs a salary file.
+    Clearing it here lets the widget fall back to its default instead of erroring.
+    """
+    current = st.session_state.get(key)
+    if current is not None and current not in options:
+        del st.session_state[key]
+        return current
+    return None
+
+
+def scope(games, dates=None, salary_dir=salaries.SALARY_DIR, slate_help=None):
+    """The shared Date + slate control. Returns `(date, slate, games_in_scope)`.
+
+    Drawn in the sidebar above every page's own filters. `games_in_scope` is the game list
+    narrowed to the chosen slate, so a page's own Game dropdown offers only what is
+    rosterable rather than every game the report happened to cache.
+    """
+    if games is None or games.empty:
+        return None, ALL_SLATES, games
+    options = list(dates) if dates is not None else \
+        sorted(games["date"].unique(), reverse=True)
+    if not options:
+        return None, ALL_SLATES, games
+
+    with st.sidebar:
+        st.subheader("Scope", anchor=False)
+        dropped = _drop_unofferable(SCOPE_DATE_KEY, options)
+        date = st.selectbox("Date", options, key=SCOPE_DATE_KEY,
+                            persist_state="session",
+                            help="Shared by every page — changing it here changes it "
+                                 "everywhere.")
+        if dropped:
+            st.caption(f"{dropped} has no data on this page; showing {date}.")
+
+        available = slates_for_date(date, salary_dir)
+        slate_options = [ALL_SLATES] + available
+        _drop_unofferable(SCOPE_SLATE_KEY, slate_options)
+        slate = st.selectbox("DK slate", slate_options, key=SCOPE_SLATE_KEY,
+                             persist_state="session",
+                             help=slate_help or "One game appears on several slates. "
+                                                "Picking one narrows every list on the page "
+                                                "to what that contest could roster.")
+    return date, slate, games_on_slate(games, date, slate, salary_dir)

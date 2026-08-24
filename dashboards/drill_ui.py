@@ -280,6 +280,11 @@ def _arsenal_evidence(payload, meta, name, team):
     except Exception as error:                      # noqa: BLE001 - surfaced, not swallowed
         st.caption(f"Could not rebuild the at-bats: {error}")
         return
+    if context.get("unavailable"):
+        # A different claim from "no at-bats found", and worth keeping apart: one says the
+        # sample is empty, the other says nothing was looked at.
+        st.info(context["unavailable"], icon=":material/info:")
+        return
     if not context or at_bats.empty:
         st.caption("No measured plate appearances against this arsenal.")
         return

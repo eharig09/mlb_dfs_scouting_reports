@@ -1800,3 +1800,99 @@ def stack_member_bars(frame, height=None):
                      alt.Tooltip("Ceiling:Q", format=".2f"),
                      alt.Tooltip("PA:Q", title="Expected PA", format=".2f")]),
         height)
+
+
+# ===================================================================================
+# Strikeouts
+#
+# Three panels that answer one question — can this arm actually miss these bats — from
+# three samples that never share an axis in the workbook. The reference line is league K%
+# on all of them, because the interesting range is only about eight points wide and a
+# strikeout panel without an anchor makes every pitcher look average.
+# ===================================================================================
+
+
+def k_recent_starts(frame, season_k=None, lineup_k=None, league=22.5, height=260):
+    """K% start by start, with his season rate and the card he draws as reference lines.
+
+    A line, not bars: these are ordered in time and the question is which way he is
+    trending. Points are kept on the line because five starts is few enough that each one
+    is a datum a reader will want to hover.
+    """
+    data = _ready(frame, ["Date", "K%"])
+    if data is None:
+        return None
+    ordered = data.sort_values("Date")
+    base = alt.Chart(ordered)
+    line = base.mark_line(point=True, strokeWidth=2).encode(
+        x=alt.X("Date:N", title=None, sort=list(ordered["Date"])),
+        y=alt.Y("K%:Q", title="K% for the start", scale=alt.Scale(zero=False)),
+        tooltip=[alt.Tooltip("Date:N"), alt.Tooltip("Opponent:N", title="Opponent"),
+                 alt.Tooltip("IP:Q", format=".2f"), alt.Tooltip("SO:Q", title="SO"),
+                 alt.Tooltip("K%:Q", format=".1f"), alt.Tooltip("K/9:Q", format=".2f")])
+    layers = [line]
+    for value, dash in ((league, [2, 4]), (season_k, [6, 3]), (lineup_k, [1, 3])):
+        if value is not None and not pd.isna(value):
+            layers.append(alt.Chart(pd.DataFrame({"y": [float(value)]}))
+                          .mark_rule(color=RULE_GREY, strokeDash=dash, strokeWidth=1,
+                                     opacity=0.75)
+                          .encode(y="y:Q"))
+    return _styled(alt.layer(*layers), height)
+
+
+def k_platoon_bars(frame, league=22.5, height=200):
+    """His K% by side of the plate, sized by how many of those bats are in tonight's card.
+
+    The count is the point. An arm who buries left-handers is not a strikeout play against
+    a card with two of them, and a bare split rate cannot say so.
+    """
+    data = _ready(frame, ["Batter Side", "K%"])
+    if data is None:
+        return None
+    bars = (alt.Chart(data).mark_bar(cornerRadiusEnd=3, height=22)
+            .encode(
+                y=alt.Y("Batter Side:N", title=None, sort=["L", "R"]),
+                x=alt.X("K%:Q", title="K% against that side", scale=alt.Scale(zero=True)),
+                # No colour: the y axis already says L or R, so a hue would repeat the
+                # label and would have to borrow the team palette for something that is not
+                # team identity. Streamlit themes an unstyled mark for us.
+                tooltip=[alt.Tooltip("Batter Side:N", title="Bats"),
+                         alt.Tooltip("K%:Q", format=".1f"),
+                         alt.Tooltip("PA:Q", title="Split PA", format=".0f"),
+                         alt.Tooltip("Bats faced:Q", title="In tonight's card")]))
+    labels = (alt.Chart(data).mark_text(align="left", dx=6, fontSize=11, fontWeight=600)
+              .encode(y=alt.Y("Batter Side:N", sort=["L", "R"]), x=alt.X("K%:Q"),
+                      text=alt.Text("Bats faced:Q", format=".0f")))
+    rule = (alt.Chart(pd.DataFrame({"x": [league]}))
+            .mark_rule(color=RULE_GREY, strokeDash=[2, 4], strokeWidth=1, opacity=0.75)
+            .encode(x="x:Q"))
+    return _styled(bars + rule + labels, height)
+
+
+def k_lineup_bars(frame, league=22.5, height=340):
+    """Each opposing hitter's K% against this arsenal, worst bat at the top.
+
+    Sorted rather than ordered by lineup slot: the question this panel answers is "who can
+    he actually put away", and that is a ranking.
+    """
+    data = _ready(frame, ["Name", "K%"])
+    if data is None:
+        return None
+    ordered = data.sort_values("K%", ascending=False)
+    tooltip = [alt.Tooltip("Name:N", title="Hitter"), alt.Tooltip("K%:Q", format=".1f")]
+    for column, title in (("K% vs Hand", "K% vs this hand"), ("K Edge", "K edge"),
+                          ("Whiff%", "Whiff%"), ("PA", "PA vs arsenal")):
+        if column in ordered.columns:
+            tooltip.append(alt.Tooltip(f"{column}:Q", title=title,
+                                       format=".0f" if column == "PA" else ".1f"))
+    bars = (alt.Chart(ordered).mark_bar(cornerRadiusEnd=3)
+            .encode(y=alt.Y("Name:N", title=None, sort=list(ordered["Name"])),
+                    # Bar length already *is* the K%. A colour ramp on the same field says
+                    # it twice and buys nothing -- the same reason the surplus bars on the
+                    # Value page carry no ramp.
+                    x=alt.X("K%:Q", title="K% against this arsenal"),
+                    tooltip=tooltip))
+    rule = (alt.Chart(pd.DataFrame({"x": [league]}))
+            .mark_rule(color=RULE_GREY, strokeDash=[2, 4], strokeWidth=1, opacity=0.75)
+            .encode(x="x:Q"))
+    return _styled(bars + rule, height)

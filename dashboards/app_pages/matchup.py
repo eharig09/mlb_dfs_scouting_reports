@@ -1,6 +1,6 @@
 import streamlit as st
 
-from dashboards import charts, data, drill_ui, outcomes, salaries
+from dashboards import charts, data, drill_ui, filters, outcomes, salaries, tables
 
 st.header("Matchup", anchor=False)
 
@@ -10,14 +10,15 @@ if games.empty:
             "`.cache/report_data/`, it never re-runs the pipeline.")
     st.stop()
 
-dates = list(dict.fromkeys(games["date"]))
+date, slate, in_scope = filters.scope(games)
+on_date = in_scope[in_scope["date"] == date]
+if on_date.empty:
+    st.warning(f"No cached game on the {slate} slate for {date}.")
+    st.stop()
 with st.sidebar:
     st.subheader("Game", anchor=False)
-    date = st.selectbox("Date", dates, key="matchup_date",
-    persist_state="session")
-    on_date = games[games["date"] == date]
     label = st.selectbox("Game", list(on_date["label"]), key="matchup_game",
-    persist_state="session")
+                         persist_state="session")
 
 meta = on_date[on_date["label"] == label].iloc[0].to_dict()
 payload = data.load_payload(meta["path"])

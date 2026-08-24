@@ -10,14 +10,33 @@ Reusing the pipeline's definition
 `dfs.slate.build_stacks` already defines a stack, and it is reused here rather than
 reimplemented. Two of its choices matter and would be easy to get wrong independently:
 
-* the five are taken **by batting order**, not by projection. A stack is contiguous in the
-  lineup because that is what makes the outcomes correlate; picking the five best-projected
-  bats scattered through the card describes a roster nobody can build the correlation from.
+* the five are taken **by batting order**, not by projection — because slots 1-5 are the
+  highest-scoring slots and they guarantee the plate appearances, *not* because adjacency
+  creates the correlation. That second reason used to be written here and it is wrong; see
+  below.
 * clubs with fewer than four priced hitters are dropped, because a "stack" of two carries a
   meaningless salary and would outrank real stacks on value.
 
 A second implementation would drift from the optimiser's own view of a stack, and then the
 dashboard and the lineups it is meant to inform would disagree about what a stack even is.
+
+Contiguity is not the mechanism
+-------------------------------
+Measured over 704 team-games (2026-07-22 .. 08-22, actual boxscore batting order against
+actual DK points), **adjacency does nothing**:
+
+* mean pairwise correlation between two slots, by the gap between them: 1 -> 0.128,
+  2 -> 0.121, 3 -> 0.119, 4 -> 0.110, 5 -> 0.109, 6 -> 0.131, 8 -> 0.131. Hitters eight slots
+  apart correlate as much as neighbours.
+* across all 126 five-slot combinations, contiguous blocks average p90 58.9 against 58.0 for
+  the rest. The best p90 of any combination is 1-2-3-4-**6** (65.0), a shade above
+  1-2-3-4-5 (64.7), which still wins on mean and p95.
+
+The correlation is a **team-level** effect -- the whole card scores when the club scores --
+so it does not care which slots are chosen. Slots 1-5 remain the right five (mean 36.9, p90
+64.7, clearing 60 points 14.9% of the time, against 29.2 / 53.0 / 5.3% for slots 5-9), but a
+skipped slot costs almost nothing: a salary-driven 1-2-3-4-6 is a legitimate construction
+rather than a compromise.
 """
 
 import numpy as np

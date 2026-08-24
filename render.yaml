@@ -1,0 +1,42 @@
+# Render blueprint for the scouting dashboard.
+#
+# The app is stateless: it reads the report payloads committed under `.cache/report_data/`
+# and the DraftKings exports under `dfs_daily_files/`, and never re-runs the pipeline or
+# calls an API on page load. So a deploy is just "install six packages and serve", and the
+# data refreshes by pushing a new commit.
+#
+# Deploy: point Render at this repo and pick "New > Blueprint". It reads this file.
+
+services:
+  - type: web
+    name: scouting-dashboard
+    runtime: python
+    plan: free
+    branch: mlb-scouting-report
+
+    # The pipeline's requirements are deliberately not installed here — see
+    # requirements-web.txt for why.
+    buildCommand: pip install --upgrade pip && pip install -r requirements-web.txt
+
+    # Render injects $PORT and expects the process to bind 0.0.0.0. Streamlit defaults to
+    # 8501 on localhost, which Render's health check cannot reach, so both are set
+    # explicitly. `--server.headless` stops it trying to open a browser and to prompt for an
+    # email on first run, which would otherwise hang the boot.
+    startCommand: >-
+      streamlit run streamlit_app.py
+      --server.port $PORT
+      --server.address 0.0.0.0
+      --server.headless true
+
+    healthCheckPath: /_stcore/health
+
+    envVars:
+      # Developed on 3.14; pinned a minor below because that is what Render installs
+      # reliably today. The pickles are version-sensitive to *pandas*, not to the
+      # interpreter, and pandas is pinned exactly in requirements-web.txt.
+      - key: PYTHON_VERSION
+        value: "3.13.4"
+      # Streamlit phones home on first run unless told not to; on a fresh container that is
+      # a slow no-op at exactly the wrong moment.
+      - key: STREAMLIT_BROWSER_GATHER_USAGE_STATS
+        value: "false"

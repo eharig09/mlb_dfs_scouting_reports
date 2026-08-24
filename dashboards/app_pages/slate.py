@@ -8,7 +8,7 @@ of axes silently picks one of them.
 
 import streamlit as st
 
-from dashboards import charts, data, drill, drill_ui, filters, outcomes, salaries
+from dashboards import charts, data, drill, drill_ui, filters, outcomes, salaries, tables
 
 st.header("Slate", anchor=False)
 st.caption("Every hitter on a date, across all games. Filters apply to every panel here.")
@@ -19,11 +19,7 @@ if games.empty:
             "`.cache/report_data/`, it never re-runs the pipeline.")
     st.stop()
 
-dates = list(dict.fromkeys(games["date"]))
-with st.sidebar:
-    st.subheader("Slate", anchor=False)
-    date = st.selectbox("Date", dates, key="slate_date",
-    persist_state="session")
+date, slate, _scoped = filters.scope(games)
 
 hitters = data.hitters_for_date(date)
 if hitters.empty:
@@ -34,17 +30,20 @@ if hitters.empty:
 # hitter with no salary row keeps his composite and simply cannot be filtered by slot.
 board = salaries.attach_salary(hitters, date)
 
-# **Cached games are not the DK slate.** The dashboard reads every game the report ran, and
-# DraftKings puts up a subset — so without this a club nobody can roster is ranked, coloured
-# and counted alongside the ones you can.
+# **Cached games are not the DK slate.** The dashboard reads every game the report ran,
+# and DraftKings puts up a subset — so without this a club nobody can roster is ranked,
+# coloured and counted alongside the ones you can. Picking a specific slate in Scope narrows
+# it further, to the clubs *that contest* could actually roster.
 dropped = filters.off_slate_teams(board, date)
-with st.sidebar:
-    only_slate = st.toggle("Only clubs on a DK slate", value=True, key="slate_only",
-                           help="Off by default nothing is excluded; on, clubs with no "
-                                "priced player that day are dropped.",
-                           persist_state="session")
+only_slate = True
+if slate == filters.ALL_SLATES:
+    with st.sidebar:
+        only_slate = st.toggle("Only clubs on a DK slate", value=True, key="slate_only",
+                               help="Off, nothing is excluded; on, clubs with no priced "
+                                    "player that day are dropped.",
+                               persist_state="session")
 if only_slate:
-    board = filters.on_slate(board, date)
+    board = filters.in_scope(board, date, slate)
 
 view = filters.sidebar(board, "slate", date=date,
                        show=("signal", "slate", "position", "team", "bats", "ab"))
@@ -177,7 +176,7 @@ with left:
         st.markdown("**Top composites**")
         top = (view.sort_values("Composite", ascending=False)
                .reindex(columns=["Name", "Team", "game", "Composite", "Signal"]).head(15))
-        st.dataframe(top, hide_index=True,
+        st.dataframe(tables.highlight(top), hide_index=True,
                      column_config={"game": st.column_config.TextColumn("Game"),
                                     "Composite": st.column_config.NumberColumn(
                                         format="%.1f")})
@@ -188,7 +187,7 @@ with right:
                    .agg(hitters=("Name", "size"), composite=("Composite", "mean"),
                         priority=("Signal", lambda s: int((s == "Priority").sum())))
                    .sort_values("composite", ascending=False))
-        st.dataframe(by_team, hide_index=True, column_config={
+        st.dataframe(tables.highlight(by_team), hide_index=True, column_config={
             "hitters": st.column_config.NumberColumn("Hitters", format="%d"),
             "composite": st.column_config.NumberColumn("Mean composite", format="%.1f"),
             "priority": st.column_config.NumberColumn("Priority", format="%d")})

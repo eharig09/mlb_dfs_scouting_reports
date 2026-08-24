@@ -263,3 +263,69 @@ class TestTableTints:
         from dashboards import bullpen
 
         assert set(tables.AVAIL_TINTS) == set(bullpen.TIERS)
+
+
+class TestDisplayRounding:
+    """Rate stats carry three decimals, everything else one.
+
+    A blanket precision was the first attempt and it reads wrong both ways: three decimals
+    on a strikeout rate is invented precision, one on an OPS looks like a typo.
+    """
+
+    @pytest.mark.parametrize("column,places", [
+        ("OPS", 3), ("Platoon OPS", 3), ("Season SLG", 3), ("xwOBA", 3),
+        ("Season ISO", 3), ("opp_ops", 3),
+        # OPS figures whose name ends in a handedness rather than the stat.
+        ("Allowed vs L", 3), ("Lineup vs R", 3), ("Edge overall", 3),
+        # ... but the counts that share those prefixes are not.
+        ("Allowed PA vs L", 1), ("Bats vs L", 1),
+        # Park and weather multipliers sit within a few points of 1.00, so one decimal
+        # collapses a 1.04 park and a 1.00 one into the same number.
+        ("park_hr", 3), ("park_runs", 3), ("hr_env", 3),
+        ("K%", 1), ("Whiff%", 1), ("HardHit%", 1), ("Composite", 1), ("Proj", 1),
+        ("surplus", 1), ("per_1k", 1), ("Salary", 1),
+    ])
+    def test_each_column_gets_the_precision_its_stat_is_quoted_in(self, column, places):
+        from dashboards import data
+
+        assert data._places(column) == places
+
+    def test_rounding_leaves_integers_and_text_alone(self):
+        from dashboards import data
+
+        frame = pd.DataFrame({"Name": ["a"], "PA": [123], "OPS": [0.76606091],
+                              "K%": [22.4499]})
+        out = data.rounded(frame)
+        assert out["OPS"].iloc[0] == 0.766
+        assert out["K%"].iloc[0] == 22.4
+        assert out["PA"].iloc[0] == 123
+        assert out["Name"].iloc[0] == "a"
+
+    def test_an_explicit_precision_overrides_the_per_column_rule(self):
+        from dashboards import data
+
+        out = data.rounded(pd.DataFrame({"OPS": [0.76606]}), places=1)
+        assert out["OPS"].iloc[0] == 0.8
+
+
+class TestCuratedHighlighting:
+    def test_direction_is_per_column_not_guessed(self):
+        frame = pd.DataFrame({"Composite": [30.0, 10.0], "ERA": [2.1, 5.4]})
+        best_composite = tables.ranked(frame, "Composite", best="high")["Composite"]
+        best_era = tables.ranked(frame, "ERA", best="low")["ERA"]
+        assert tables.GOOD_RGB in best_composite.iloc[0]   # high composite is good
+        assert tables.GOOD_RGB in best_era.iloc[0]         # low ERA is good
+
+    def test_highlight_shades_only_the_vocabulary_columns(self):
+        frame = pd.DataFrame({"Name": ["a", "b"], "Composite": [30.0, 10.0],
+                              "Whatever": [1.0, 2.0]})
+        html = tables.highlight(frame).to_html()
+        assert html.count("background-color") == 2, "Whatever is not in the vocabulary"
+
+    def test_a_frame_with_nothing_to_shade_comes_back_unstyled(self):
+        frame = pd.DataFrame({"Name": ["a"], "Whatever": [1.0]})
+        assert isinstance(tables.highlight(frame), pd.DataFrame)
+
+    def test_the_two_direction_sets_do_not_overlap(self):
+        """A column in both would take whichever branch happened to be checked first."""
+        assert not (tables.HIGHER_IS_BETTER & tables.LOWER_IS_BETTER)

@@ -1,6 +1,6 @@
 import streamlit as st
 
-from dashboards import charts, data, drill, drill_ui, filters, outcomes, salaries
+from dashboards import charts, data, drill, drill_ui, filters, outcomes, salaries, tables
 
 st.header("Value", anchor=False)
 st.caption("Each hitter measured against his own price bracket. Salary and composite "
@@ -19,10 +19,9 @@ if not usable:
     st.info("No date has both a cached report and a salary file.")
     st.stop()
 
-with st.sidebar:
-    st.subheader("Slate", anchor=False)
-    date = st.selectbox("Date", usable, key="value_date",
-    persist_state="session")
+# Only dates with both a salary file and a cached report can be shown here, so the shared
+# date may not be offerable — `scope` drops it and says so rather than raising.
+date, slate, _scoped = filters.scope(games, dates=usable)
 
 hitters = data.hitters_for_date(date)
 if hitters.empty:
@@ -32,7 +31,7 @@ if hitters.empty:
 board = data.attach_projection(salaries.attach_salary(hitters, date), date)
 # Priced-only already excludes an off-slate club's hitters; the colour domain has to be
 # built from the same subset or the legend carries clubs no point can belong to.
-priced = board[board["Salary"].notna()]
+priced = filters.in_scope(board[board["Salary"].notna()], date, slate)
 slate_teams = charts.team_domain(priced)
 if priced.empty:
     st.warning("No hitter on this slate matched a salary row.")
