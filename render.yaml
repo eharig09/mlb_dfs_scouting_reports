@@ -29,7 +29,10 @@ services:
     name: scouting-dashboard
     runtime: python
     plan: free
-    branch: mlb-scouting-report
+    # The repo's default branch. Render deploys whatever this names, so it has to match
+    # where the work actually lands -- a blueprint pointing at a branch that does not exist
+    # deploys nothing and says very little about why.
+    branch: main
 
     # The pipeline's requirements are deliberately not installed here — see
     # requirements-web.txt for why.
