@@ -17,5 +17,13 @@ numpy==2.4.6
 requests==2.34.2
 
 # Not optional. pandas 3.x stores strings as PyArrow-backed by default, so the cached
-# payloads cannot be unpickled at all without it.
+# payloads cannot be unpickled at all without it -- and the NFL snapshot is parquet, which
+# is pyarrow all the way down.
 pyarrow==24.0.0
+
+# **scipy is deliberately absent.** `nfl.optimizer` needs it for `scipy.optimize.milp`, and
+# for a while importing anything at all from the `nfl` package pulled it in, because
+# `nfl/__init__.py` re-exported the solver eagerly. That is ~40 MB of wheel installed and
+# imported to serve pages that never solve a lineup. The re-export is lazy now (PEP 562),
+# so the hosted app never touches it. If a page ever *does* need the solver, this is the
+# line to add -- and the build will get noticeably slower.

@@ -23,6 +23,8 @@ scouting_reports/
 savant_highlights/
 
 dfs_boards/
+# The NFL twin of dfs_boards: pools, lineups, exposure and filled DK uploads.
+nfl_boards/
 # Salary exports are the dashboard's other runtime input (Value page, price tiers, the slate
 # filter), so they ship. Pool files are not read by the app and carry hand-made lock and
 # exclude decisions, so they stay out.
@@ -49,6 +51,12 @@ autosnap.log
 # NFL slate reports (generated)
 nfl/nfl_reports/
 nfl/nfl_dfs/
+# ...but the hosted dashboard needs the weekly DK inputs, and they are small (~90 KB each).
+# The MLB side commits `dfs_daily_files/` for exactly this reason.
+!nfl/nfl_dfs/
+nfl/nfl_dfs/*
+!nfl/nfl_dfs/nfl_daily_files/
+!nfl/nfl_dfs/nfl_daily_files/*.csv
 
 .streamlit/secrets.toml
 

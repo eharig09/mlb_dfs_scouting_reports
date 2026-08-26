@@ -1,9 +1,26 @@
 # Render blueprint for the scouting dashboard.
 #
-# The app is stateless: it reads the report payloads committed under `.cache/report_data/`
-# and the DraftKings exports under `dfs_daily_files/`, and never re-runs the pipeline or
-# calls an API on page load. So a deploy is just "install six packages and serve", and the
-# data refreshes by pushing a new commit.
+# The app is stateless: it never re-runs the pipeline or calls an API on page load. So a
+# deploy is "install seven packages and serve", and the data refreshes by pushing a commit.
+#
+# What it reads, and therefore what has to be committed:
+#
+#   MLB   .cache/report_data/          per-game payloads (pickles)
+#         dfs_daily_files/             DK salary exports
+#   NFL   nfl/snapshot/                precomputed frames (parquet, ~1.3 MB)
+#         nfl/nfl_dfs/nfl_daily_files/ DK salary exports
+#         nfl/Lineups/                 filled DK entries exports
+#
+# **The raw PFF drop is deliberately NOT committed.** It is 14 MB of exports, several 500
+# columns wide, and the pages read a few dozen of those columns. `python -m nfl.snapshot
+# --build` precomputes everything into `nfl/snapshot/` at a twentieth of the size --
+# and, more importantly, without the nflverse network calls that the Defence, Teams and
+# Trenches pages would otherwise make on every cold start of an ephemeral container.
+#
+# So the NFL refresh loop is:
+#
+#   python -m nfl.snapshot --build
+#   git add nfl/snapshot nfl/nfl_dfs/nfl_daily_files nfl/Lineups && git commit && git push
 #
 # Deploy: point Render at this repo and pick "New > Blueprint". It reads this file.
 

@@ -27,6 +27,7 @@ import re
 import numpy as np
 import pandas as pd
 
+from nfl import pffdata
 from nfl import redzone as rz
 from nfl import sos as sos_module
 from nfl.salaries import canon_team, normalize_name
@@ -36,7 +37,11 @@ SKILL_POSITIONS = ("QB", "RB", "WR", "TE")
 # The DK export writes roster slots ("WR/FLEX"), the other sources write positions.
 _SLOT = re.compile(r"/.*$")
 
-PFF_PROJECTIONS = "pff/projections (1).csv"
+# Not a fixed path. A projection export is superseded by its next pull rather than describing
+# a distinct season, so the newest one wins -- see `nfl.pffdata.latest`. Pinning this to a
+# filename meant a fresher pull could land beside it and never be read; the two on disk
+# differed on 374 of 533 players.
+PFF_PROJECTION_FAMILY = "projections"
 PFF_RECEIVING_GRADES = {2025: "pff/receiving_summary (4).csv"}
 PFF_RUSHING_GRADES = {2025: "pff/rushing_summary (3).csv"}
 PFF_RECEIVING_SCHEME = {2025: "pff_coverage_data/receiving_scheme (3).csv"}
@@ -68,6 +73,19 @@ def _key(series):
 def _read(path, root="."):
     full = os.path.join(root, path)
     return pd.read_csv(full) if os.path.exists(full) else None
+
+
+def _read_projections(root="."):
+    """The newest PFF projection export, or None when there is none on disk.
+
+    Absence is not an error here: half a preseason board has no PFF projection anyway, and
+    the `basis` column already carries that.
+    """
+    roots = [os.path.join(root, r) for r in pffdata.PFF_ROOTS]
+    try:
+        return pd.read_csv(pffdata.latest(PFF_PROJECTION_FAMILY, roots=roots))
+    except pffdata.PffDataError:
+        return None
 
 
 def load_dk_slate(path):
@@ -129,7 +147,7 @@ def build_slate(dk_path, season=2025, week=None, priors=None, root="."):
     board["opp"] = board["team"].map(opponents)
 
     # --- PFF season projection ---------------------------------------------------------
-    projections = _read(PFF_PROJECTIONS, root)
+    projections = _read_projections(root)
     if projections is not None:
         projections = projections.copy()
         projections["key"] = _key(projections["playerName"])

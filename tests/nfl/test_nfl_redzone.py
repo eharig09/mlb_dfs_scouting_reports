@@ -103,12 +103,28 @@ class TestSeasonMap:
         `defense_coverage_scheme` uses it for the oldest, so this cannot be inferred from
         the filename and must stay pinned.
         """
-        assert rz.PFF_FILES["fantasy_receiving"][2025] == "pff/fantasy-stats-receiving.csv"
-        assert rz.PFF_FILES["fantasy_receiving"][2024] == "pff/fantasy-stats-receiving (1).csv"
+        assert rz.pff_path("fantasy_receiving", 2025).endswith("fantasy-stats-receiving.csv")
+        assert rz.pff_path("fantasy_receiving", 2024).endswith("fantasy-stats-receiving (1).csv")
+
+    def test_passing_numbering_runs_opposite_to_receiving(self):
+        """The two exports of the same report number in opposite directions.
+
+        `fantasy-stats-receiving` puts the newest season in the unnumbered file;
+        `fantasy-stats-passing` puts the *oldest* there. A hand-written table assumed one
+        convention covered both and had all four passing seasons reversed. Verified against
+        real passing yards: the identified season matches to a mean error of 0, every other
+        season to ~1,100.
+        """
+        assert rz.pff_path("fantasy_passing", 2025).endswith("fantasy-stats-passing (3).csv")
+        assert rz.pff_path("fantasy_passing", 2022).endswith("fantasy-stats-passing.csv")
 
     def test_an_unmapped_season_fails_loudly(self):
         with pytest.raises(KeyError):
             rz.load_fantasy_receiving(1999)
+
+    def test_an_unknown_family_fails_loudly(self):
+        with pytest.raises(KeyError):
+            rz.pff_path("fantasy_blocking", 2025)
 
 
 class TestSos:

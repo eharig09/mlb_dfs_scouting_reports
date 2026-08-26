@@ -26,9 +26,39 @@ next to the MLB value. None of it should be trusted until it has been re-measure
 """
 
 from .scoring import DK_CLASSIC_SLOTS, DK_SALARY_CAP, offense_points, dst_points
-from .optimizer import ROSTER, ROSTER_SIZE, eligible_positions, optimize
+
+# **The optimizer is re-exported lazily, and that is a deployment decision.** It imports
+# `scipy.optimize.milp`, so an eager import here meant that *any* `from nfl import ...` --
+# including `nfl.naming`, which the dashboard uses to find a file path -- pulled scipy into
+# the process. On the hosted app that is about 40 MB of wheel installed and imported to
+# serve pages that never solve anything. PEP 562 keeps the public names working while the
+# solver stays unimported until something actually asks for it.
+_LAZY = {"ROSTER": "optimizer", "ROSTER_SIZE": "optimizer",
+         "eligible_positions": "optimizer"}
+
+
+def __getattr__(name):
+    if name in _LAZY:
+        import importlib
+
+        module = importlib.import_module(f".{_LAZY[name]}", __name__)
+        value = getattr(module, name)
+        globals()[name] = value          # cached: the lazy path runs once
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(set(globals()) | set(_LAZY))
+
+# **`optimize` is deliberately NOT re-exported here.** `nfl/optimize.py` is the CLI module,
+# the twin of `dfs.optimize`, and a re-exported function of the same name shadows it: after
+# `from nfl import optimize` you hold the solver function and every attribute lookup on the
+# module fails with "'function' object has no attribute ...". `python -m nfl.optimize` still
+# worked, because runpy loads the file directly -- so the collision only showed up on import.
+# The solver is `nfl.optimizer.optimize`; the pipeline is `nfl.optimize`.
 
 __all__ = [
     "DK_CLASSIC_SLOTS", "DK_SALARY_CAP", "offense_points", "dst_points",
-    "ROSTER", "ROSTER_SIZE", "eligible_positions", "optimize",
+    "ROSTER", "ROSTER_SIZE", "eligible_positions",
 ]

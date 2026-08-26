@@ -57,6 +57,8 @@ import unicodedata
 import numpy as np
 import pandas as pd
 
+from nfl import pffdata
+
 # Each rate applies to its tier with the inner tier removed. See the module docstring.
 RECEIVING_TD_RATE = {
     "end_zone": 0.4005,
@@ -69,26 +71,35 @@ RUSHING_TD_RATE = {
     "open_field": 0.0057,
 }
 
-# **The filenames carry no season and the numbering is not consistent between families.**
-# Every one of these was identified by matching the file's own totals against nflverse
-# season totals, not by reading the number: `receiving_summary` counts *up* with age while
-# `fantasy-stats-receiving` uses the unnumbered file for the newest season and
-# `defense_coverage_scheme` uses it for the oldest. Re-identify with
-# `scripts/identify_pff_season` rather than guessing when new exports land.
-PFF_FILES = {
-    "fantasy_receiving": {
-        2025: "pff/fantasy-stats-receiving.csv",
-        2024: "pff/fantasy-stats-receiving (1).csv",
-        2023: "pff/fantasy-stats-receiving (2).csv",
-        2022: "pff/fantasy-stats-receiving (3).csv",
-    },
-    "fantasy_passing": {
-        2025: "pff/fantasy-stats-passing.csv",
-        2024: "pff/fantasy-stats-passing (1).csv",
-        2023: "pff/fantasy-stats-passing (2).csv",
-        2022: "pff/fantasy-stats-passing (3).csv",
-    },
+# **The filenames carry no season, and the numbering convention is not even consistent
+# between two exports of the same report.** This used to be a hand-maintained table here.
+# It was right about `fantasy-stats-receiving` (unnumbered = newest) and it then assumed
+# `fantasy-stats-passing` followed suit. It does not: that family runs the other way, so
+# the table had 2022 filed as 2025 and 2025 as 2022, top to bottom. Nothing loaded the
+# passing side yet, so it never reached a report -- but it was one `load_fantasy_passing`
+# away from putting a three-year-old quarterback split on a live slate.
+#
+# So the season is no longer written down. `nfl.pffdata` identifies it from the file's own
+# contents, and everything here resolves through it. See that module for the method.
+PFF_FAMILIES = {
+    "fantasy_receiving": "fantasy-stats-receiving",
+    "fantasy_passing": "fantasy-stats-passing",
 }
+
+
+def pff_path(family, season, root="."):
+    """The export for a family and season, identified rather than looked up.
+
+    `family` is one of `PFF_FAMILIES`; the season comes back from `nfl.pffdata.catalog`,
+    which fingerprints each file against that season's rosters.
+    """
+    if family not in PFF_FAMILIES:
+        raise KeyError(f"unknown PFF family '{family}'; have {sorted(PFF_FAMILIES)}")
+    roots = [os.path.join(root, r) for r in pffdata.PFF_ROOTS]
+    try:
+        return pffdata.resolve(PFF_FAMILIES[family], int(season), roots=roots)
+    except pffdata.PffDataError as exc:
+        raise KeyError(str(exc)) from exc
 
 _RECEIVING_COLUMNS = [
     "player", "team", "position", "games",
@@ -112,10 +123,7 @@ def name_key(value):
 
 def load_fantasy_receiving(season, root="."):
     """PFF receiving + rushing fantasy splits for one season, with a join key attached."""
-    path = PFF_FILES["fantasy_receiving"].get(int(season))
-    if path is None:
-        raise KeyError(f"no PFF fantasy-receiving file mapped for {season}")
-    frame = pd.read_csv(os.path.join(root, path))
+    frame = pd.read_csv(pff_path("fantasy_receiving", season, root=root))
     frame = frame.reindex(columns=[c for c in _RECEIVING_COLUMNS if c in frame.columns])
     for column in frame.columns:
         if column not in ("player", "team", "position"):

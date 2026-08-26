@@ -65,6 +65,13 @@ PASS_GAME_POSITIONS = frozenset({"QB", "WR", "TE"})
 # revisit once there are results to price it against.
 DST_CONFLICT_MAX = 2
 
+# Pass-game players from one club that make a lineup "stacked" for exposure purposes.
+# Three, not two: on a nine-man roster carrying three WR slots plus a FLEX, two from one
+# club happens by accident often enough that counting it as a stack would fire a team cap
+# on lineups nobody would call stacked. Whatever this is, the exposure report has to count
+# a stack the same way, or a cap you set is checked against a different definition.
+STACK_EXPOSURE_AT = 3
+
 
 class OptimizerError(Exception):
     pass
@@ -331,7 +338,10 @@ def optimize(players, n_lineups=1, objective="ceiling", locks=None, excludes=Non
              stacks=None, max_overlap=None, min_proj=None,
              max_players_per_team=MAX_PLAYERS_PER_TEAM, min_games=MIN_GAMES_REPRESENTED,
              randomness=DEFAULT_RANDOMNESS, seed=None, pins=None,
-             max_ownership=None, slot_groups=None, dst_conflict_max=DST_CONFLICT_MAX):
+             max_ownership=None, slot_groups=None, dst_conflict_max=DST_CONFLICT_MAX,
+             exposure=None, team_exposure=None, stack_at=STACK_EXPOSURE_AT,
+             prior_appearances=None, prior_team_stacks=None, total_lineups=None,
+             prior_lineups=0):
     """Generate up to `n_lineups` distinct DK NFL Classic lineups.
 
     max_overlap caps how many players a lineup may share with any earlier one; randomness
@@ -410,6 +420,50 @@ def optimize(players, n_lineups=1, objective="ceiling", locks=None, excludes=Non
 
     rng = np.random.default_rng(seed)
     lineups, chosen_sets = [], []
+    # Minimums the pace ran out of room for. Reported with the finished set rather than
+    # raised, so an oversubscribed board still hands back the lineups it did build.
+    unmet, unmet_teams = set(), set()
+
+    # **Exposure is a property of the SET of lineups, not of any one lineup**, so it is
+    # enforced by counting appearances as the set is built: anyone at their cap is barred
+    # from the next solve, anyone behind their minimum's pace is forced into it. Lifted
+    # from `dfs.optimizer`, which is where the pacing arithmetic below was learned.
+    exposure = exposure or {}
+    name_to_index = {name: i for i, name in enumerate(pool["Name"])}
+    appearances = {name: 0 for name in exposure}
+    # A caller building one set across several solves -- the stack-shape loop does exactly
+    # that, one solve per anchor -- has to say so. Minimums are satisfied over the whole
+    # set, so judging "how many lineups are left" from this call alone makes every minimum
+    # look urgent on the first lineup and forces the entire exposure list in at once.
+    for name, used in (prior_appearances or {}).items():
+        if name in appearances:
+            appearances[name] = int(used)
+    budget = int(total_lineups if total_lineups else n_lineups)
+
+    stack_at = max(2, int(stack_at))
+    pass_masks = _team_pass_masks(pool)
+    team_limits, missing_team_exposure = {}, []
+    for team, span in (team_exposure or {}).items():
+        key = canon_team(team)
+        if key not in pass_masks:
+            missing_team_exposure.append(str(team))
+            continue
+        low, high = span
+        team_limits[key] = (0 if low is None else int(low),
+                            budget if high is None else int(high))
+    missing["team_exposure"] = missing_team_exposure
+    stacked_counts = {team: 0 for team in team_limits}
+    for team, used in (prior_team_stacks or {}).items():
+        key = canon_team(team)
+        if key in stacked_counts:
+            stacked_counts[key] = int(used)
+
+    def _player_row(index):
+        mask = np.zeros(len(pool))
+        mask[index] = 1
+        return np.atleast_2d(mask @ selector)
+
+    pass_slots = ROSTER["QB"] + ROSTER["WR"] + ROSTER["TE"] + ROSTER["FLEX"]
 
     for lineup_number in range(n_lineups):
         weights = base.copy()
@@ -421,6 +475,78 @@ def optimize(players, n_lineups=1, objective="ceiling", locks=None, excludes=Non
         for previous in chosen_sets:
             mask = np.isin(np.arange(len(pool)), list(previous)).astype(float)
             extra.append((np.atleast_2d(mask @ selector), 0, max_overlap))
+
+        remaining = max(1, budget - prior_lineups - lineup_number)
+        done = prior_lineups + lineup_number
+        free_pass_slots = max(0, pass_slots - sum((stacks or {}).values()))
+
+        # --- team stack exposure -------------------------------------------------------
+        # Caps are hard constraints on this solve; minimums are paced the way player
+        # minimums are, so a club wanted in half the set gets stacked steadily rather than
+        # all at once at the end. A forced stack constrains a COUNT rather than a named
+        # player, so there is nothing an infeasibility fallback could pop -- it is kept
+        # satisfiable by construction: one club at most per lineup, only when it still fits.
+        forced_stack_team = None
+        stack_behind = []
+        for team, (low, high) in team_limits.items():
+            used = stacked_counts[team]
+            if used >= high:
+                # Held below stack size. Individual players from the club stay available.
+                extra.append((np.atleast_2d(pass_masks[team] @ selector), 0, stack_at - 1))
+                continue
+            if low <= 0:
+                continue
+            target = (2 * low * (done + 1) + budget) // (2 * max(budget, 1))
+            last_chance = (low - used) >= remaining
+            if target - used > 0 or last_chance:
+                stack_behind.append((last_chance, (low - used) / remaining, team))
+        stack_behind.sort(key=lambda item: (item[0], item[1], rng.random()), reverse=True)
+        for last_chance, _urgency, team in stack_behind:
+            # An explicit --stack already dictates this club's count, and the pass-game
+            # slots a forced stack needs have to exist alongside it.
+            if (stacks or {}).get(team) or stack_at > free_pass_slots:
+                if last_chance:
+                    unmet_teams.add(team)
+                continue
+            extra.append((np.atleast_2d(pass_masks[team] @ selector), stack_at, pass_slots))
+            forced_stack_team = team
+            break
+        for last_chance, _urgency, team in stack_behind:
+            if last_chance and team != forced_stack_team:
+                unmet_teams.add(team)
+
+        # --- player exposure -----------------------------------------------------------
+        behind = []
+        for name, (low, high) in exposure.items():
+            index = name_to_index.get(name)
+            if index is None:
+                continue
+            used = appearances[name]
+            if used >= high:
+                extra.append((_player_row(index), 0, 0))        # cap reached: bar them
+                continue
+            if low <= 0:
+                continue
+            # **Nearest, not ceil and not floor** -- both ends of the set are a trap, and
+            # `dfs.optimizer` documents both failures. Ceil makes every minimum due on the
+            # very first lineup, so a long Min% list fills the whole roster in file order
+            # and leaves the solver nothing to decide. Floor only reaches `low` on the final
+            # lineup, so every owed appearance falls due at once and whatever does not fit
+            # finishes short. Nearest puts a player due half a lineup either side of his own
+            # rate, which leaves slack at both ends.
+            target = (2 * low * (done + 1) + budget) // (2 * max(budget, 1))
+            last_chance = (low - used) >= remaining
+            if target - used > 0 or last_chance:
+                behind.append((last_chance, (low - used) / remaining, name, index))
+        behind.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        # Only as many as there are free seats. Forcing more players than the roster holds
+        # is how a long minimum list makes a solve infeasible rather than merely tight.
+        seats = max(0, ROSTER_SIZE - len(lock_idx))
+        for _last, _urgency, name, index in behind[:seats]:
+            extra.append((_player_row(index), 1, 1))
+        for last_chance, _urgency, name, _index in behind[seats:]:
+            if last_chance:
+                unmet.add(name)
 
         constraints = [LinearConstraint(a, lb, ub) for a, lb, ub in rows + extra]
         with profiler.stage("solve", vars=width, players=len(pool)):
@@ -443,8 +569,28 @@ def optimize(players, n_lineups=1, objective="ceiling", locks=None, excludes=Non
         if len(assignment) != ROSTER_SIZE:
             break
         chosen_sets.append(set(assignment))
-        lineups.append(_assemble(pool, assignment, objective))
+        record = _assemble(pool, assignment, objective)
+        lineups.append(record)
 
+        # Count what this lineup used, so the next solve paces against it. Counted from the
+        # assembled lineup rather than from the solver vector, so it can never disagree with
+        # what the exposure report will later read off the same frame.
+        chosen = record["players"]
+        chosen_names = set(chosen["Name"])
+        for name in appearances:
+            if name in chosen_names:
+                appearances[name] += 1
+        if stacked_counts:
+            pass_game = chosen[chosen["Roster"].isin(("QB", "WR", "TE", "FLEX"))]
+            by_team = pass_game["Team"].map(canon_team).value_counts()
+            for team in stacked_counts:
+                if int(by_team.get(team, 0)) >= stack_at:
+                    stacked_counts[team] += 1
+
+    missing["exposure_unmet"] = sorted(unmet)
+    missing["team_exposure_unmet"] = sorted(unmet_teams)
+    missing["appearances"] = dict(appearances)
+    missing["team_stacks"] = dict(stacked_counts)
     return lineups, pool, missing
 
 
