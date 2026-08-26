@@ -43,10 +43,26 @@ if priced.empty:
 view = filters.sidebar(priced, "value", date=date,
                        show=("signal", "slate", "position", "team", "bats", "ab"))
 with st.sidebar:
-    price = st.slider("Salary", int(priced["Salary"].min()), int(priced["Salary"].max()),
-                      (int(priced["Salary"].min()), int(priced["Salary"].max())),
-                      step=100, key="value_price",
-                      persist_state="session")
+    low, high = int(priced["Salary"].min()), int(priced["Salary"].max())
+    # **A persisted range outlives the slate it was set on.** The bounds come from whatever
+    # is priced today; the value survives a date or slate change because the widget is
+    # `persist_state="session"`. Move from a slate topping out at $6,900 to one topping out
+    # at $6,600 and Streamlit raises `StreamlitValueAboveMaxError` rather than clamping --
+    # the page dies on a filter the reader never touched. Clamped before the widget is
+    # created, which is the only point session state can still be rewritten.
+    stored = st.session_state.get("value_price")
+    if isinstance(stored, (tuple, list)) and len(stored) == 2:
+        clamped = (min(max(int(stored[0]), low), high), min(max(int(stored[1]), low), high))
+        if clamped != tuple(stored):
+            st.session_state["value_price"] = clamped
+    if low >= high:
+        # One price on the board -- a slider needs a range, and a preseason slate that
+        # flat-prices everyone is exactly this case.
+        price = (low, high)
+        st.caption(f"Every hitter priced at ${low:,} — no range to filter on.")
+    else:
+        price = st.slider("Salary", low, high, (low, high), step=100, key="value_price",
+                          persist_state="session")
 view = view[view["Salary"].between(*price)]
 
 best = priced.nlargest(1, "surplus").iloc[0]
