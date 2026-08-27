@@ -282,11 +282,16 @@ def _bonus_probability(mean_yards, threshold, cv):
 
 
 def project_week(season, week, weekly, schedules, history=None, priors=None,
-                 defense=None, min_games=2):
+                 defense=None, min_games=2, player_priors=None):
     """DK-point projections for every rosterable skill player in one week.
 
     `history` defaults to every completed game before the cutoff. Pass it explicitly when
     projecting many weeks in a row so the same frame is not re-sliced each time.
+
+    `player_priors` is an optional `{player_id: {attempts, carries, targets}}` map -- see
+    `nfl.coldstart.projection_priors`. Where a player has one it replaces the positional
+    volume prior he would otherwise be shrunk toward. Note the two "priors" arguments are
+    different shapes and always were: `priors` is per *position*, this is per *player*.
     """
     history = _before(weekly, season, week) if history is None else history
     history = history[history["position"].isin(POSITIONS)]
@@ -322,6 +327,26 @@ def project_week(season, week, weekly, schedules, history=None, priors=None,
         prior = priors.get(position)
         if prior is None:
             continue
+
+        # **A per-player volume prior, where one exists.** `positional_priors` shrinks every
+        # player toward his position's league average, which is the right target for a
+        # veteran with a long record and a poor one for anyone else -- measured on held-out
+        # 2025, the model beats a season average by 0.434 MAE at 16+ games of history and
+        # loses to it below that.
+        #
+        # Only the three **volume** terms are overridden. Cold start projects opportunity;
+        # it does not project efficiency, and the rate priors stay positional because
+        # efficiency does not persist well enough to personalise (yards per carry
+        # self-correlates at +0.27, touchdown rates at 0.03-0.24).
+        if player_priors:
+            personal = player_priors.get(player["player_id"])
+            if personal:
+                prior = dict(prior)
+                for metric in ("attempts", "carries", "targets"):
+                    value = personal.get(metric)
+                    if value is not None and not (isinstance(value, float)
+                                                  and np.isnan(value)):
+                        prior[metric] = float(value)
         own = by_player.get(player["player_id"])
         form = _weighted_rates(own) if own is not None else None
         if form is None or form["games"] < min_games:

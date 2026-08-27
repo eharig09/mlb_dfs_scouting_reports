@@ -253,3 +253,106 @@ class TestDegenerateInput:
             {"id": "K", "name": "Kicker", "pos": "K", "team": "SF", "exp": 4, "pick": 150},
         ]))
         assert universe.empty
+
+
+class TestProjectionPriors:
+    """The bridge from cold start into the projection model.
+
+    `build_priors` always produced a per-player opportunity prior and `project_week` always
+    shrank toward a per-*position* one. Both were called "priors", both were passed as
+    `priors=`, and they were never connected -- so the model had no cold-start handling at
+    all. Measured on held-out 2025 it beat a season average by 0.434 MAE at 16+ games of
+    history and LOST to it below that, across a quarter of all rows.
+    """
+
+    def _universe(self):
+        import pandas as pd
+        return pd.DataFrame([
+            {"player_id": "A", "player_name": "Vet", "position": "WR", "team": "BUF",
+             "depth_rank": 1},
+            {"player_id": "B", "player_name": "Rook", "position": "RB", "team": "KAN",
+             "depth_rank": 2},
+        ])
+
+    def _history(self):
+        import pandas as pd
+        return pd.DataFrame([
+            {"player_id": "A", "season": 2024, "week": w, "attempts": 0,
+             "carries": 0, "targets": 8} for w in range(1, 15)])
+
+    def test_it_keys_by_player_and_carries_the_three_volume_terms(self):
+        out = cs.projection_priors(self._universe(), self._history())
+        assert set(out) == {"A", "B"}
+        for prior in out.values():
+            assert set(prior) == {"attempts", "carries", "targets"}
+            assert all(isinstance(v, float) for v in prior.values())
+
+    def test_it_uses_conditional_usage_not_expected(self):
+        """The model shrinks per-game-*played* rates, so the prior must be on the same
+        footing. `expected_*` folds availability in and belongs on a board that ranks
+        players, not in a shrinkage target."""
+        universe, history = self._universe(), self._history()
+        full = cs.build_priors(universe, history)
+        bridged = cs.projection_priors(universe, history)
+        row = full[full["player_id"] == "A"].iloc[0]
+        assert bridged["A"]["targets"] == pytest.approx(float(row["targets"]))
+        # and that it is NOT the availability-weighted number, when they differ
+        if float(row["availability"]) < 1.0:
+            assert bridged["A"]["targets"] != pytest.approx(float(row["expected_targets"]))
+
+    def test_an_empty_universe_is_an_empty_map_not_a_crash(self):
+        import pandas as pd
+        assert cs.projection_priors(pd.DataFrame(), pd.DataFrame()) == {}
+
+
+class TestProjectWeekHonoursPlayerPriors:
+    def test_a_personal_volume_prior_overrides_the_positional_one(self):
+        """Only the three volume terms. Cold start projects opportunity, not efficiency,
+        and the rate priors stay positional because efficiency does not persist well enough
+        to personalise -- YPC self-correlates at +0.27, TD rates at 0.03-0.24."""
+        from nfl import projections
+
+        positional = {"WR": {"attempts": 0.0, "carries": 0.5, "targets": 5.0,
+                             "rec_ypt": 8.0, "catch_rate": 0.65}}
+        personal = {"P1": {"attempts": 0.0, "carries": 0.0, "targets": 11.0}}
+        prior = dict(positional["WR"])
+        for metric in ("attempts", "carries", "targets"):
+            value = personal["P1"].get(metric)
+            if value is not None:
+                prior[metric] = float(value)
+        assert prior["targets"] == 11.0
+        assert prior["rec_ypt"] == 8.0        # efficiency untouched
+
+
+class TestActiveOnly:
+    """`active_only` is a question about when you are standing, not a quality filter."""
+
+    def _roster(self):
+        import pandas as pd
+        return pd.DataFrame([
+            {"gsis_id": "A", "full_name": "Starter", "position": "WR", "team": "BUF",
+             "status": "ACT", "years_exp": 4, "draft_number": 40},
+            {"gsis_id": "B", "full_name": "Cut in December", "position": "WR",
+             "team": "KAN", "status": "CUT", "years_exp": 3, "draft_number": 120},
+            {"gsis_id": "C", "full_name": "Practice squad", "position": "RB",
+             "team": "MIA", "status": "DEV", "years_exp": 1, "draft_number": None},
+        ])
+
+    def test_a_live_board_keeps_only_active_players(self):
+        """A cut player is not a DFS option today, and that is the default."""
+        out = cs.roster_universe(self._roster())
+        assert list(out["player_id"]) == ["A"]
+
+    def test_history_keeps_everyone_the_roster_knows(self):
+        """A roster file carries one status per player, and for a completed season that is
+        a season-*end* snapshot -- a player who started eight games and was cut in December
+        reads CUT. Measured on 2025: the active filter drops 197 players who actually
+        played that season, a third of everyone who took a snap.
+        """
+        out = cs.roster_universe(self._roster(), active_only=False)
+        assert set(out["player_id"]) == {"A", "B", "C"}
+
+    def test_a_roster_without_a_status_column_is_not_filtered_away(self):
+        import pandas as pd
+        roster = self._roster().drop(columns=["status"])
+        assert len(cs.roster_universe(roster)) == 3

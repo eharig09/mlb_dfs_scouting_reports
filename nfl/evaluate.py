@@ -51,8 +51,14 @@ def season_average_baseline(history):
 
 
 def walk_forward(season, weekly, schedules, first_week=DEFAULT_FIRST_WEEK, last_week=None,
-                 positions=POSITIONS):
-    """Project every week of a season from its past, and join on what actually happened."""
+                 positions=POSITIONS, player_priors=None):
+    """Project every week of a season from its past, and join on what actually happened.
+
+    `player_priors` is passed straight through to `project_week`. It must be built from
+    seasons *before* `season` -- it is a preseason construct, so building it once outside
+    the loop is correct rather than a shortcut, but building it from this season's games
+    would leak the answer into every week.
+    """
     weeks = sorted(weekly[weekly["season"] == season]["week"].unique())
     weeks = [int(w) for w in weeks if w >= first_week
              and (last_week is None or w <= last_week)]
@@ -69,7 +75,8 @@ def walk_forward(season, weekly, schedules, first_week=DEFAULT_FIRST_WEEK, last_
         priors = positional_priors(history)
         defense = opponent_factors(history)
         projected = project_week(season, week, weekly, schedules,
-                                 history=history, priors=priors, defense=defense)
+                                 history=history, priors=priors, defense=defense,
+                                 player_priors=player_priors)
         if projected.empty:
             continue
 

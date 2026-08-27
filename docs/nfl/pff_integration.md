@@ -913,3 +913,117 @@ at 0.5% ownership, which is also true of live contests.
 
 `pytest ... 2>&1 | tail` reports **tail's** exit code, not pytest's. A run with 7 failures
 reported "exited with code 0". Redirect to a file and check `$?` instead.
+
+---
+
+## Step 13 — Does any of this improve the projection?
+
+Twelve steps of description. This one asks the only question that settles whether it was
+worth it, on the model's own held-out harness: **fit on 2022-24, score 2025, compare against
+each player's own season average.**
+
+Baseline reproduced exactly: MAE 4.617 against 4.938, rho 0.682 against 0.635.
+
+### Finding 1: the model is only good at players it already knows
+
+MAE by games of history on held-out 2025:
+
+| games | n | model | season average | gain |
+|---|---|---|---|---|
+| 0-4 | 210 | 4.109 | 4.029 | **−0.081** |
+| 4-8 | 358 | 4.067 | 4.043 | **−0.024** |
+| 8-16 | 672 | 3.697 | 3.669 | **−0.028** |
+| 16+ | 3,939 | 4.851 | 5.284 | **+0.434** |
+
+**Below sixteen games the model loses to a season average**, across a quarter of all rows.
+Everything it is worth comes from established players.
+
+### Finding 2: PFF deployment cannot fix that, for a structural reason
+
+The obvious move was to use the PFF deployment signal — the stable half of the data, 0.82 to
+0.95 year over year — as a better prior for those players. It cannot be done, and the reason
+is worth recording so nobody tries again:
+
+| games of history | rows | with a prior-season PFF profile |
+|---|---|---|
+| 0-8 | 506 | **0 (0%)** |
+| 8-16 | 615 | 54 (8.8%) |
+| 16+ | 3,494 | 2,692 (77%) |
+
+**PFF covers 5% of the bucket where the model is weak.** A player with no NFL games has no
+prior-season PFF profile either; the two conditions are very nearly mutually exclusive. On
+the 54 usable rows a blend moved MAE from 3.981 to 3.913, which on n=54 is nothing.
+
+### Correction: the "QB drift" was an artefact
+
+An earlier bucketed read showed quarterback bias growing +0.286 → +0.887 → +1.057 across
+the season and looked like a trend worth chasing. Week by week it oscillates between −2.20
+and +2.59 with a slope of **+0.055 points per week** on n≈35 a week. Noise. The apparent
+drift was the bucketing.
+
+### Finding 3: cold start was built for this and was never connected
+
+`nfl/coldstart.py` produces a per-player opportunity prior from prior-season usage, draft
+capital and depth rank. `project_week` shrinks toward a per-*position* prior. Both are called
+"priors", both are passed as `priors=`, they are different shapes, and nothing ever bridged
+them — cold start only ever decorated the report board through `nfl/slate.py`.
+
+`coldstart.projection_priors()` is that bridge, and `project_week(player_priors=...)`
+overrides **only the three volume terms**. Efficiency stays positional: cold start projects
+opportunity, and yards per carry self-correlates at +0.27.
+
+### Result
+
+| games | n | before | after | Δ | vs season average |
+|---|---|---|---|---|---|
+| 0-4 | 210 | 4.109 | **3.966** | +0.144 | −0.081 → **+0.063** |
+| 4-8 | 358 | 4.067 | **3.969** | +0.098 | −0.024 → **+0.074** |
+| 8-16 | 672 | 3.697 | **3.638** | +0.059 | −0.028 → **+0.031** |
+| 16+ | 3,939 | 4.851 | 4.848 | +0.002 | +0.436 unchanged |
+
+All three weak buckets now beat the baseline; the strong bucket is untouched, which is what
+a targeted fix should look like. Overall MAE 4.617 → **4.595**, gain 0.321 → 0.343, bias
+0.267 → 0.221.
+
+**Honest limits.** The low buckets are 210, 358 and 672 rows and this is one held-out season.
+The overall movement is small because the affected rows are a quarter of the sample.
+
+### Closing the headroom the same session
+
+`roster_universe` returned **438** players for 2025 while **610** actually played. The cause
+was not the schema trap I first assumed — it was the status filter.
+
+The roster holds **971** skill players and **609 of the 610** who played. But status is a
+season-**end** snapshot, and `startswith(("ACT", "A"))` keeps only the 438 marked `ACT`:
+
+    ACT 438   DEV 164   CUT 151   RES 131   INA 83   RET 5
+
+A player who started eight games and was cut in December reads `CUT`. **197 players who
+actually played were filtered out** — a third of everyone who took a snap.
+
+That filter is *right* for a live board and *wrong* for anything historical, so it is now
+`active_only=True` by default (the board path in `nfl/cli.py` is unchanged) and
+`projection_priors` passes `False`. The asymmetry that makes this safe: `project_week`
+builds its own universe from box scores and only *looks up* a prior, so a player in the map
+who should not be rostered can never be added to a projection by it — he is simply never
+asked about.
+
+### Final result, held-out 2025
+
+| games | n | model | + priors (438) | + priors (971) | vs season average |
+|---|---|---|---|---|---|
+| 0-4 | 210 | 4.109 | 3.966 | **3.845** | −0.081 → **+0.184** |
+| 4-8 | 358 | 4.067 | 3.969 | **3.947** | −0.024 → **+0.096** |
+| 8-16 | 672 | 3.697 | 3.638 | **3.620** | −0.028 → **+0.049** |
+| 16+ | 3,939 | 4.851 | 4.848 | 4.846 | +0.438 unchanged |
+
+Widening the universe roughly **doubled** the gain in the weakest bucket, which is what the
+coverage argument predicted and is the reason to measure coverage rather than assume it.
+
+Overall: MAE **4.617 → 4.584**, gain over a season average 0.321 → **0.354**, rho 0.6815 →
+**0.6835**, bias 0.267 → **0.200**.
+
+**Honest limits.** The low buckets are 210, 358 and 672 rows, and this is one held-out
+season. The overall movement is modest because the rows it affects are a quarter of the
+sample — but the direction is consistent across every bucket and the strong bucket is
+untouched, which is what a targeted fix should look like rather than a rebalance.

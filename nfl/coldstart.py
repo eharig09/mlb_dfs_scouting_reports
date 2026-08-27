@@ -206,18 +206,28 @@ def _latest_depth_chart(depth_charts):
     return latest
 
 
-def roster_universe(roster, depth_charts=None, positions=POSITIONS):
+def roster_universe(roster, depth_charts=None, positions=POSITIONS, active_only=True):
     """Who is rosterable, and on which team -- from the roster, not from box scores.
 
     This is the half of cold start that has nothing to do with projection quality: a player
     who changed teams in the offseason is on his new team here, and a player who has never
     taken a snap is present at all.
+
+    **`active_only` is a question about when you are standing.** A roster file carries one
+    status per player, and for a completed season that status is a season-*end* snapshot --
+    so a player who started eight games and was cut in December reads `CUT`, and a practice
+    squad elevation reads `DEV`. Filtering on it is right for a live board, where a cut
+    player is not a DFS option, and wrong for anything historical.
+
+    Measured on 2025: the roster holds 971 skill players and 609 of the 610 who actually
+    played, but the active filter keeps 438 -- **it drops 197 players who played that
+    season**. Pass `active_only=False` when building priors or backtesting.
     """
     if roster is None or roster.empty:
         return pd.DataFrame()
     frame = roster[roster["position"].isin(positions)].copy()
-    if "status" in frame.columns:
-        # ACT/RES/etc. Anyone not on the active roster is not a DFS option.
+    if active_only and "status" in frame.columns:
+        # ACT/RES/etc. Anyone not on the active roster is not a DFS option *today*.
         frame = frame[frame["status"].astype(str).str.upper().str.startswith(("ACT", "A"))]
 
     out = pd.DataFrame({
@@ -426,3 +436,34 @@ def fit_draft_curves(history, draft_picks, seasons, min_touch_games=3):
         print(f'    ("{key[0]}", "{key[1]}"): {value},')
     print("}")
     return availability, usage
+
+
+def projection_priors(universe, history, positions=POSITIONS):
+    """`{player_id: {attempts, carries, targets}}` for `nfl.projections.project_week`.
+
+    The bridge that was missing. `build_priors` has always produced a per-player opportunity
+    prior, and `project_week` has always shrunk toward a per-*position* one -- both called
+    "priors", different shapes, never connected. So the projection model had no cold-start
+    handling at all, which is exactly what the held-out numbers said: measured on 2025 it
+    beats a season average by 0.434 MAE at sixteen or more games of history, and **loses to
+    it below that**, across a quarter of all rows.
+
+    **Conditional usage, not `expected_*`.** The model shrinks a player's own per-game rates,
+    which are computed over the games he actually played, so the prior has to be on the same
+    footing. `expected_*` folds availability in and belongs on a board that ranks players,
+    not in a shrinkage target that is compared against a per-game-played rate.
+    """
+    # **A wider universe costs nothing here and a narrow one costs coverage.**
+    # `project_week` builds its own universe from box scores and only *looks up* a prior, so
+    # a player in this map who should not be rostered can never be added to a projection by
+    # it -- he simply is never asked about. That asymmetry is why prior-building should take
+    # everyone the roster knows, while a board that ranks players should not.
+    priors = build_priors(universe, history, positions=positions)
+    if priors.empty:
+        return {}
+    out = {}
+    for row in priors.itertuples(index=False):
+        out[row.player_id] = {"attempts": float(row.attempts),
+                              "carries": float(row.carries),
+                              "targets": float(row.targets)}
+    return out
