@@ -320,9 +320,25 @@ class TestAgainstRealSlates:
         # took five-stacks from 53.7% to 45.0%, and a bare `> 0.40` then failed while the
         # simulator was tracking its target exactly as well as before.
         #
-        # The 0.08 band is not slack, it is a known bias: the repair step trades some
-        # five-stacks down, so size 5 lands ~5pp under target and sizes 3-4 a little over.
-        # Tighten this only along with a fix to that, not on its own.
+        # The 0.08 band is not slack, it is a known bias. It used to be the repair step
+        # trading five-stacks down; that is fixed -- `_spend_up` now stays on the stack's
+        # team, and a reused block core is treated as that block's stack instead of extra
+        # players to build a second, larger stack around. Those two together took the
+        # 4-stack error from +8.3pp to -1.2pp on this seed.
+        #
+        # Be clear about what that bought: the error moved rather than shrank. Averaged
+        # over five seeds the worst error across sizes 3-5 went 0.060 to 0.061 -- the
+        # 4-stack surplus became a 3-stack one (+0.014 to +0.056). It was still worth
+        # doing, because the two mechanisms removed were wrong about the field rather
+        # than merely mis-tuned, and the remaining bias now has one cause instead of three.
+        #
+        # That cause is the fill step: filling eight hitters by ownership appeal
+        # concentrates incidentally, so a lineup that drew a small primary picks up a third
+        # teammate -- and since a block's core is read off its leader's finished lineup,
+        # one accidental triple becomes twenty. Sizes 1 and 2 come in ~2pp light each and
+        # size 3 runs ~5pp heavy (worst seen +8.7pp over five seeds). Capping incidental
+        # fill teams at a pair fixes the 3-stacks and costs 3pp of 5-stacks, which is a bad
+        # trade. Tighten this band only along with a fix that does not.
         for size in (3, 4, 5):
             assert abs(primary.get(size, 0) - PRIMARY_SIZE_SHARE[size]) < 0.08, (
                 f"{size}-stacks simulated at {primary.get(size, 0):.3f} against a measured "

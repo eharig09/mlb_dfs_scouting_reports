@@ -14,14 +14,14 @@ other teams slightly *less* likely (they compete for the same salary), and pitch
 almost exactly independent once you condition on their marginals. A model that draws ten
 players independently reproduces the marginals perfectly and gets every one of those wrong.
 
-**How the field actually builds.** Refreshed 2026-08-08 over all 53,685 lineups in the 19
-exports now on disk -- `calibrate()` produces exactly this block, so it is the number the
-constants below are set from:
+**How the field actually builds.** Refreshed 2026-09-02 over 232,935 legal lineups in 91
+dated Classic contest exports -- `calibrate()` produces exactly this block, so it is the
+number the constants below are set from:
 
-    primary stack size    5 hitters 45.0%   4: 28.4%   3: 15.1%   2: 10.2%   1: 1.3%
-    commonest shapes      5-2 22.3%   5-3 12.7%   4-2 11.3%   5 10.1%   4-3 9.1%
-    pitcher vs own stack  0.7% of lineups   (the field treats this as very nearly a rule)
-    both P in one game    6.1% of lineups
+    primary stack size    5 hitters 42.2%   4: 26.1%   3: 17.3%   2: 12.2%   1: 2.3%
+    commonest shapes      5-2 20.3%   5-3 12.1%   5 9.8%   4-2 9.6%   4-3 7.9%
+    pitcher vs own stack  0.8% of matched lineups
+    both P in one game    4.7% of matched lineups
     duplication           91.0% of entries unique overall, max 27x; 81-98% by contest
 
 That is the generative process implemented here: draw a primary stack, draw a secondary,
@@ -57,38 +57,33 @@ SEATS = [slot for slot, count in ROSTER.items() for _ in range(count)]
 HITTER_SEATS = [s for s in SEATS if s != "P"]
 
 # ---------------------------------------------------------------------------
-# Measured field behaviour. Provenance: 53,685 lineups across the 19 contest exports in
-# dk_results/ (contest sizes 98 to 8,917; single-entry through 20-max). Recompute with
+# Measured field behaviour. Provenance: 232,935 legal lineups across 91 dated Classic
+# contest exports in dk_results/; 214,282 lineups matched both pitchers to dated opponents.
+# Showdown, undated, sub-90-entry, and invalidly joined lineups are excluded. Recompute with
 # `python -m dfs.field --calibrate`.
-#
-# Refreshed 2026-08-08 from 2x the lineups the first fit had. The field stacks *smaller*
-# than that fit said -- five-stacks fell from 53.7% to 45.0% and four-stacks rose from 23.4%
-# to 28.4% -- which is worth knowing rather than smoothing over: these are 19 real contests,
-# not a stationary process, and a slate's game count moves the whole distribution.
 # ---------------------------------------------------------------------------
 
-# How many hitters the field takes from its most-used team. Just under half of all entries
-# are five-stacks; a lineup with no stack at all is around 1%.
-PRIMARY_SIZE_SHARE = {1: 0.0126, 2: 0.1020, 3: 0.1510, 4: 0.2839, 5: 0.4504}
+# How many hitters the field takes from its most-used team.
+PRIMARY_SIZE_SHARE = {1: 0.0226, 2: 0.1218, 3: 0.1730, 4: 0.2605, 5: 0.4222}
 
 # Secondary stack size, conditional on the primary. This is the conditional structure the
 # independent model cannot express: 5-2 is the single commonest shape in the whole field at
-# 22.3%, and it only exists because the second stack is chosen *knowing* the first.
+# 20.3%, and it only exists because the second stack is chosen *knowing* the first.
 SECONDARY_SIZE_SHARE = {
     1: {0: 1.0000},
-    2: {0: 0.3549, 2: 0.6451},
-    3: {0: 0.1477, 2: 0.5918, 3: 0.2605},
-    4: {0: 0.1699, 2: 0.4361, 3: 0.3188, 4: 0.0753},
-    5: {0: 0.2235, 2: 0.4947, 3: 0.2818},
+    2: {0: 0.4102, 2: 0.5898},
+    3: {0: 0.2121, 2: 0.5516, 3: 0.2364},
+    4: {0: 0.2001, 2: 0.4142, 3: 0.3028, 4: 0.0828},
+    5: {0: 0.2321, 2: 0.4815, 3: 0.2864},
 }
 
 # Share of field lineups whose pitcher faces 3+ of their own hitters. The field treats this
 # as nearly a hard rule, so the simulator does too rather than letting it emerge from
 # independent draws, which would produce it an order of magnitude too often.
-CONFLICT_RATE = 0.0068
+CONFLICT_RATE = 0.0084
 
 # Share with both pitchers drawn from the same game.
-SAME_GAME_PITCHER_RATE = 0.0612
+SAME_GAME_PITCHER_RATE = 0.0470
 
 # How sharply the field concentrates on its favourites when choosing *within* a group.
 # Ownership is already a probability; raising it to this power sharpens (>1) or flattens
@@ -195,7 +190,8 @@ def read_contest_lineups(path):
     Only complete ten-player lineups are returned; DK pads the export with reservation rows
     that have no entry yet, and counting those as lineups would deflate every rate here.
     """
-    frame = pd.read_csv(path, encoding="utf-8-sig")
+    from .results import read_result_frame
+    frame = read_result_frame(path)
     frame.columns = [str(c).strip() for c in frame.columns]
     lineups = []
     for text in frame.get("Lineup", pd.Series(dtype=str)).fillna(""):
@@ -219,7 +215,9 @@ def read_contest_lineups(path):
 
 def max_entries_of(path):
     """Max entries per user, read off DK's 'handle (3/20)' entry names."""
-    frame = pd.read_csv(path, encoding="utf-8-sig", usecols=lambda c: str(c).strip() == "EntryName")
+    from .results import read_result_frame
+    frame = read_result_frame(
+        path, usecols=lambda c: str(c).strip() == "EntryName")
     counts = Counter()
     for name in frame.iloc[:, 0].dropna():
         match = re.search(r"\((\d+)/(\d+)\)$", str(name))
@@ -553,44 +551,61 @@ def draw_entry(rng, pool, config, core=None, max_tries=6):
 
         chosen = list(taken)
         stacked_teams = set()
+        primary_team = primary_size = None
+
+        # A reused core *is* this user's stack, not spare players to build a fresh stack
+        # around. Drawing a new primary on top of the core gave every 1-, 2- and 3-stack
+        # block a second and larger stack in most of its entries, which is where the
+        # simulated field's 4-stacks came from: +8pp over the measured share, with 1- and
+        # 2-stacks starved by the same amount. A 20-max user reusing a four-stack submits
+        # twenty four-stacks, not twenty lineups that stack somebody else as well.
+        core_counts = Counter(pool.teams[i] for i in taken if pool.is_hitter[i])
+        core_counts.pop(None, None)
+        if core_counts:
+            inherited, size = max(core_counts.items(), key=lambda item: item[1])
+            if size >= 2:
+                primary_team, primary_size = inherited, size
+                stacked_teams.add(inherited)
 
         # --- primary stack ---
-        if hitters_needed >= 2:
+        if primary_size is None and hitters_needed >= 2:
             sizes = [s for s in PRIMARY_SIZE_SHARE if s <= min(hitters_needed,
                                                                MAX_HITTERS_PER_TEAM)]
             probability = _weights([PRIMARY_SIZE_SHARE[s] for s in sizes])
-            primary_size = int(rng.choice(sizes, p=probability))
+            drawn_size = int(rng.choice(sizes, p=probability))
 
             teams = list(pool.stackable)
             appeal = _weights([pool.team_appeal[t] for t in teams])
-            primary_team = teams[int(rng.choice(len(teams), p=appeal))]
-            stack = _pick_stack(rng, pool, primary_team, primary_size, set(chosen),
+            candidate = teams[int(rng.choice(len(teams), p=appeal))]
+            stack = _pick_stack(rng, pool, candidate, drawn_size, set(chosen),
                                 budget, hitters_needed, canonical=canonical_stack)
             if stack:
                 chosen.extend(stack)
-                stacked_teams.add(primary_team)
+                stacked_teams.add(candidate)
                 budget -= float(pool.salary[stack].sum())
                 hitters_needed -= len(stack)
+                primary_team, primary_size = candidate, len(stack)
 
-                # --- secondary stack, conditional on the primary ---
-                table = SECONDARY_SIZE_SHARE.get(primary_size, {0: 1.0})
-                options = [s for s in table if s == 0 or s <= hitters_needed]
-                if options:
-                    weights = _weights([table[s] for s in options])
-                    secondary_size = int(rng.choice(options, p=weights))
-                    if secondary_size >= 2:
-                        others = [t for t in pool.stackable if t != primary_team]
-                        if others:
-                            appeal = _weights([pool.team_appeal[t] for t in others])
-                            team = others[int(rng.choice(len(others), p=appeal))]
-                            second = _pick_stack(rng, pool, team, secondary_size,
-                                                 set(chosen), budget, hitters_needed,
-                                                 canonical=canonical_stack)
-                            if second:
-                                chosen.extend(second)
-                                stacked_teams.add(team)
-                                budget -= float(pool.salary[second].sum())
-                                hitters_needed -= len(second)
+        # --- secondary stack, conditional on the primary ---
+        if primary_size is not None and hitters_needed >= 2:
+            table = SECONDARY_SIZE_SHARE.get(primary_size, {0: 1.0})
+            options = [s for s in table if s == 0 or s <= hitters_needed]
+            if options:
+                weights = _weights([table[s] for s in options])
+                secondary_size = int(rng.choice(options, p=weights))
+                if secondary_size >= 2:
+                    others = [t for t in pool.stackable if t != primary_team]
+                    if others:
+                        appeal = _weights([pool.team_appeal[t] for t in others])
+                        team = others[int(rng.choice(len(others), p=appeal))]
+                        second = _pick_stack(rng, pool, team, secondary_size,
+                                             set(chosen), budget, hitters_needed,
+                                             canonical=canonical_stack)
+                        if second:
+                            chosen.extend(second)
+                            stacked_teams.add(team)
+                            budget -= float(pool.salary[second].sum())
+                            hitters_needed -= len(second)
 
         # --- fill the remaining hitter seats by marginal appeal ---
         chosen = _fill_hitters(rng, pool, chosen, hitters_needed, budget,
@@ -763,6 +778,17 @@ def _spend_up(rng, pool, indices, tries=8):
         position = int(rng.integers(0, len(indices)))
         current = indices[position]
         headroom = DK_SALARY_CAP - total + pool.salary[current]
+
+        # Spending up must not dismantle the stack the entry was built around. A user with
+        # spare salary upgrades *within* their stack, or trades a one-off bat; they do not
+        # sell the fifth man of their five-stack to buy somebody else's expensive hitter.
+        # Unconstrained this broke a stack in 9.8% of entries -- and because a block's core
+        # is read off its leader's finished lineup, each break propagated to nineteen more.
+        teams = Counter(pool.teams[i] for i in indices if pool.is_hitter[i])
+        stacked = None
+        if pool.is_hitter[current] and teams.get(pool.teams[current], 0) >= 2:
+            stacked = pool.teams[current]
+
         swaps = []
         for i in (pool.hitters if pool.is_hitter[current] else pool.pitchers):
             i = int(i)
@@ -772,6 +798,8 @@ def _spend_up(rng, pool, indices, tries=8):
                 continue
             if pool.slot_sets[current] - pool.slot_sets[i]:
                 continue           # must be able to take the same seat
+            if stacked is not None and pool.teams[i] != stacked:
+                continue           # stay on the stack's team
             swaps.append(i)
         if not swaps:
             continue
@@ -884,40 +912,58 @@ def calibrate(directory=RESULTS_DIR, team_lookup=None, opponent_lookup=None):
     without editing code. A contest export names players but not their teams, so both
     lookups are rebuilt from the cached slates.
     """
-    if team_lookup is None:
-        team_lookup = _team_lookup()
-    if opponent_lookup is None:
-        opponent_lookup = _opponent_lookup()
+    from .results import contest_night, list_contests
+
+    lookup_cache = {}
 
     shapes, primary, secondary = Counter(), Counter(), defaultdict(Counter)
     conflicts = same_game = examined = 0
     contests = 0
 
-    for path in sorted(glob.glob(os.path.join(directory, "*.csv"))):
+    for contest in list_contests(directory):
+        path = contest["path"]
         try:
             lineups, _own, _entries = read_contest_lineups(path)
         except Exception:
             continue
         if len(lineups) < 90:
             continue
+        local_team, local_opponent = team_lookup, opponent_lookup
+        if local_team is None or local_opponent is None:
+            night, slate = contest_night(contest)
+            if not night:
+                # Without a date, a starter's opponent cannot be identified safely. Do not
+                # let an ambiguous contest dilute pitcher-conflict rates toward zero.
+                continue
+            cache_key = (night, slate)
+            if cache_key not in lookup_cache:
+                lookup_cache[cache_key] = _slate_lookups(night, slate)
+            dated_team, dated_opponent = lookup_cache.get(cache_key, ({}, {}))
+            local_team = local_team or dated_team
+            local_opponent = local_opponent or dated_opponent
+        if not local_team or not local_opponent:
+            continue
         contests += 1
         for lineup in lineups:
             hitters = [name for slot, name in lineup if slot != "P"]
             pitchers = [name for slot, name in lineup if slot == "P"]
-            counts = Counter(team_lookup.get(h) for h in hitters)
+            counts = Counter(local_team.get(h) for h in hitters)
             counts.pop(None, None)
+            if counts and max(counts.values()) > MAX_HITTERS_PER_TEAM:
+                # A resolved six-hitter team is a bad name/team join, not a legal DK lineup.
+                continue
             sizes = sorted((c for c in counts.values() if c >= 2), reverse=True)
             shapes["-".join(map(str, sizes)) or "none"] += 1
             top = max(sizes) if sizes else 1
             primary[top] += 1
             secondary[top][sizes[1] if len(sizes) > 1 else 0] += 1
 
-            opponent = {p: opponent_lookup.get(p) for p in pitchers}
+            opponent = {p: local_opponent.get(p) for p in pitchers}
             if all(opponent.get(p) for p in pitchers):
                 examined += 1
                 if any(counts.get(opponent[p], 0) >= 3 for p in pitchers):
                     conflicts += 1
-                if len(pitchers) == 2 and team_lookup.get(pitchers[0]) == opponent[pitchers[1]]:
+                if len(pitchers) == 2 and local_team.get(pitchers[0]) == opponent[pitchers[1]]:
                     same_game += 1
 
     def share(counter):
@@ -927,6 +973,7 @@ def calibrate(directory=RESULTS_DIR, team_lookup=None, opponent_lookup=None):
     return {
         "contests": contests,
         "lineups": int(sum(primary.values())),
+        "pitcher_match_lineups": examined,
         "primary_size_share": share(primary),
         "secondary_size_share": {k: share(v) for k, v in sorted(secondary.items())},
         "conflict_rate": round(conflicts / max(examined, 1), 4),
@@ -952,6 +999,64 @@ def _team_lookup():
             mapping[normalize_name(name)].add(canon_team(team))
     # Only unambiguous names; a player who changed teams mid-window would corrupt the count.
     return {k: sorted(v)[0] for k, v in mapping.items() if len(v) == 1}
+
+
+def _slate_lookups(night, slate=None):
+    """Team and opponent mappings for one dated slate.
+
+    Pitchers face different opponents on different dates, so season-wide name mappings
+    silently discard almost every regular starter as ambiguous. Calibration must join each
+    contest to the board from the date on which it was played.
+    """
+    from .naming import latest
+
+    players = pd.DataFrame()
+    board_path = latest("slate", str(night), slate, root="dfs_boards")
+    if board_path:
+        try:
+            players = pd.read_csv(
+                board_path, encoding="utf-8-sig",
+                usecols=lambda column: str(column).strip() in {"Name", "Team", "Opp"})
+            players.columns = [str(column).strip() for column in players.columns]
+        except Exception:
+            players = pd.DataFrame()
+    if players.empty or not {"Name", "Team", "Opp"} <= set(players.columns):
+        from .naming import label_slates
+        from .salaries import list_salary_files
+
+        infos = list_salary_files(date=str(night))
+        labels = label_slates(infos, str(night))
+        info = next((item for item in infos if labels.get(item["path"]) == slate), None)
+        if info is None:
+            return {}, {}
+        try:
+            salary = pd.read_csv(
+                info["path"], encoding="utf-8-sig",
+                usecols=lambda column: str(column).strip() in
+                {"Name", "TeamAbbrev", "Game Info"})
+            salary.columns = [str(column).strip() for column in salary.columns]
+        except Exception:
+            return {}, {}
+        if not {"Name", "TeamAbbrev", "Game Info"} <= set(salary.columns):
+            return {}, {}
+        salary["Team"] = salary["TeamAbbrev"].map(canon_team)
+
+        def salary_opponent(row):
+            matchup = str(row["Game Info"]).split(" ", 1)[0].split("@")
+            if len(matchup) != 2:
+                return ""
+            away, home = map(canon_team, matchup)
+            return home if row["Team"] == away else away
+
+        salary["Opp"] = salary.apply(salary_opponent, axis=1)
+        players = salary
+    if players is None or players.empty or not {"Name", "Team", "Opp"} <= set(players.columns):
+        return {}, {}
+    teams = {normalize_name(name): canon_team(team)
+             for name, team in zip(players["Name"], players["Team"])}
+    opponents = {normalize_name(name): canon_team(opponent)
+                 for name, opponent in zip(players["Name"], players["Opp"])}
+    return teams, opponents
 
 
 def validate(players, config=None, seed=7, directory=RESULTS_DIR, ownership_column="Own%"):
@@ -1032,8 +1137,10 @@ def format_validation(report, real=None):
 
 def real_duplication(directory=RESULTS_DIR):
     """Duplication actually observed across the contest exports."""
+    from .results import list_contests
     unique, total, biggest = 0, 0, 0
-    for path in sorted(glob.glob(os.path.join(directory, "*.csv"))):
+    for contest in list_contests(directory):
+        path = contest["path"]
         try:
             lineups, _, _ = read_contest_lineups(path)
         except Exception:

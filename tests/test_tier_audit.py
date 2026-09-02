@@ -18,7 +18,7 @@ def test_rank_cohorts_include_ties_and_use_all_scored_entries():
         "Lineup": [LINEUP] * 4,
     })
 
-    with patch("dfs.tier_audit.pd.read_csv", return_value=frame):
+    with patch("dfs.tier_audit.read_result_frame", return_value=frame):
         entries = read_ranked_entries("contest.csv")
 
     assert entries.attrs["contest_entries"] == 4

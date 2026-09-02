@@ -27,7 +27,7 @@ from .price_analysis import (
     load_observations,
     price_tiers,
 )
-from .results import RESULTS_DIR, contest_night, list_contests
+from .results import RESULTS_DIR, contest_night, list_contests, read_result_frame
 from .salaries import normalize_name
 
 
@@ -98,7 +98,7 @@ def _tier_metadata(tier, definitions):
 
 def read_ranked_entries(path):
     """Complete ten-player contest entries with inclusive rank-based cohort flags."""
-    frame = pd.read_csv(path, encoding="utf-8-sig")
+    frame = read_result_frame(path)
     frame.columns = [str(column).strip() for column in frame.columns]
     required = {"Rank", "Points", "Lineup"}
     if not required.issubset(frame.columns):
@@ -474,7 +474,8 @@ def _markdown_table(frame, columns=None, limit=30):
 
 
 def write_tier_audit_report(directory, start, end, coverage, winners, historical,
-                            premium_counts, premium_patterns, minimum_match_pct=90.0):
+                            premium_counts, premium_patterns, minimum_match_pct=90.0,
+                            minimum_contest_entries=90):
     winner_view = winners[["Date", "Slate", "Position", "Name", "Salary", "Tier Label",
                            "Points"]].sort_values(["Date", "Slate", "Position"])
     history_view = historical.sort_values(
@@ -488,7 +489,9 @@ def write_tier_audit_report(directory, start, end, coverage, winners, historical
         "Largest-field contest per slate. Top 20% is a cash proxy because standings exports "
         "do not contain the payout table. Salary bands are learned only from earlier scored "
         f"slates. Strategic rates require at least {minimum_match_pct:.0f}% of real roster slots "
-        "to match the archived board; excluded contests remain in the coverage and raw-slot files. "
+        f"and at least {minimum_contest_entries:,} contest entries. They also require "
+        "the roster slots to match the archived board; excluded contests remain in the coverage "
+        "and raw-slot files. "
         "Exact construction tables additionally require all ten lineup slots to have known tiers.",
         "", "## Coverage", "",
         _markdown_table(coverage), "", "## Winning lineup tiers", "",
@@ -515,15 +518,19 @@ def write_tier_audit_report(directory, start, end, coverage, winners, historical
 
 
 def write_tier_audit(observations, directory, start=None, end=None,
-                     results_directory=RESULTS_DIR, minimum_match_pct=90.0):
+                     results_directory=RESULTS_DIR, minimum_match_pct=90.0,
+                     minimum_contest_entries=90):
     contests = primary_contests(start, end, results_directory)
     slots, coverage = contest_slot_rows(
         observations, contests=contests, start=start, end=end)
-    coverage["Audited"] = (coverage["Match%"].ge(minimum_match_pct) &
+    coverage["Audited"] = (coverage["Entries"].ge(minimum_contest_entries) &
+                           coverage["Match%"].ge(minimum_match_pct) &
                            coverage["Hitter Tiers"].ge(2))
     coverage["Audit Status"] = np.select(
-        [coverage["Hitter Tiers"].lt(2), coverage["Match%"].lt(minimum_match_pct)],
-        ["Warmup: no prior tiers", f"Excluded: match < {minimum_match_pct:.0f}%"],
+        [coverage["Entries"].lt(minimum_contest_entries),
+         coverage["Hitter Tiers"].lt(2), coverage["Match%"].lt(minimum_match_pct)],
+        [f"Excluded: entries < {minimum_contest_entries:,}", "Warmup: no prior tiers",
+         f"Excluded: match < {minimum_match_pct:.0f}%"],
         default="Included")
     valid = coverage[coverage["Audited"]][["Date", "Slate", "Contest"]].copy()
     valid["Audited"] = True
@@ -565,7 +572,8 @@ def write_tier_audit(observations, directory, start=None, end=None,
     report_path = write_tier_audit_report(
         directory, start or observations["Date"].min(), end or observations["Date"].max(),
         coverage, winners, historical, premium_counts, premium_patterns,
-        minimum_match_pct=minimum_match_pct)
+        minimum_match_pct=minimum_match_pct,
+        minimum_contest_entries=minimum_contest_entries)
     return outputs, report_path
 
 
@@ -578,6 +586,8 @@ def main(argv=None):
     parser.add_argument("--output-root", default=ANALYSIS_ROOT)
     parser.add_argument("--min-match", type=float, default=90.0,
                         help="Minimum matched roster-slot percentage for strategic rates.")
+    parser.add_argument("--min-entries", type=int, default=90,
+                        help="Minimum contest field size for strategic rates.")
     args = parser.parse_args(argv)
 
     # Earlier scored boards are needed to define the first requested day's tiers.
@@ -589,7 +599,7 @@ def main(argv=None):
     directory = os.path.join(args.output_root, f"price_{start}_{end}")
     outputs, report = write_tier_audit(
         observations, directory, start=start, end=end, results_directory=args.results_dir,
-        minimum_match_pct=args.min_match)
+        minimum_match_pct=args.min_match, minimum_contest_entries=args.min_entries)
     print(f"Tier audit: {report}")
     for filename, frame in outputs.items():
         print(f"  {filename}: {len(frame):,} rows")
