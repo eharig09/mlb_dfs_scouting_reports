@@ -399,7 +399,7 @@ def optimize(players, n_lineups=1, objective="ceiling", locks=None, excludes=Non
              focus_exclusive=True, max_ownership=None,
              total_lineups=None, prior_appearances=None, prior_lineups=0,
              slot_groups=None, team_exposure=None, stack_at=STACK_EXPOSURE_AT,
-             prior_team_stacks=None):
+             prior_team_stacks=None, on_lineup=None):
     """Generate up to `n_lineups` distinct DK Classic lineups.
 
     max_overlap caps how many players a lineup may share with any earlier one. randomness
@@ -426,6 +426,12 @@ def optimize(players, n_lineups=1, objective="ceiling", locks=None, excludes=Non
     and a team behind its minimum's pace is forced to stack in the next one. Ordinary
     non-stack hitters from a capped team are never blocked -- the cap is on *clustering*, not
     on the players.
+
+    on_lineup(done, target), when given, fires once a lineup is accepted into the set --
+    not once per solve, so an infeasible attempt that gets re-tried with a nudge dropped
+    does not report a phantom lineup. `done` counts from `prior_lineups`, so a caller
+    re-invoking this per stack-shape combination still reports progress against the whole
+    requested set rather than restarting at zero on every combination.
     """
     if objective not in OBJECTIVES:
         raise OptimizerError(f"objective must be one of {sorted(OBJECTIVES)}")
@@ -826,6 +832,8 @@ def optimize(players, n_lineups=1, objective="ceiling", locks=None, excludes=Non
                 if int(taken.get(team, 0)) >= stack_at:
                     stacked_counts[team] += 1
         lineups.append(built)
+        if on_lineup is not None:
+            on_lineup(prior_lineups + lineup_number + 1, budget)
 
     # Minimums the roster could not make room for. The CLI recomputes the real shortfall
     # from the finished set, but a library caller that does not gets the signal here.

@@ -366,3 +366,26 @@ class TestPins:
     def test_pinning_to_an_ineligible_slot_is_an_error(self, slate):
         with pytest.raises(OptimizerError, match="not eligible"):
             optimize(slate, pins={"LAD Bat1": "SS"})       # Bat1 is the catcher
+
+
+class TestProgressCallback:
+    """A set of any size is silent until it finishes without this -- long enough on a big
+    slate to look hung. on_lineup is how a caller (the CLI) reports it is still working."""
+
+    def test_fires_once_per_accepted_lineup_counting_up_to_the_target(self, slate):
+        seen = []
+        optimize(slate, n_lineups=4, seed=5, on_lineup=lambda done, target: seen.append((done, target)))
+        assert seen == [(1, 4), (2, 4), (3, 4), (4, 4)]
+
+    def test_continues_from_prior_lineups_rather_than_restarting_at_one(self, slate):
+        """The stack-shape sweep in dfs.optimize re-invokes optimize() once per team
+        pairing, each call building only a slice of the requested set. prior_lineups and
+        total_lineups are how that slice still reports progress against the whole set."""
+        seen = []
+        optimize(slate, n_lineups=2, seed=6, prior_lineups=6, total_lineups=10,
+                 on_lineup=lambda done, target: seen.append((done, target)))
+        assert seen == [(7, 10), (8, 10)]
+
+    def test_is_optional(self, slate):
+        lineups, _, _ = optimize(slate, n_lineups=2, seed=7)
+        assert len(lineups) == 2
