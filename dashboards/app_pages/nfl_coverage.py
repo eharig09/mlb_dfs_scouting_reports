@@ -19,6 +19,7 @@ the only honest channel. Sized end to end it is worth about **0.09 targets a gam
 extremes of both distributions — a tie-break, not a projection input.
 """
 
+import pandas as pd
 import streamlit as st
 
 from dashboards import nfl_charts, nfl_filters, nfl_pff
@@ -64,11 +65,22 @@ with tabs[0]:
         y = f"{against} {measure}"
         x = "Opp man%" if against == "Man" else "Opp zone%"
 
+        # **Both axes are pinned across the switch.** Man and zone are the two halves of
+        # one comparison, and letting each panel rescale to its own data moves every point
+        # *and* the axis under it when you flip -- the reader is left comparing two pictures
+        # that share nothing. The domains span both schemes so a receiver sitting still
+        # means he is genuinely the same.
+        y_pair = [f"Man {measure}", f"Zone {measure}"]
+        values = pd.concat([matchups[c] for c in y_pair if c in matchups.columns]).dropna()
+        y_domain = [float(values.min()), float(values.max())] if len(values) else None
+        x_domain = [0.0, 100.0]
         chart = nfl_charts.usage_scatter(matchups, x, y, size="Man routes", color="Pos",
-                                         labels=True)
+                                         labels=True, x_domain=x_domain, y_domain=y_domain)
         if chart is not None:
             st.altair_chart(chart, width="stretch")
-            st.caption(f"Right is more {against.lower()} coverage faced; up is better "
+            st.caption(f"Axes are fixed across the Man/Zone switch, so a point that does "
+                       f"not move really did not change. Right is more "
+                       f"{against.lower()} coverage faced; up is better "
                        f"{measure} against it. The top-right corner is a receiver who is "
                        f"good against the scheme he is about to see a lot of — which is the "
                        f"whole shape of the question. **Size it honestly**: the TPRR gap "
@@ -112,16 +124,76 @@ with tabs[2]:
 
 with tabs[3]:
     slot = nfl_pff.defense_slot(season)
-    st.warning("Slot YPT allowed self-correlates at **+0.10** and slot TD rate at "
-               "**+0.01**. Last season's vulnerable slot defence is a coin flip; this is "
-               "here as a record of the season, not as a target list.",
-               icon=":material/warning:")
-    chart = nfl_charts.tendency_bars(slot, "Slot YPT", "Slot yards per target allowed")
-    if chart is not None:
-        st.altair_chart(chart, width="stretch")
-    st.dataframe(nfl_charts.round_display(
-        slot.sort_values("Slot YPT", ascending=False)), hide_index=True,
-                 width="stretch")
+    inner = st.segmented_control("Side", ["Matchup", "Receivers", "Defences"],
+                                 default="Matchup", key="nflcov_slotside",
+                                 persist_state="session") or "Matchup"
+
+    if inner == "Defences":
+        st.warning("Slot YPT allowed self-correlates at **+0.10** year over year and slot "
+                   "TD rate at **+0.01**. Last season's vulnerable slot defence is a coin "
+                   "flip; this is a record of the season, not a target list.",
+                   icon=":material/warning:")
+        chart = nfl_charts.tendency_bars(slot, "Slot YPT", "Slot yards per target allowed")
+        if chart is not None:
+            st.altair_chart(chart, width="stretch")
+        st.dataframe(nfl_charts.round_display(
+            slot.sort_values("Slot YPT", ascending=False)), hide_index=True,
+            width="stretch")
+
+    elif inner == "Receivers":
+        st.markdown("**Who actually works from the slot, and what he does there**")
+        st.caption("`Slot share` is of *routes*, not snaps — a receiver who moves inside on "
+                   "third down is a slot receiver for the plays that matter, and a snap "
+                   "count flattens that.")
+        catchers = nfl_pff.receiver_slot(season)
+        if catchers.empty:
+            st.info("No slot splits for that season.")
+        else:
+            chart = nfl_charts.usage_scatter(catchers, "Slot routes/G", "Slot YPRR",
+                                             size="Slot targets", color="Pos",
+                                             extra_tooltip=("Slot aDOT", "Slot TPRR",
+                                                            "Slot grade"))
+            if chart is not None:
+                st.altair_chart(chart, width="stretch")
+                st.caption("Right is more slot volume, up is more production per route "
+                           "there. Route grade and YPRR persist around 0.6 — the solid "
+                           "half of this page.")
+            columns = ["Name", "Team", "Pos", "G", "Slot routes/G", "Slot TPRR",
+                       "Slot YPRR", "Slot aDOT", "Slot catch%", "Slot grade",
+                       "Slot yards/G", "Slot TD", "Screen YPRR"]
+            st.dataframe(nfl_charts.round_display(
+                catchers[[c for c in columns if c in catchers.columns]]
+                .sort_values("Slot YPRR", ascending=False)),
+                hide_index=True, width="stretch")
+
+    else:
+        st.markdown("**Slot receivers against the slot defence they draw**")
+        if slate_path is None:
+            st.info("Pick a slate in the sidebar to set each receiver against his opponent.")
+        else:
+            paired = nfl_pff.slot_matchup(season, slate_path)
+            if paired.empty or "Opp slot YPT" not in paired.columns:
+                st.warning("Could not pair slot receivers with slot defences on this slate.")
+            else:
+                chart = nfl_charts.usage_scatter(
+                    paired, "Opp slot YPT", "Slot YPRR", size="Slot targets", color="Pos",
+                    extra_tooltip=("Opp", "Slot routes/G", "Slot aDOT"))
+                if chart is not None:
+                    st.altair_chart(chart, width="stretch")
+                st.warning("**Read the vertical axis, not the horizontal one.** What a "
+                           "receiver does from the slot is his own — route grade and YPRR "
+                           "persist around 0.6. What a defence allowed there does not: slot "
+                           "YPT self-correlates at +0.10, slot TD rate at +0.01. Top-right "
+                           "is a good slot receiver drawing a defence that *was* leaky, "
+                           "which is one real fact and one coin flip.",
+                           icon=":material/warning:")
+                columns = ["Name", "Team", "Opp", "Pos", "Slot routes/G", "Slot TPRR",
+                           "Slot YPRR", "Slot aDOT", "Slot grade", "Opp slot YPT",
+                           "Opp slot TD%"]
+                st.dataframe(nfl_charts.round_display(
+                    paired[[c for c in columns if c in paired.columns]]
+                    .sort_values("Slot YPRR", ascending=False)),
+                    hide_index=True, width="stretch")
 
 with tabs[4]:
     scheme_receivers = nfl_pff.receiver_scheme(season)

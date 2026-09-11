@@ -69,6 +69,30 @@ def slug_from_filename(name, date=None):
     return slug if slug != UNKNOWN_SLATE else ""
 
 
+def slug_from_template_name(name, date=None):
+    """Pull the slate label out of an upload template's filename.
+
+    'DKTemplate_2026-08-25_turbo_entries.csv' -> 'turbo'. Same rule as
+    `slug_from_filename`, plus the trailing entries/bulk marker: that says which layout DK
+    handed back, not which contest it was, so it is structure and gets stripped too.
+
+    Only our own `DKTemplate_` names are read. DK's raw downloads (`DKEntries (2).csv`)
+    carry no slate, and treating what is left of one as a label invents a slate nobody
+    typed -- the opposite of the point, which is to honour a name somebody chose.
+    """
+    stem = os.path.splitext(os.path.basename(str(name or "")))[0]
+    stem, count = re.subn(r"(?i)^dk\s*template", "", stem, count=1)
+    if not count:
+        return ""
+    stem = DATE_RE.sub("", stem)
+    if date:
+        stem = stem.replace(str(date), "")
+    stem = re.sub(r"\(\s*\d+\s*\)", "", stem)
+    stem = re.sub(r"(?i)[^a-z0-9]*(entries|bulk)\s*$", "", stem)
+    slug = slate_slug(stem)
+    return slug if slug != UNKNOWN_SLATE else ""
+
+
 def slug_from_contents(info):
     """Infer a slate label from what an export actually prices.
 

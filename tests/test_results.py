@@ -8,8 +8,9 @@ resolved to another night's contest and were reviewed against the wrong ownershi
 
 import pandas as pd
 import pytest
+import zipfile
 
-from dfs.results import contest_night, match_contest
+from dfs.results import contest_night, list_contests, match_contest, result_files
 
 
 def contest(names, entries=1000, path="contest-standings-1.csv"):
@@ -53,6 +54,14 @@ class TestContestNight:
         assert contest_night(contest([]), index=[index_entry("2026-08-07", "main", ALPHA)]) \
             == (None, None)
 
+    def test_archive_chronology_prevents_a_later_subset_collision(self):
+        export = contest(ALPHA)
+        export["observed_at"] = "2026-08-26T02:59:40"
+        index = [index_entry("2026-08-25", "turbo", ALPHA + ["extra"]),
+                 index_entry("2026-08-29", "early", ALPHA)]
+
+        assert contest_night(export, index=index) == ("2026-08-25", "turbo")
+
 
 class TestMatchContest:
     def test_a_small_file_no_longer_beats_the_night_s_own(self):
@@ -81,3 +90,43 @@ class TestMatchContest:
 
     def test_no_contests_at_all_is_not_an_error(self):
         assert match_contest(slate(ALPHA), contests=[]) == (None, 0.0)
+
+
+def _standings_frame(lineup):
+    return pd.DataFrame({
+        "Rank": [1], "Points": [100], "Lineup": [lineup],
+        "Player": ["Player One"], "Roster Position": ["OF"],
+        "%Drafted": ["25%"], "FPTS": [10],
+    })
+
+
+def _write_zip(path, frame):
+    info = zipfile.ZipInfo(path.with_suffix(".csv").name, (2026, 8, 26, 2, 59, 40))
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(info, frame.to_csv(index=False).encode("utf-8-sig"))
+
+
+def test_zip_is_a_native_input_and_is_not_double_counted(tmp_path):
+    classic = "P One P Two C Three 1B Four 2B Five 3B Six SS Seven OF Eight OF Nine OF Ten"
+    frame = _standings_frame(classic)
+    archive = tmp_path / "contest-standings-123.zip"
+    _write_zip(archive, frame)
+
+    contests = list_contests(str(tmp_path))
+    assert len(contests) == 1
+    assert contests[0]["format"] == "classic"
+    assert contests[0]["observed_at"] == "2026-08-26T02:59:40"
+
+    csv_path = archive.with_suffix(".csv")
+    frame.to_csv(csv_path, index=False)
+    assert result_files(str(tmp_path)) == [str(csv_path)]
+    assert len(list_contests(str(tmp_path))) == 1
+
+
+def test_showdown_is_excluded_from_classic_results(tmp_path):
+    frame = _standings_frame("CPT Captain One UTIL Player Two UTIL Player Three")
+    archive = tmp_path / "contest-standings-showdown.zip"
+    _write_zip(archive, frame)
+
+    assert list_contests(str(tmp_path)) == []
+    assert len(list_contests(str(tmp_path), include_showdown=True)) == 1

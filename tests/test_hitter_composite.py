@@ -20,7 +20,7 @@ import pytest
 
 from scouting_report import (HITTER_SPLIT_SHRINK_AB, HITTER_SPLIT_WEIGHTS,
                              _best_hitter_signal, _shrunk_split_ops,
-                             build_hitter_composite_table)
+                             attach_offense_index, build_hitter_composite_table)
 
 
 def hitter(season_ops=0.750, season_ab=400, **splits):
@@ -129,3 +129,14 @@ class TestComposite:
         assert HITTER_SPLIT_WEIGHTS["Platoon"] > HITTER_SPLIT_WEIGHTS["Arsenal"]
         assert HITTER_SPLIT_WEIGHTS["Arsenal"] > HITTER_SPLIT_WEIGHTS["Similar"]
         assert HITTER_SPLIT_WEIGHTS["BvP"] == 0.0
+
+    def test_recent_ops_is_carried_beside_the_l28_index(self):
+        composite = pd.DataFrame({"Name": ["A Hitter"]})
+        lineup = pd.DataFrame({"Name": ["A Hitter"], "ID": [101]})
+        league = pd.DataFrame({"BatterID": [101], "OPS_proxy": [0.750],
+                               "xwOBA": [0.320]})
+        recent = pd.DataFrame({"Name": ["A Hitter"], "OPS": [0.912],
+                               "xwOBA": [0.401]})
+        out = attach_offense_index(composite, [lineup], league, [recent])
+        assert out.loc[0, "L28 OPS"] == pytest.approx(0.912)
+        assert out.loc[0, "Off L28"] > 100

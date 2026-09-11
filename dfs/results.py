@@ -15,6 +15,9 @@ against the slate in hand. Doing it in that order matters -- see `match_contest`
 import functools
 import glob
 import os
+import re
+import zipfile
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 
@@ -34,13 +37,85 @@ MIN_OVERLAP = 0.45
 MIN_CONTAINMENT = 0.95
 
 
+def _zip_member(archive):
+    """The standings CSV inside a DraftKings download archive."""
+    members = [info for info in archive.infolist()
+               if not info.is_dir() and info.filename.lower().endswith(".csv")]
+    if not members:
+        raise ValueError("ZIP contains no CSV file")
+    stem = os.path.splitext(os.path.basename(archive.filename or ""))[0].lower()
+    exact = [info for info in members
+             if os.path.splitext(os.path.basename(info.filename))[0].lower() == stem]
+    return (exact or members)[0]
+
+
+def read_result_frame(path, **kwargs):
+    """Read a standings CSV whether it is loose or still in its DK ZIP archive."""
+    options = {"encoding": "utf-8-sig", **kwargs}
+    if str(path).lower().endswith(".zip"):
+        with zipfile.ZipFile(path) as archive:
+            with archive.open(_zip_member(archive)) as handle:
+                return pd.read_csv(handle, **options)
+    return pd.read_csv(path, **options)
+
+
+def result_files(directory=RESULTS_DIR):
+    """Unique standings inputs, preferring a loose CSV when both forms exist.
+
+    DraftKings delivers standings as ZIPs. Users may also extract those ZIPs in place;
+    grouping by basename prevents the same contest from being counted twice.
+    """
+    chosen = {}
+    for extension in ("*.zip", "*.csv"):
+        for path in sorted(glob.glob(os.path.join(directory, extension))):
+            stem = os.path.splitext(os.path.basename(path))[0].lower()
+            chosen[stem] = path
+    return [chosen[key] for key in sorted(chosen)]
+
+
+def _archive_timestamp(path):
+    """Embedded completion/download time retained by a DK archive, if available."""
+    archive_path = path
+    if not str(path).lower().endswith(".zip"):
+        sibling = os.path.splitext(path)[0] + ".zip"
+        if not os.path.isfile(sibling):
+            return None
+        archive_path = sibling
+    try:
+        with zipfile.ZipFile(archive_path) as archive:
+            stamp = datetime(*_zip_member(archive).date_time)
+    except (OSError, ValueError, zipfile.BadZipFile):
+        return None
+    return stamp.isoformat(timespec="seconds")
+
+
+_SHOWDOWN_SLOT = re.compile(r"(?:^|\s)(?:CPT|UTIL)\s+", re.IGNORECASE)
+_CLASSIC_SLOT = re.compile(r"(?:^|\s)(?:P|C|1B|2B|3B|SS|OF)\s+", re.IGNORECASE)
+
+
+def contest_format(frame):
+    """Return ``classic``, ``showdown``, or ``unknown`` from lineup slot labels."""
+    if "Lineup" not in frame.columns:
+        return "unknown"
+    samples = frame["Lineup"].dropna().astype(str)
+    if samples.empty:
+        return "unknown"
+    sample = " ".join(samples.head(25))
+    if _SHOWDOWN_SLOT.search(sample):
+        return "showdown"
+    if _CLASSIC_SLOT.search(sample):
+        return "classic"
+    return "unknown"
+
+
 def read_contest(path):
     """Parse one standings export into ownership, scores and contest shape."""
-    frame = pd.read_csv(path, encoding="utf-8-sig")
+    frame = read_result_frame(path)
     frame.columns = [str(c).strip() for c in frame.columns]
 
     result = {"path": path, "ownership": {}, "fpts": {}, "entries": 0,
-              "scores": pd.Series(dtype=float), "players": 0}
+              "scores": pd.Series(dtype=float), "players": 0,
+              "format": contest_format(frame), "observed_at": _archive_timestamp(path)}
 
     if {"Player", "%Drafted"} <= set(frame.columns):
         block = frame[["Player", "Roster Position", "%Drafted", "FPTS"]].copy()
@@ -60,15 +135,19 @@ def read_contest(path):
     return result
 
 
-def list_contests(directory=RESULTS_DIR):
-    """Every parsed standings export on disk."""
+def list_contests(directory=RESULTS_DIR, include_showdown=False):
+    """Every unique Classic standings export on disk.
+
+    Showdown uses CPT/UTIL and cannot be compared with a ten-slot Classic salary board.
+    Unknown legacy files remain eligible for backward compatibility.
+    """
     found = []
-    for path in sorted(glob.glob(os.path.join(directory, "*.csv"))):
+    for path in result_files(directory):
         try:
             contest = read_contest(path)
         except Exception:
             continue
-        if contest["ownership"]:
+        if contest["ownership"] and (include_showdown or contest["format"] != "showdown"):
             found.append(contest)
     return found
 
@@ -140,8 +219,23 @@ def contest_night(contest, index=None):
     keys = set(contest.get("ownership") or ())
     if not keys:
         return None, None
+    entries = list(index if index is not None else _export_index())
+    observed = contest.get("observed_at")
+    if observed:
+        try:
+            completed = date.fromisoformat(str(observed)[:10])
+            plausible = {(completed - timedelta(days=1)).isoformat(), completed.isoformat()}
+            chronological = [entry for entry in entries if str(entry.get("date")) in plausible]
+            # Only constrain by time when the plausible window contains a real match. This
+            # keeps an unusual delayed download datable by contents instead of rejecting it.
+            if any(len(keys & entry["names"]) / len(keys) >= MIN_CONTAINMENT
+                   for entry in chronological):
+                entries = chronological
+        except ValueError:
+            pass
+
     best = None
-    for entry in (index if index is not None else _export_index()):
+    for entry in entries:
         containment = len(keys & entry["names"]) / len(keys)
         if containment < MIN_CONTAINMENT:
             continue

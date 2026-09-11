@@ -8,6 +8,7 @@ import argparse
 import json
 import math
 import os
+import time
 from datetime import datetime
 
 import pandas as pd
@@ -424,6 +425,20 @@ def _run(args):
                      else f" (stack bonus forced on; '{args.objective}' does not stack by default)")
             print(f"stacking only from: {', '.join(focus_teams)}{extra}")
 
+    # A set past a handful of lineups is an MILP solve per lineup, and each one gets a
+    # little harder as overlap and exposure constraints accumulate -- long enough to run
+    # silent and look hung. Reported roughly every 10% (always the first and the last)
+    # rather than on every solve, so a 150-lineup set gives about a dozen lines instead of
+    # a scroll of them; the callback itself always fires per lineup, so a caller that wants
+    # every one can still get it.
+    started = time.perf_counter()
+
+    def _progress(done, target):
+        step = max(1, target // 10)
+        if done == target or done == 1 or done % step == 0:
+            print(f"  {done}/{target} lineups built ({time.perf_counter() - started:.1f}s)",
+                  flush=True)
+
     try:
         if shape and not stacks:
             combos = stack_shapes(players, shape, top_teams=stack_teams,
@@ -486,6 +501,7 @@ def _run(args):
                             # without this every pairing starts from zero and a cap that
                             # should bind over the set never binds at all.
                             prior_team_stacks=team_stacks,
+                            on_lineup=_progress,
                         )
                     except OptimizerError as error:
                         combo_errors[str(error)] = combo_errors.get(str(error), 0) + 1
@@ -528,6 +544,7 @@ def _run(args):
                 focus_teams=focus_teams,
                 max_ownership=args.max_ownership,
                 team_exposure=team_limits, stack_at=args.stack_at,
+                on_lineup=_progress,
             )
     except OptimizerError as error:
         print(f"[!] {error}")

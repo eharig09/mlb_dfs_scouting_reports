@@ -196,8 +196,11 @@ class TestOutcomeCharts:
             "Signal": ["Priority", "Watch", "Neutral", "Fade"] * 3,
         }))
         spec = charts.value_scatter_with_history(board, self._grid()).to_dict()
-        assert spec["layer"][0]["mark"]["type"] == "rect"
-        assert spec["layer"][-1]["mark"]["type"] == "circle"
+        marks = [(l.get("mark") or {}).get("type") for l in spec["layer"]]
+        # The grid first, the dots over it, and only the name labels above those.
+        assert marks[0] == "rect"
+        assert marks.index("circle") > marks.index("rect")
+        assert set(marks[marks.index("circle") + 1:]) <= {"text"}
 
     def test_the_lift_chart_carries_its_base_rate(self):
         """Bars without the base rate invite reading any ordering as an edge."""

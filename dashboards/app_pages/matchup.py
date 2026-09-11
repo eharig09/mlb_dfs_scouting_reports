@@ -1,6 +1,6 @@
 import streamlit as st
 
-from dashboards import charts, data, drill_ui, filters, outcomes, salaries, tables
+from dashboards import charts, data, drill_ui, filters, outcomes, salaries, scales, tables
 
 st.header("Matchup", anchor=False)
 
@@ -59,6 +59,19 @@ if positions:
     view = view[view["Pos"].isin(positions)]
 if bats and bats != "All":
     view = view[view["Bats"].astype(str).str.upper() == bats]
+
+# **Axes are measured against the whole card, never against what the filters left.** Narrowing
+# to Priority used to redraw the axes underneath the points, so a reader comparing before to
+# after was reading two different planes. The three OPS columns share one domain for the same
+# reason a level up: the split control changes the *question*, not the units, and it must not
+# re-scale the panel either.
+view = scales.anchor(view, hitters,
+                     share=[("Season OPS", "Platoon OPS", "Arsenal OPS")],
+                     mode=scales.selected_mode(st.session_state))
+axis_note = scales.overflow_note(
+    view, ("Composite", "Off L28", "Season OPS", "Platoon OPS", "Arsenal OPS"))
+if axis_note:
+    st.caption(axis_note)
 
 teams = list(dict.fromkeys(hitters["Team"].dropna()))
 priority = int((hitters["Signal"] == "Priority").sum())
@@ -122,6 +135,9 @@ with st.container(border=True):
                    "the diagonal shows whether tonight's hand is unusual for him. Click any "
                    "point to open that hitter's evidence; the four furthest from the line "
                    "are named, and the rest are on hover.")
+        st.caption("Scroll to zoom, drag to pan, double-click to reset. The axes are fixed "
+                   "to the whole card, so the filters above move the points and not the "
+                   "plane — and zooming in names every bat it has room for.")
     else:
         st.caption("No batter-vs-arsenal sample for this game.")
 
@@ -129,6 +145,7 @@ with st.container(border=True):
     st.markdown(f"**{len(view)} hitters** · {' / '.join(teams)}")
     columns = ["Team", "Name", "Pos", "Spot", "Bats", "Composite", "Signal",
                "Season OPS", "Season AB",
+               "L28 OPS",
                "Platoon OPS", "Platoon AB", "Arsenal OPS", "Arsenal AB",
                "Off Szn", "Off L28"]
     table = (view.reindex(columns=[c for c in columns if c in view.columns])
@@ -140,6 +157,7 @@ with st.container(border=True):
         column_config={
             "Composite": st.column_config.NumberColumn(format="%.1f"),
             "Season OPS": st.column_config.NumberColumn(format="%.3f"),
+            "L28 OPS": st.column_config.NumberColumn(format="%.3f"),
             "Platoon OPS": st.column_config.NumberColumn(format="%.3f"),
             "Arsenal OPS": st.column_config.NumberColumn(format="%.3f"),
             "Season AB": st.column_config.NumberColumn(format="%d"),

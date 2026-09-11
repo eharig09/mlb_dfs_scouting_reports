@@ -6,11 +6,74 @@ multi-slot players, a switch hitter matched to the wrong split, a weather term a
 a closed roof — none of them raise, and all of them are wrong.
 """
 
+import itertools
+import math
+
 import numpy as np
 import pandas as pd
 import pytest
 
-from dashboards import charts, environment as env, filters
+from dashboards import charts, environment as env, filters, scales
+
+
+def _oklab(hex_colour):
+    """sRGB hex to OKLab. Perceptual, so a distance in it means what the eye means by one."""
+    value = hex_colour.lstrip("#")
+    channels = [int(value[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+    linear = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in channels]
+    r, g, b = linear
+    long = (0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b) ** (1 / 3)
+    medium = (0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b) ** (1 / 3)
+    short = (0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b) ** (1 / 3)
+    return (0.2104542553 * long + 0.7936177850 * medium - 0.0040720468 * short,
+            1.9779984951 * long - 2.4285922050 * medium + 0.4505937099 * short,
+            0.0259040371 * long + 0.7827717662 * medium - 0.8086757660 * short)
+
+
+def _perceptual_gap(first, second):
+    """Distance in OKLab, leaning on lightness.
+
+    Not plain Euclidean: at the size of a scatter dot a lightness difference survives where
+    an equal chroma difference does not, and the palette is derived against this same metric.
+    """
+    a, b = _oklab(first), _oklab(second)
+    return math.sqrt((1.6 * (a[0] - b[0])) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2)
+
+
+def _lightness(hex_colour):
+    return _oklab(hex_colour)[0]
+
+
+def _chroma(hex_colour):
+    _, a, b = _oklab(hex_colour)
+    return math.hypot(a, b)
+
+
+def _hue_shift(first, second):
+    """Degrees between two colours' hues, ignoring how light or saturated either one is."""
+    _, a1, b1 = _oklab(first)
+    _, a2, b2 = _oklab(second)
+    gap = math.degrees(math.atan2(b2, a2) - math.atan2(b1, a1))
+    return abs((gap + 180) % 360 - 180)
+
+
+def _marks(spec):
+    """The layer that draws the marks, by mark type rather than by position.
+
+    Every scatter here is layered and the name labels sit on top, so "the points are the
+    last layer" has not been true since direct labels arrived -- indexing past them is how a
+    handful of these assertions ended up describing a `text` mark. Same rule
+    `charts._marks_layer` uses to decide where the click selection goes.
+    """
+    layers = spec.get("layer")
+    if not layers:
+        return spec
+    for layer in reversed(layers):
+        mark = layer.get("mark")
+        kind = mark if isinstance(mark, str) else (mark or {}).get("type")
+        if kind in ("circle", "point", "square", "bar"):
+            return layer
+    return layers[-1]
 
 
 def _board(n=12):
@@ -202,7 +265,7 @@ class TestConditionCharts:
         pitchers depending on who is reading — a red/green ramp would take a side the chart
         has no business taking."""
         spec = charts.hr_exposure_scatter(_staffs()).to_dict()
-        points = spec["layer"][-1]["encoding"]
+        points = _marks(spec)["encoding"]
         assert points["shape"]["field"] == "impact"
         assert points["color"]["field"] == "unit"
 
@@ -213,9 +276,35 @@ class TestConditionCharts:
     def test_hits_saved_is_not_encoded_as_a_size(self):
         """It swings both ways around zero and a negative radius is meaningless."""
         spec = charts.defense_park_scatter(_staffs()).to_dict()
-        points = spec["layer"][-1]["encoding"]
+        points = _marks(spec)["encoding"]
         assert "size" not in points
         assert points["color"]["field"] == "defence"
+
+    def test_focus_uses_a_natural_window_for_each_contact_measure(self):
+        anchored = scales.anchor(
+            _staffs(), _staffs(), domains=scales.CONDITIONS_FOCUS_DOMAINS)
+        assert scales.of(anchored, "GB+LD%") == (55.0, 80.0)
+        assert scales.of(anchored, "GB%") == (30.0, 65.0)
+        assert scales.of(anchored, "LD%") == (15.0, 30.0)
+
+    def test_reference_rules_cannot_pull_condition_axes_back_to_zero(self):
+        anchored = scales.anchor(
+            _staffs(), _staffs(), domains=scales.CONDITIONS_FOCUS_DOMAINS)
+
+        exposure = charts.hr_exposure_scatter(anchored).to_dict()
+        exposure_points = _marks(exposure)["encoding"]
+        rules = [layer for layer in exposure["layer"]
+                 if layer.get("mark", {}).get("type") == "rule"]
+        x_rule = next(layer for layer in rules if "x" in layer.get("encoding", {}))
+        y_rule = next(layer for layer in rules if "y" in layer.get("encoding", {}))
+        assert x_rule["encoding"]["x"]["scale"] == exposure_points["x"]["scale"]
+        assert y_rule["encoding"]["y"]["scale"] == exposure_points["y"]["scale"]
+
+        defense = charts.defense_park_scatter(anchored).to_dict()
+        defense_points = _marks(defense)["encoding"]
+        rule = next(layer for layer in defense["layer"]
+                    if layer.get("mark", {}).get("type") == "rule")
+        assert rule["encoding"]["y"]["scale"] == defense_points["y"]["scale"]
 
 
 def _matchups():
@@ -243,7 +332,7 @@ class TestAllowedBaseline:
     def test_the_chart_shares_one_domain_across_both_axes(self):
         """The diagonal is the entire chart. Two different domains make it decorative."""
         spec = charts.arsenal_vs_allowed_scatter(_matchups()).to_dict()
-        points = spec["layer"][-1]["encoding"]
+        points = _marks(spec)["encoding"]
         assert points["x"]["scale"]["domain"] == points["y"]["scale"]["domain"]
         rule = spec["layer"][0]["encoding"]
         assert rule["x"]["scale"]["domain"] == points["x"]["scale"]["domain"]
@@ -252,7 +341,7 @@ class TestAllowedBaseline:
         """A slate view that silently drops everyone with few at-bats against the mix is
         hiding the most common case, not cleaning it up."""
         spec = charts.arsenal_vs_allowed_scatter(_matchups()).to_dict()
-        fill = spec["layer"][-1]["encoding"]["fill"]
+        fill = _marks(spec)["encoding"]["fill"]
         assert "transparent" in fill["scale"]["range"]
 
     def test_every_baseline_builds(self):
@@ -351,7 +440,7 @@ class TestPitcherVsLineup:
 
     def test_both_axes_share_a_domain_so_the_diagonal_is_a_rule(self):
         spec = charts.pitcher_vs_lineup_scatter(_vs_lineup()).to_dict()
-        points = spec["layer"][-1]["encoding"]
+        points = _marks(spec)["encoding"]
         assert points["x"]["scale"]["domain"] == points["y"]["scale"]["domain"]
         assert spec["layer"][0]["mark"]["type"] == "line"
 
@@ -364,7 +453,7 @@ class TestPitcherVsLineup:
         see that on the chart is for the point to be small."""
         spec = charts.pitcher_vs_lineup_scatter(_vs_lineup(),
                                                 "vs left-handed bats").to_dict()
-        assert spec["layer"][-1]["encoding"]["size"]["field"] == "Bats vs L"
+        assert _marks(spec)["encoding"]["size"]["field"] == "Bats vs L"
 
     def test_a_split_with_no_bats_is_dropped_rather_than_drawn_at_zero(self):
         frame = _vs_lineup()
@@ -415,8 +504,8 @@ class TestTeamSignalEncoding:
     def test_colour_is_the_club_and_shape_is_the_signal(self):
         board = _board()
         spec = charts.team_signal_scatter(board, "Composite", "Season OPS").to_dict()
-        assert spec["encoding"]["color"]["field"] == "Team"
-        assert spec["encoding"]["shape"]["field"] == "Signal"
+        assert _marks(spec)["encoding"]["color"]["field"] == "Team"
+        assert _marks(spec)["encoding"]["shape"]["field"] == "Signal"
 
     def test_filtering_does_not_repaint_the_survivors(self):
         """Colour follows the club, never its rank. A domain taken from the filtered frame
@@ -426,7 +515,7 @@ class TestTeamSignalEncoding:
         narrowed = board[board["Team"] == "ATH"]
         spec = charts.team_signal_scatter(narrowed, "Composite", "Season OPS",
                                           domain=domain).to_dict()
-        assert spec["encoding"]["color"]["scale"]["domain"] == domain
+        assert _marks(spec)["encoding"]["color"]["scale"]["domain"] == domain
         assert len(domain) == 3
 
     def test_the_shape_scale_covers_every_signal_in_order(self):
@@ -498,11 +587,65 @@ class TestOnSlate:
 class TestTeamColours:
     def test_every_club_has_its_own_colour(self):
         assert len(charts.TEAM_COLORS) == 30
+        assert set(charts.TEAM_COLORS) == set(charts.TEAM_IDENTITY)
 
     def test_no_two_clubs_share_a_hex(self):
         """Detroit and the Yankees both wear #0C2340; Detroit takes its orange instead, or
         two clubs are indistinguishable on a chart whose whole point is identity."""
         assert len(set(charts.TEAM_COLORS.values())) == len(charts.TEAM_COLORS)
+        assert len(set(charts.TEAM_IDENTITY.values())) == len(charts.TEAM_IDENTITY)
+
+
+    def test_no_two_clubs_read_as_the_same_colour(self):
+        """A distinct hex is not the same claim as a distinguishable colour.
+
+        The identity map clears "no two share a hex" and still puts the Mets and the Giants
+        0.006 apart in OKLab, which on a scatter is the same orange. This is the floor the
+        derived palette is required to hold; drop it and the panel is claiming thirty series
+        it does not have.
+        """
+        pairs = list(itertools.combinations(charts.TEAM_COLORS, 2))
+        gaps = {(a, b): _perceptual_gap(charts.TEAM_COLORS[a], charts.TEAM_COLORS[b])
+                for a, b in pairs}
+        worst, gap = min(gaps.items(), key=lambda kv: kv[1])
+        assert gap > 0.05, f"{worst[0]} and {worst[1]} are only {gap:.3f} apart"
+
+    def test_it_is_a_real_gain_over_the_identity_map(self):
+        """The point of deriving a palette at all, stated as a number."""
+        def closest(mapping):
+            return min(_perceptual_gap(mapping[a], mapping[b])
+                       for a, b in itertools.combinations(mapping, 2))
+
+        assert closest(charts.TEAM_COLORS) > 8 * closest(charts.TEAM_IDENTITY)
+
+    def test_every_club_keeps_its_own_hue(self):
+        """Separation is spent on lightness, never on hue.
+
+        Hue is the whole of what a club colour recognises — a red club has to stay red or the
+        palette has traded the problem for a worse one. Anything past a couple of degrees is
+        a different colour, not a lighter one.
+        """
+        for team, drawn in charts.TEAM_COLORS.items():
+            identity = charts.TEAM_IDENTITY[team]
+            if team in ("CWS", "SD"):
+                # Black and brown have no hue to keep; both take their own secondary's.
+                continue
+            assert _hue_shift(identity, drawn) < 3.0, f"{team} changed hue"
+
+    def test_nothing_is_dark_enough_to_vanish_or_pale_enough_to_wash_out(self):
+        """The band is what keeps the palette readable in both themes.
+
+        Streamlit themes the chart chrome but not the mark colours, so a club drawn at the
+        Yankees' true navy disappears on the dark surface and one drawn at the Mets' true
+        orange washes out on the light one.
+        """
+        for team, drawn in charts.TEAM_COLORS.items():
+            assert 0.40 <= _lightness(drawn) <= 0.86, f"{team} sits outside the band"
+
+    def test_the_unmapped_grey_is_not_a_thirty_first_club(self):
+        """It has to read as absence, and the way it does that is by having no hue at all."""
+        assert _chroma(charts.UNKNOWN_TEAM_COLOR) < 0.02
+        assert all(_chroma(c) > 0.05 for c in charts.TEAM_COLORS.values())
 
     def test_an_unmapped_club_is_grey_not_a_borrowed_identity(self):
         assert charts.team_colors(["XYZ"]) == [charts.UNKNOWN_TEAM_COLOR]

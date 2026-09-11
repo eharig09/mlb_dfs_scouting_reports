@@ -139,13 +139,29 @@ class TestPriceShapes:
 
 
 class TestOutlierLabels:
-    def test_only_the_extremes_are_named(self):
+    def test_only_the_extremes_are_named_until_the_reader_zooms(self):
+        """Two tiers, and the second one is invisible until it is asked for.
+
+        The cap was never "four names is the right number" — it was that a name needs room
+        beside its own point. Zooming makes the room, so the second tier is drawn with its
+        opacity gated on the zoom binding and contributes nothing at rest.
+        """
         spec = charts.platoon_scatter(_hitters(), view="context").to_dict()
-        text = [l for l in spec["layer"] if _layer_marks(spec)[spec["layer"].index(l)] == "text"]
-        assert len(text) == 1
-        rows = spec["datasets"][text[0]["data"]["name"]]
+        marks = _layer_marks(spec)
+        text = [l for l, kind in zip(spec["layer"], marks) if kind == "text"]
+        assert len(text) == 2
+
+        always, on_zoom = text
+        rows = spec["datasets"][always["data"]["name"]]
         assert len(rows) == charts.LABEL_LIMIT < len(_hitters())
         assert "De La Cruz" in [r["_label"] for r in rows]
+        assert "opacity" not in always["encoding"]
+
+        opacity = on_zoom["encoding"]["opacity"]
+        assert opacity["value"] == 0                     # nothing shown before a zoom
+        assert "zoom" in opacity["condition"]["test"]
+        assert not set(r["_label"] for r in spec["datasets"][on_zoom["data"]["name"]]) & \
+            set(r["_label"] for r in rows)
 
     def test_a_label_is_never_the_only_thing_carrying_identity(self):
         """Unlabelled points still resolve — the tooltip names every one of them."""

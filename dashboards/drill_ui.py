@@ -264,7 +264,12 @@ def chart_with_drilldown(chart, frame, date, key, kind="hitter", history=None):
     """
     if chart is None:
         return None
-    return st.altair_chart(charts.selectable(chart, kind), on_select="rerun", key=key)
+    # The chart also carries a scale-bound `zoom` interval. Without selection_mode,
+    # Streamlit listens to every parameter and a wheel zoom reruns the page, rebuilding the
+    # chart at its home domain. Only the point selection is server-side; pan/zoom stays in
+    # Vega in the browser and the click-through continues to rerun normally.
+    return st.altair_chart(charts.selectable(chart, kind), on_select="rerun",
+                           selection_mode="point", key=key)
 
 
 def _arsenal_evidence(payload, meta, name, team):

@@ -20,7 +20,7 @@ import altair as alt
 import numpy as np
 import pandas as pd
 
-from dashboards import salaries
+from dashboards import salaries, scales
 
 # Validated categorical pair — the same two the MLB report's figures use, so a club keeps
 # its colour between the workbook and the dashboard.
@@ -39,19 +39,25 @@ SIGNAL_ORDER = ["Priority", "Watch", "Neutral", "Fade"]
 # the dark app surface, since a rule is chrome and Streamlit does not theme mark colours.
 RULE_GREY = "#9aa0a6"
 
+HITTER_OPS_TOOLTIP = [
+    alt.Tooltip("Season OPS:Q", title="OPS", format=".3f"),
+    alt.Tooltip("L28 OPS:Q", title="L28 OPS", format=".3f"),
+    alt.Tooltip("Platoon OPS:Q", title="Platoon OPS", format=".3f"),
+    alt.Tooltip("Arsenal OPS:Q", title="Arsenal OPS", format=".3f"),
+]
+
 TOOLTIP = [
     alt.Tooltip("Name:N", title="Player"),
     alt.Tooltip("Team:N", title="Team"),
     alt.Tooltip("Bats:N", title="Bats"),
     alt.Tooltip("Composite:Q", title="Composite", format=".1f"),
     alt.Tooltip("Signal:N", title="Signal"),
-    alt.Tooltip("Season OPS:Q", title="Season OPS", format=".3f"),
-    alt.Tooltip("Platoon OPS:Q", title="Platoon OPS", format=".3f"),
+] + HITTER_OPS_TOOLTIP + [
     alt.Tooltip("Platoon AB:Q", title="Platoon AB", format=".0f"),
 ]
 
 
-def _styled(chart, height=380):
+def _styled(chart, height=380, zoom=False):
     """Size the chart and otherwise leave its chrome to Streamlit.
 
     **Axis and legend colours are deliberately not set here.** The first version pinned them
@@ -61,11 +67,37 @@ def _styled(chart, height=380):
     does not. Only the *data* colours are ours, because those carry meaning — team identity
     and the reserved status scale — and must not drift with the theme.
 
+    `zoom` attaches the pan/zoom binding, and only the *scatters* ask for it. A ranked bar
+    chart has one continuous axis and a categorical one; panning it hides rows without
+    telling anyone, which is a worse chart, not a more interactive one.
+
     Takes the chart, never the frame: these are layered (points over a reference rule), and
     passing a composed LayerChart back through `alt.Chart(...)` treats it as *data*, failing
     with the memorably unhelpful "`Data` has no parameter named 'layer'".
     """
-    return chart.properties(height=height)
+    return _zoomable(chart).properties(height=height) if zoom \
+        else chart.properties(height=height)
+
+
+def _zoomable(chart):
+    """Bind pan and zoom to the chart's scales, or hand it back untouched if it will not take.
+
+    The parameter goes on the layer that draws the *marks*, for the same reason the click
+    selection does: a scale binding on the reference-rule layer binds the rule's own scale,
+    and the points then sit still while the dashed line slides around underneath them.
+    """
+    if chart is None:
+        return None
+    try:
+        layers = getattr(chart, "layer", None)
+        if layers:
+            index = _marks_layer(layers)
+            layers[index] = layers[index].add_params(scales.binding())
+            return chart
+        return chart.add_params(scales.binding())
+    except Exception:
+        # A chart shape that will not take a param is still worth showing.
+        return chart
 
 
 def _ready(frame, columns):
@@ -74,6 +106,9 @@ def _ready(frame, columns):
     `frame.dropna(subset=[...])` raises KeyError when the column is missing entirely — which
     is exactly the shape an absent payload section produces — so a chart would crash rather
     than politely decline. Every builder goes through here.
+
+    Also the one place the page's anchored axis bounds are re-attached, so a builder gets
+    them without every builder having to remember to.
     """
     if frame is None or getattr(frame, "empty", True):
         return None
@@ -81,7 +116,36 @@ def _ready(frame, columns):
     if missing:
         return None
     data = frame.dropna(subset=list(columns))
-    return data if not data.empty else None
+    return scales.carry(data, frame) if not data.empty else None
+
+
+def _qscale(data, field, zero=False, **kw):
+    """The scale for one quantitative axis: the page's anchored bounds, or the old default.
+
+    Focus bounds are stable across refreshes and clamp extremes to a visible boundary; Full
+    bounds cover the unfiltered board. A frame nobody anchored falls through to the old
+    `zero=False` behavior unchanged.
+    """
+    pinned = scales.of(data, field)
+    if pinned:
+        # A focus window leaves room for normal differences; clamping keeps a genuine
+        # extreme visible on the boundary instead of silently dropping the mark.
+        return alt.Scale(domain=list(pinned), clamp=True, **kw)
+    return alt.Scale(zero=zero, **kw)
+
+
+def _same_unit_domain(data, fields, floor=None):
+    """One domain for a set of same-unit axes — the parity panels' diagonal needs it.
+
+    Falls back to the frame's own range when the page has not anchored it, which is what the
+    parity charts computed for themselves before there were anchors at all.
+    """
+    pinned = scales.across(data, fields)
+    if pinned:
+        return [pinned[0], pinned[1]]
+    low = float(min(data[f].min() for f in fields)) - 0.05
+    high = float(max(data[f].max() for f in fields)) + 0.05
+    return [low if floor is None else max(floor, low), high]
 
 
 def _team_scale(teams):
@@ -94,10 +158,22 @@ def _signal_scale():
                      range=[SIGNAL_COLORS[s] for s in SIGNAL_ORDER])
 
 
-#: How many points a scatter may name. Direct labels work *because* they are sparing: a
-#: name beside every dot is chaos and goes unread, and on an eighteen-hitter panel it would
-#: also collide with itself. The extremes are the only ones a reader is going to ask about.
+#: How many points a scatter may name *at rest*. Direct labels work because they are sparing:
+#: a name beside every dot is chaos and goes unread, and on an eighteen-hitter panel it would
+#: also collide with itself. The extremes are the only ones a reader is going to ask about
+#: before they have asked a narrower question.
 LABEL_LIMIT = 4
+
+#: How many it may name once the reader has zoomed in. The constraint on labels was never
+#: "four is the right number" — it was that a name needs room beside its own point, and
+#: zooming is the reader creating that room. So the second tier is generous: the cap is only
+#: there to keep the spec from carrying a thousand text marks that will never be drawn.
+ZOOM_LABEL_LIMIT = 60
+
+#: Share of the x axis the reader has to zoom inside before the second tier appears. Just
+#: over half, so it takes a deliberate zoom rather than an accidental scroll, and so a panel
+#: that opens two clubs' worth of bats is already showing them.
+ZOOM_LABEL_SPAN = 0.55
 
 
 #: Name particles that belong to the surname, and suffixes that are not part of it at all.
@@ -123,26 +199,90 @@ def _short_name(value):
     return " ".join(parts[start:])
 
 
-def _label_layer(data, x_field, y_field, deviation, color_field, scale, limit=LABEL_LIMIT):
-    """Name the `limit` points furthest from the panel's reference, and nothing else.
+def _text_layer(labelled, x_field, y_field, color_field, scale, *, size, weight,
+                opacity=None):
+    """One tier of direct labels.
 
     Labels are coloured on the same scale as their marks rather than given ink of their own.
     Two reasons: it ties the word to the dot without a leader line, and it keeps the rule
     that only *data* colours are ours -- theme ink is Streamlit's to set, and a hard-coded
     label colour is the exact bug that made the legend invisible in dark mode.
     """
-    if data is None or data.empty or "Name" not in data.columns:
-        return None
-    ranked = data.assign(_dev=deviation.abs()).nlargest(min(limit, len(data)), "_dev")
+    encode = dict(x=alt.X(x_field), y=alt.Y(y_field), text=alt.Text("_label:N"))
+    if color_field:
+        encode["color"] = alt.Color(color_field, scale=scale, legend=None)
+    if opacity is not None:
+        encode["opacity"] = opacity
+    return (alt.Chart(labelled)
+            .mark_text(align="left", baseline="middle", dx=11, dy=-9, fontSize=size,
+                       fontWeight=weight)
+            .encode(**encode))
+
+
+def _label_layers(data, x_field, y_field, deviation, color_field=None, scale=alt.Undefined,
+                  limit=LABEL_LIMIT, name_column="Name", team=False):
+    """Name the extremes always, and everyone else once the reader zooms in.
+
+    Two tiers rather than one, because the old cap of four was answering the wrong question.
+    Four is not the number of names a reader wants; it is the number that fits when the whole
+    slate is on screen. Zooming *is* the reader asking for the crowded corner to be readable,
+    so the second tier fades in when the visible x span drops below `ZOOM_LABEL_SPAN` of the
+    axis and fades back out on the double-click that resets it.
+
+    `x_field` arrives as `"Field:Q"`; the predicate needs the bare field name, because that is
+    the key the zoom binding reports its extent under.
+    """
+    if data is None or data.empty or name_column not in data.columns:
+        return []
+    ranked = data.assign(_dev=deviation.abs()).sort_values("_dev", ascending=False)
     ranked = ranked[ranked["_dev"] > 0]
     if ranked.empty:
+        return []
+
+    def labelled(frame):
+        text = frame[name_column].map(_short_name)
+        if team and "Team" in frame.columns:
+            text = text + " " + frame["Team"].astype(str)
+        return frame.assign(_label=text)
+
+    layers = [_text_layer(labelled(ranked.head(min(limit, len(ranked)))), x_field, y_field,
+                          color_field, scale, size=11, weight=600)]
+
+    field = str(x_field).split(":")[0]
+    rest = ranked.iloc[limit:ZOOM_LABEL_LIMIT]
+    span = _axis_span(data, field)
+    if not rest.empty and span:
+        # Lighter than the always-on tier: these are the reader's own follow-up question, and
+        # they should not out-shout the four the panel opened with.
+        condition = {"condition": {"test": scales.zoomed_in(field, span * ZOOM_LABEL_SPAN),
+                                   "value": 0.95}, "value": 0}
+        layers.append(_text_layer(labelled(rest), x_field, y_field, color_field, scale,
+                                  size=10, weight=500, opacity=condition))
+    return layers
+
+
+def _axis_span(data, field):
+    """How wide the x axis is, so "zoomed in" can be a fraction of it rather than a constant.
+
+    The anchored bounds when the page set them -- which is the span the reader actually sees
+    at rest -- and the data's own range otherwise.
+    """
+    pinned = scales.of(data, field)
+    if pinned:
+        return pinned[1] - pinned[0]
+    if field not in getattr(data, "columns", []):
         return None
-    labelled = ranked.assign(_label=ranked["Name"].map(_short_name))
-    return (alt.Chart(labelled)
-            .mark_text(align="left", baseline="middle", dx=11, dy=-9, fontSize=11,
-                       fontWeight=600)
-            .encode(x=alt.X(x_field), y=alt.Y(y_field), text=alt.Text("_label:N"),
-                    color=alt.Color(color_field, scale=scale, legend=None)))
+    values = pd.to_numeric(data[field], errors="coerce").dropna()
+    span = float(values.max() - values.min()) if not values.empty else 0.0
+    return span or None
+
+
+def _over(base, layers):
+    """Stack `layers` on top of `base`, skipping the ones a builder decided against."""
+    for layer in layers:
+        if layer is not None:
+            base = base + layer
+    return base
 
 
 #: The two ways to read a split panel. `context` is the decision view -- the raw split
@@ -170,22 +310,24 @@ def _split_context_scatter(data, value_column, value_title, size_column, size_ti
     rather than its distance from his season line — a deviation answers "is this unusual for
     him", which is a different and later question than "how well does he hit this".
 
-    The reference is the **median of the points drawn**, which is what makes a raw axis
-    readable: without it every dot is an absolute number with nothing to sit against. It
-    moves with the panel and the caption says so, rather than pretending to be a league line.
+    The reference is the **median of the unfiltered reference board** when the page supplied
+    one, which makes a filter comparison readable without moving the rule underneath it. An
+    unanchored chart still uses the points drawn.
 
     Shape is price tier. It costs nothing already spent — colour is the club, size is the
     sample — and it is the one thing a reader needs that the axes do not carry.
     """
-    plotted = salaries.price_tier(data)
-    median = float(plotted[value_column].median())
-    low = float(plotted[value_column].min()) - 0.05
-    high = float(plotted[value_column].max()) + 0.05
-    domain = [max(0.0, low), high]
+    plotted = scales.carry(salaries.price_tier(data), data)
+    median = scales.reference(plotted, value_column)
+    median = float(median if median is not None else plotted[value_column].median())
+    pinned = scales.of(plotted, value_column)
+    domain = (list(pinned) if pinned else
+              [max(0.0, float(plotted[value_column].min()) - 0.05),
+               float(plotted[value_column].max()) + 0.05])
 
     rule = (alt.Chart(pd.DataFrame({"y": [median]}))
             .mark_rule(color=RULE_GREY, strokeDash=[4, 4], strokeWidth=1, opacity=0.7)
-            .encode(y=alt.Y("y:Q", scale=alt.Scale(domain=domain))))
+            .encode(y=alt.Y("y:Q", scale=alt.Scale(domain=domain, clamp=True))))
 
     tiers, shape_scale = _price_scale(plotted["Price"])
     points = (alt.Chart(plotted)
@@ -194,22 +336,21 @@ def _split_context_scatter(data, value_column, value_title, size_column, size_ti
               # long before a circle stops being visible.
               .mark_point(filled=True, opacity=0.85, stroke="#fcfcfb", strokeWidth=1.2)
               .encode(
-                  x=alt.X("Composite:Q", title="Composite matchup score"),
+                  x=alt.X("Composite:Q", title="Composite matchup score",
+                          scale=_qscale(plotted, "Composite")),
                   y=alt.Y(f"{value_column}:Q", title=value_title,
-                          scale=alt.Scale(domain=domain)),
-                  size=alt.Size(f"{size_column}:Q", title=size_title,
-                                scale=alt.Scale(range=[90, 520])),
+                          scale=alt.Scale(domain=domain, clamp=True)),
+                  size=_size_channel(plotted, size_column, (90, 520), size_title)[0],
                   color=alt.Color("Team:N", title="Team",
                                   scale=_team_scale(plotted["Team"])),
                   shape=alt.Shape("Price:N", title="Price", scale=shape_scale,
                                   sort=tiers),
                   tooltip=tooltip + [alt.Tooltip("Salary:Q", title="Salary", format=",.0f")]
                   if "Salary" in plotted.columns else tooltip))
-    labels = _label_layer(plotted, "Composite:Q", f"{value_column}:Q",
-                          plotted[value_column] - median,
-                          "Team:N", _team_scale(plotted["Team"]))
-    layered = rule + points
-    return _styled(layered + labels if labels is not None else layered, height)
+    labels = _label_layers(plotted, "Composite:Q", f"{value_column}:Q",
+                           plotted[value_column] - median,
+                           "Team:N", _team_scale(plotted["Team"]))
+    return _styled(_over(rule + points, labels), height, zoom=True)
 
 
 def platoon_scatter(frame, height=400, view="context"):
@@ -234,30 +375,26 @@ def platoon_scatter(frame, height=400, view="context"):
                 data.dropna(subset=["Composite"]), "Platoon OPS",
                 "OPS vs tonight's hand", "Platoon AB", "Platoon AB", TOOLTIP, height)
 
-    low = float(min(data["Season OPS"].min(), data["Platoon OPS"].min())) - 0.05
-    high = float(max(data["Season OPS"].max(), data["Platoon OPS"].max())) + 0.05
-    domain = [max(0.0, low), high]
+    domain = _same_unit_domain(data, ["Season OPS", "Platoon OPS"], floor=0.0)
 
     parity = (alt.Chart(pd.DataFrame({"x": domain, "y": domain}))
               .mark_line(color=RULE_GREY, strokeDash=[4, 4], strokeWidth=1, opacity=0.7)
-              .encode(x=alt.X("x:Q", scale=alt.Scale(domain=domain)),
-                      y=alt.Y("y:Q", scale=alt.Scale(domain=domain))))
+              .encode(x=alt.X("x:Q", scale=alt.Scale(domain=domain, clamp=True)),
+                      y=alt.Y("y:Q", scale=alt.Scale(domain=domain, clamp=True))))
 
     points = (alt.Chart(data).mark_circle(opacity=0.85, stroke="#fcfcfb", strokeWidth=1.5)
               .encode(
                   x=alt.X("Season OPS:Q", title="Season OPS",
-                          scale=alt.Scale(domain=domain)),
+                          scale=alt.Scale(domain=domain, clamp=True)),
                   y=alt.Y("Platoon OPS:Q", title="OPS vs tonight's hand",
-                          scale=alt.Scale(domain=domain)),
-                  size=alt.Size("Platoon AB:Q", title="Platoon AB",
-                                scale=alt.Scale(range=[40, 520])),
+                          scale=alt.Scale(domain=domain, clamp=True)),
+                  size=_size_channel(data, "Platoon AB", (40, 520), "Platoon AB")[0],
                   color=alt.Color("Team:N", title="Team", scale=_team_scale(data["Team"])),
                   tooltip=TOOLTIP))
-    labels = _label_layer(data, "Season OPS:Q", "Platoon OPS:Q",
-                          data["Platoon OPS"] - data["Season OPS"],
-                          "Team:N", _team_scale(data["Team"]))
-    layered = parity + points
-    return _styled(layered + labels if labels is not None else layered, height)
+    labels = _label_layers(data, "Season OPS:Q", "Platoon OPS:Q",
+                           data["Platoon OPS"] - data["Season OPS"],
+                           "Team:N", _team_scale(data["Team"]))
+    return _styled(_over(parity + points, labels), height, zoom=True)
 
 
 def form_scatter(frame, height=400):
@@ -279,14 +416,16 @@ def form_scatter(frame, height=400):
             .encode(x="x:Q"))
     points = (alt.Chart(data).mark_circle(opacity=0.85, stroke="#fcfcfb", strokeWidth=1.5)
               .encode(
-                  x=alt.X("Composite:Q", title="Composite matchup score"),
-                  y=alt.Y("Off L28:Q", title="Offense index, last 28 days (100 = league)"),
-                  size=alt.Size("Season AB:Q", title="Season AB",
-                                scale=alt.Scale(range=[40, 520])),
+                  x=alt.X("Composite:Q", title="Composite matchup score",
+                          scale=_qscale(data, "Composite")),
+                  y=alt.Y("Off L28:Q", title="Offense index, last 28 days (100 = league)",
+                          scale=_qscale(data, "Off L28")),
+                  size=_size_channel(data, "Season AB", (40, 520), "Season AB")[0],
                   color=alt.Color("Signal:N", title="Signal", scale=_signal_scale(),
                                   sort=SIGNAL_ORDER),
                   tooltip=TOOLTIP))
-    return _styled(rule + zero + points, height)
+    labels = _label_layers(data, "Composite:Q", "Off L28:Q", data["Off L28"] - league)
+    return _styled(_over(rule + zero + points, labels), height, zoom=True)
 
 
 def slate_scatter(frame, height=460):
@@ -301,14 +440,17 @@ def slate_scatter(frame, height=460):
         return None
     points = (alt.Chart(data).mark_circle(opacity=0.75, stroke="#fcfcfb", strokeWidth=1)
               .encode(
-                  x=alt.X("Composite:Q", title="Composite matchup score"),
-                  y=alt.Y("Season OPS:Q", title="Season OPS"),
-                  size=alt.Size("Platoon AB:Q", title="Platoon AB",
-                                scale=alt.Scale(range=[30, 400])),
+                  x=alt.X("Composite:Q", title="Composite matchup score",
+                          scale=_qscale(data, "Composite")),
+                  y=alt.Y("Season OPS:Q", title="Season OPS",
+                          scale=_qscale(data, "Season OPS")),
+                  size=_size_channel(data, "Platoon AB", (30, 400), "Platoon AB")[0],
                   color=alt.Color("Signal:N", title="Signal", scale=_signal_scale(),
                                   sort=SIGNAL_ORDER),
                   tooltip=TOOLTIP + [alt.Tooltip("game:N", title="Game")]))
-    return _styled(points, height)
+    labels = _label_layers(data, "Composite:Q", "Season OPS:Q",
+                           data["Composite"] - data["Composite"].median(), team=True)
+    return _styled(_over(points, labels), height, zoom=True)
 
 
 def arsenal_scatter(frame, height=400, view="context"):
@@ -338,28 +480,24 @@ def arsenal_scatter(frame, height=400, view="context"):
             data.dropna(subset=["Composite"]), "Arsenal OPS",
             "OPS vs this arsenal", "Arsenal AB", "Arsenal AB",
             arsenal_tooltip, height)
-    low = float(min(data["Season OPS"].min(), data["Arsenal OPS"].min())) - 0.05
-    high = float(max(data["Season OPS"].max(), data["Arsenal OPS"].max())) + 0.05
-    domain = [max(0.0, low), high]
+    domain = _same_unit_domain(data, ["Season OPS", "Arsenal OPS"], floor=0.0)
     parity = (alt.Chart(pd.DataFrame({"x": domain, "y": domain}))
               .mark_line(color=RULE_GREY, strokeDash=[4, 4], strokeWidth=1, opacity=0.7)
-              .encode(x=alt.X("x:Q", scale=alt.Scale(domain=domain)),
-                      y=alt.Y("y:Q", scale=alt.Scale(domain=domain))))
+              .encode(x=alt.X("x:Q", scale=alt.Scale(domain=domain, clamp=True)),
+                      y=alt.Y("y:Q", scale=alt.Scale(domain=domain, clamp=True))))
     points = (alt.Chart(data).mark_circle(opacity=0.85, stroke="#fcfcfb", strokeWidth=1.5)
               .encode(
                   x=alt.X("Season OPS:Q", title="Season OPS",
-                          scale=alt.Scale(domain=domain)),
+                          scale=alt.Scale(domain=domain, clamp=True)),
                   y=alt.Y("Arsenal OPS:Q", title="OPS vs this arsenal",
-                          scale=alt.Scale(domain=domain)),
-                  size=alt.Size("Arsenal AB:Q", title="Arsenal AB",
-                                scale=alt.Scale(range=[40, 520])),
+                          scale=alt.Scale(domain=domain, clamp=True)),
+                  size=_size_channel(data, "Arsenal AB", (40, 520), "Arsenal AB")[0],
                   color=alt.Color("Team:N", title="Team", scale=_team_scale(data["Team"])),
                   tooltip=arsenal_tooltip))
-    labels = _label_layer(data, "Season OPS:Q", "Arsenal OPS:Q",
-                          data["Arsenal OPS"] - data["Season OPS"],
-                          "Team:N", _team_scale(data["Team"]))
-    layered = parity + points
-    return _styled(layered + labels if labels is not None else layered, height)
+    labels = _label_layers(data, "Season OPS:Q", "Arsenal OPS:Q",
+                           data["Arsenal OPS"] - data["Season OPS"],
+                           "Team:N", _team_scale(data["Team"]))
+    return _styled(_over(parity + points, labels), height, zoom=True)
 
 
 # ===================================================================================
@@ -413,16 +551,18 @@ def batted_ball_scatter(frame, label="Pitcher", height=380):
                alt.Tooltip("Brl%:Q", title="Barrel%", format=".1f"),
                alt.Tooltip("BIP:Q", title="Balls in play", format=".0f")]
     encode = dict(
-        x=alt.X("GB%:Q", title="Ground-ball rate", scale=alt.Scale(zero=False)),
-        y=alt.Y("FB%:Q", title="Fly-ball rate", scale=alt.Scale(zero=False)),
-        size=alt.Size("BIP:Q", title="Balls in play", scale=alt.Scale(range=[40, 460])),
+        x=alt.X("GB%:Q", title="Ground-ball rate", scale=_qscale(data, "GB%")),
+        y=alt.Y("FB%:Q", title="Fly-ball rate", scale=_qscale(data, "FB%")),
+        size=_size_channel(data, "BIP", (40, 460), "Balls in play")[0],
         tooltip=tooltip)
     if "Status" in data.columns:
         encode["color"] = alt.Color("Status:N", title="Availability",
                                     scale=_avail_scale(), sort=AVAIL_ORDER)
     points = alt.Chart(data).mark_circle(opacity=0.85, stroke="#fcfcfb",
                                          strokeWidth=1.5).encode(**encode)
-    return _styled(_rule(LEAGUE_GB, "x") + _rule(LEAGUE_FB, "y") + points, height)
+    labels = _label_layers(data, "GB%:Q", "FB%:Q", data["FB%"] - LEAGUE_FB)
+    return _styled(_over(_rule(LEAGUE_GB, "x") + _rule(LEAGUE_FB, "y") + points, labels),
+                   height, zoom=True)
 
 
 def bullpen_workload_scatter(frame, height=380):
@@ -458,7 +598,9 @@ def bullpen_workload_scatter(frame, height=380):
                            alt.Tooltip("b2b:N", title="Back-to-back"),
                            alt.Tooltip("Avail:N", title="Report grade"),
                            alt.Tooltip("Status:N", title="Measured grade")]))
-    return _styled(parity + points, height)
+    labels = _label_layers(data, "two_day:Q", "three_day:Q",
+                           data["three_day"] - data["two_day"])
+    return _styled(_over(parity + points, labels), height, zoom=True)
 
 
 def park_defense_scatter(frame, height=420):
@@ -474,12 +616,11 @@ def park_defense_scatter(frame, height=420):
     points = (alt.Chart(data).mark_circle(opacity=0.85, stroke="#fcfcfb", strokeWidth=1.5)
               .encode(
                   x=alt.X("park_runs:Q", title="Park run factor (1.00 = neutral)",
-                          scale=alt.Scale(zero=False)),
+                          scale=_qscale(data, "park_runs")),
                   y=alt.Y("hits_saved:Q",
                           title="Defence behind him: hits saved per game",
-                          scale=alt.Scale(zero=False)),
-                  size=alt.Size("fb_rate:Q", title="Starter FB%",
-                                scale=alt.Scale(range=[40, 460])),
+                          scale=_qscale(data, "hits_saved")),
+                  size=_size_channel(data, "fb_rate", (40, 460), "Starter FB%")[0],
                   tooltip=[alt.Tooltip("pitcher:N", title="Starter"),
                            alt.Tooltip("team:N", title="Pitching for"),
                            alt.Tooltip("game:N", title="Game"),
@@ -488,7 +629,10 @@ def park_defense_scatter(frame, height=420):
                            alt.Tooltip("hits_saved:Q", title="Hits saved/g", format=".2f"),
                            alt.Tooltip("fb_rate:Q", title="FB%", format=".1f"),
                            alt.Tooltip("gb_rate:Q", title="GB%", format=".1f")]))
-    return _styled(_rule(1.0, "x") + _rule(0.0, "y") + points, height)
+    labels = _label_layers(data, "park_runs:Q", "hits_saved:Q", data["hits_saved"],
+                           name_column="pitcher")
+    return _styled(_over(_rule(1.0, "x") + _rule(0.0, "y") + points, labels), height,
+                   zoom=True)
 
 
 def slate_pitcher_scatter(frame, height=440):
@@ -504,10 +648,10 @@ def slate_pitcher_scatter(frame, height=440):
     points = (alt.Chart(data).mark_circle(opacity=0.85, stroke="#fcfcfb", strokeWidth=1.5)
               .encode(
                   x=alt.X("opp_ops:Q", title="OPS of the lineup he faces",
-                          scale=alt.Scale(zero=False)),
+                          scale=_qscale(data, "opp_ops")),
                   y=alt.Y("fip:Q", title="FIP  (better arms higher)",
-                          scale=alt.Scale(zero=False, reverse=True)),
-                  size=alt.Size("k_bb:Q", title="K-BB%", scale=alt.Scale(range=[40, 460])),
+                          scale=_qscale(data, "fip", reverse=True)),
+                  size=_size_channel(data, "k_bb", (40, 460), "K-BB%")[0],
                   tooltip=[alt.Tooltip("pitcher:N", title="Starter"),
                            alt.Tooltip("team:N", title="Team"),
                            alt.Tooltip("game:N", title="Game"),
@@ -515,7 +659,9 @@ def slate_pitcher_scatter(frame, height=440):
                            alt.Tooltip("k_bb:Q", title="K-BB%", format=".1f"),
                            alt.Tooltip("opp_ops:Q", title="Opp OPS", format=".3f"),
                            alt.Tooltip("score:Q", title="Watchlist score", format=".1f")]))
-    return _styled(points, height)
+    labels = _label_layers(data, "opp_ops:Q", "fip:Q", data["fip"] - data["fip"].median(),
+                           name_column="pitcher")
+    return _styled(_over(points, labels), height, zoom=True)
 
 
 # ===================================================================================
@@ -564,7 +710,7 @@ SALARY_TOOLTIP = [
     alt.Tooltip("surplus:Q", title="Surplus", format="+.1f"),
     alt.Tooltip("per_1k:Q", title="Composite per $1k", format=".1f"),
     alt.Tooltip("Signal:N", title="Signal"),
-]
+] + HITTER_OPS_TOOLTIP
 
 
 def salary_scatter(frame, height=440):
@@ -581,17 +727,19 @@ def salary_scatter(frame, height=440):
     points = (alt.Chart(data).mark_circle(opacity=0.85, stroke="#fcfcfb", strokeWidth=1.2)
               .encode(
                   x=alt.X("Salary:Q", title="DraftKings salary",
-                          scale=alt.Scale(zero=False), axis=alt.Axis(format="$,.0f")),
-                  y=alt.Y("Composite:Q", title="Composite matchup score"),
+                          scale=_qscale(data, "Salary"), axis=alt.Axis(format="$,.0f")),
+                  y=alt.Y("Composite:Q", title="Composite matchup score",
+                          scale=_qscale(data, "Composite")),
                   # Signal, not surplus: distance from the par line already *is* the
                   # surplus, so the colour channel is free to carry the report's own call.
                   color=alt.Color("Signal:N", title="Signal", scale=_signal_scale(),
                                   sort=SIGNAL_ORDER),
-                  size=alt.Size("Season AB:Q", title="Season AB",
-                                scale=alt.Scale(range=[40, 420])),
+                  size=_size_channel(data, "Season AB", (40, 420), "Season AB")[0],
                   tooltip=SALARY_TOOLTIP))
+    labels = _label_layers(data, "Salary:Q", "Composite:Q", data["surplus"], team=True)
     curve = band_curve_chart(data)
-    return _styled(points if curve is None else curve + points, height)
+    return _styled(_over(points if curve is None else curve + points, labels), height,
+                   zoom=True)
 
 
 def band_curve_chart(data):
@@ -650,15 +798,20 @@ def price_position_scatter(frame, height=400):
     data = data[data["DK Pos"].notna()]
     if data.empty:
         return None
-    return _styled(
-        alt.Chart(_with_sign(data)).mark_circle(opacity=0.8, stroke="#fcfcfb", strokeWidth=1)
-        .encode(
-            x=alt.X("Salary:Q", title="Salary", scale=alt.Scale(zero=False),
-                    axis=alt.Axis(format="$,.0f")),
-            y=alt.Y("per_1k:Q", title="Composite per $1k"),
-            color=alt.Color("vs par:N", title=None, scale=_sign_scale()),
-            tooltip=SALARY_TOOLTIP + [alt.Tooltip("DK Pos:N", title="Slot")]),
-        height)
+    signed = scales.carry(_with_sign(data), data)
+    points = (alt.Chart(signed)
+              .mark_circle(opacity=0.8, stroke="#fcfcfb", strokeWidth=1)
+              .encode(
+                  x=alt.X("Salary:Q", title="Salary", scale=_qscale(data, "Salary"),
+                          axis=alt.Axis(format="$,.0f")),
+                  y=alt.Y("per_1k:Q", title="Composite per $1k",
+                          scale=_qscale(data, "per_1k")),
+                  color=alt.Color("vs par:N", title=None, scale=_sign_scale()),
+                  tooltip=SALARY_TOOLTIP + [alt.Tooltip("DK Pos:N", title="Slot")]))
+    labels = _label_layers(signed, "Salary:Q", "per_1k:Q",
+                           signed["per_1k"] - signed["per_1k"].median(),
+                           "vs par:N", _sign_scale(), team=True)
+    return _styled(_over(points, labels), height, zoom=True)
 
 
 # ===================================================================================
@@ -719,19 +872,22 @@ def value_scatter_with_history(frame, grid=None, height=460):
     points = (alt.Chart(data).mark_circle(opacity=0.9, stroke="#fcfcfb", strokeWidth=1.4)
               .encode(
                   x=alt.X("Salary:Q", title="DraftKings salary",
-                          scale=alt.Scale(zero=False), axis=alt.Axis(format="$,.0f")),
-                  y=alt.Y("Composite:Q", title="Composite matchup score"),
+                          scale=_qscale(data, "Salary"), axis=alt.Axis(format="$,.0f")),
+                  y=alt.Y("Composite:Q", title="Composite matchup score",
+                          scale=_qscale(data, "Composite")),
                   color=alt.Color("Signal:N", title="Signal", scale=_signal_scale(),
                                   sort=SIGNAL_ORDER),
-                  size=alt.Size("Season AB:Q", title="Season AB",
-                                scale=alt.Scale(range=[40, 400])),
+                  size=_size_channel(data, "Season AB", (40, 400), "Season AB")[0],
                   tooltip=SALARY_TOOLTIP))
+    labels = _label_layers(data, "Salary:Q", "Composite:Q",
+                           data["Composite"] - data["Composite"].median(), team=True)
     if grid is None or getattr(grid, "empty", True):
-        return _styled(points, height)
+        return _styled(_over(points, labels), height, zoom=True)
     # The background carries its own colour legend; two legends for two different meanings
     # is correct here, and the rect layer is drawn first so the dots sit on top of it.
-    return _styled(hit_background(grid, "DraftKings salary",
-                                  "Composite matchup score") + points, height)
+    return _styled(_over(hit_background(grid, "DraftKings salary",
+                                        "Composite matchup score") + points, labels),
+                   height, zoom=True)
 
 
 def lift_bars(table, height=None):
@@ -836,16 +992,17 @@ def outcome_scatter(frame, x, y, x_title, y_title, height=440):
     return _styled(
         alt.Chart(plot).mark_circle(size=46, opacity=0.6)
         .encode(
-            x=alt.X(f"{x}:Q", title=x_title, scale=alt.Scale(zero=False)),
-            y=alt.Y(f"{y}:Q", title=y_title, scale=alt.Scale(zero=False)),
+            x=alt.X(f"{x}:Q", title=x_title, scale=_qscale(data, x)),
+            y=alt.Y(f"{y}:Q", title=y_title, scale=_qscale(data, y)),
             color=alt.Color("Result:N", title="Result",
                             scale=alt.Scale(domain=["Hit", "Miss"],
                                             range=[SIGNAL_COLORS["Priority"], "#9aa0a6"])),
             tooltip=[alt.Tooltip("Name:N"), alt.Tooltip("date:N", title="Date"),
                      alt.Tooltip("Salary:Q", title="Salary", format="$,.0f"),
                      alt.Tooltip("Composite:Q", title="Composite", format=".1f"),
-                     alt.Tooltip("fpts:Q", title="DK points", format=".1f")]),
-        height)
+                     alt.Tooltip("fpts:Q", title="DK points", format=".1f")] +
+                    HITTER_OPS_TOOLTIP),
+        height, zoom=True)
 
 
 #: What a point is sized by. Measured across a slate and against outcomes:
@@ -873,7 +1030,7 @@ SIZE_SCALES = {
 DEFAULT_SIZE = "Proj"
 
 
-def _size_channel(data, column, default_range=(40, 420)):
+def _size_channel(data, column, default_range=(40, 420), title=None):
     """A size encoding for `column`, or a constant when the frame cannot support one.
 
     Zero is excluded from the domain deliberately. Altair maps value to *area* from zero by
@@ -884,10 +1041,11 @@ def _size_channel(data, column, default_range=(40, 420)):
     if column not in data.columns:
         return alt.value(110), None
     values = pd.to_numeric(data[column], errors="coerce").dropna()
-    if values.empty or values.nunique() < 2:
+    anchored = scales.extent(data, column)
+    if values.empty or (values.nunique() < 2 and not anchored):
         return alt.value(110), None
-    low, high = float(values.min()), float(values.max())
-    return (alt.Size(f"{column}:Q", title=SIZE_SCALES.get(column, column),
+    low, high = anchored or (float(values.min()), float(values.max()))
+    return (alt.Size(f"{column}:Q", title=title or SIZE_SCALES.get(column, column),
                      scale=alt.Scale(domain=[low, high], range=list(default_range))),
             column)
 
@@ -912,8 +1070,9 @@ def ceiling_scatter(frame, grid=None, height=470, size_by=DEFAULT_SIZE):
     points = (alt.Chart(plot).mark_circle(opacity=0.82, stroke="#fcfcfb", strokeWidth=1.2)
               .encode(
                   x=alt.X("Salary:Q", title="DraftKings salary",
-                          scale=alt.Scale(zero=False), axis=alt.Axis(format="$,.0f")),
-                  y=alt.Y("Composite:Q", title="Composite matchup score"),
+                          scale=_qscale(plot, "Salary"), axis=alt.Axis(format="$,.0f")),
+                  y=alt.Y("Composite:Q", title="Composite matchup score",
+                          scale=_qscale(plot, "Composite")),
                   size=_size_channel(plot, size_by, (40, 620))[0],
                   color=alt.Color("Signal:N", title="Signal", scale=_signal_scale(),
                                   sort=SIGNAL_ORDER),
@@ -924,9 +1083,12 @@ def ceiling_scatter(frame, grid=None, height=470, size_by=DEFAULT_SIZE):
                            alt.Tooltip("Ceiling:Q", format=".1f"),
                            alt.Tooltip("Floor:Q", format=".1f"),
                            alt.Tooltip("ceiling_per_1k:Q", title="Ceiling per $1k",
-                                       format=".2f")]))
+                                       format=".2f")] + HITTER_OPS_TOOLTIP))
+    labels = _label_layers(plot, "Salary:Q", "Composite:Q",
+                           plot["Composite"] - plot["Composite"].median(), team=True)
     background = hit_background(grid, "DraftKings salary", "Composite matchup score")
-    return _styled(points if background is None else background + points, height)
+    return _styled(_over(points if background is None else background + points, labels),
+                   height, zoom=True)
 
 
 def ceiling_value_scatter(frame, height=440, domain=None):
@@ -945,9 +1107,9 @@ def ceiling_value_scatter(frame, height=440, domain=None):
                                          stroke="#fcfcfb", strokeWidth=1.1)
               .encode(
                   x=alt.X("Salary:Q", title="DraftKings salary",
-                          scale=alt.Scale(zero=False), axis=alt.Axis(format="$,.0f")),
+                          scale=_qscale(data, "Salary"), axis=alt.Axis(format="$,.0f")),
                   y=alt.Y("Ceiling:Q", title="Ceiling (DK points)",
-                          scale=alt.Scale(zero=False)),
+                          scale=_qscale(data, "Ceiling")),
                   color=(_team_color(domain) if domain else
                          alt.Color("Signal:N", title="Signal", scale=_signal_scale(),
                                    sort=SIGNAL_ORDER)),
@@ -957,11 +1119,13 @@ def ceiling_value_scatter(frame, height=440, domain=None):
                   tooltip=[alt.Tooltip("Name:N"), alt.Tooltip("Team:N"),
                            alt.Tooltip("Salary:Q", format="$,.0f"),
                            alt.Tooltip("Ceiling:Q", format=".1f"),
-                           alt.Tooltip("Composite:Q", format=".1f")]))
+                           alt.Tooltip("Composite:Q", format=".1f")] + HITTER_OPS_TOOLTIP))
     trend = (alt.Chart(data).transform_regression("Salary", "Ceiling")
              .mark_line(color=RULE_GREY, strokeDash=[5, 4], strokeWidth=1.5)
              .encode(x="Salary:Q", y="Ceiling:Q"))
-    return _styled(trend + points, height)
+    labels = _label_layers(data, "Salary:Q", "Ceiling:Q",
+                           data["Ceiling"] - data["Ceiling"].median(), team=True)
+    return _styled(_over(trend + points, labels), height, zoom=True)
 
 
 # ===================================================================================
@@ -1003,25 +1167,30 @@ def hr_exposure_scatter(frame, league_fb=25.0, height=470):
     data = _ready(frame, ["FB%", "hr_env", "unit"])
     if data is None:
         return None
+    # A layered chart resolves like-named scales together. If a one-value rule is left on
+    # Altair's default quantitative scale, that scale starts at zero and its union with the
+    # points silently drags a .94-1.20 environment plot down to 0-1.3. Give rules the exact
+    # same domains as the marks so they annotate the plane rather than redefining it.
     neutral_fb = alt.Chart(pd.DataFrame({"x": [league_fb]})).mark_rule(
-        color=RULE_GREY, strokeDash=[4, 4]).encode(x="x:Q")
+        color=RULE_GREY, strokeDash=[4, 4]).encode(
+            x=alt.X("x:Q", scale=_qscale(data, "FB%")))
     neutral_env = alt.Chart(pd.DataFrame({"y": [1.0]})).mark_rule(
-        color=RULE_GREY, strokeDash=[4, 4]).encode(y="y:Q")
+        color=RULE_GREY, strokeDash=[4, 4]).encode(
+            y=alt.Y("y:Q", scale=_qscale(data, "hr_env")))
     points = (alt.Chart(data).mark_point(filled=True, opacity=0.85,
                                          stroke="#fcfcfb", strokeWidth=1.1)
               .encode(
                   x=alt.X("FB%:Q", title="Fly-ball rate allowed (%)",
-                          scale=alt.Scale(zero=False)),
+                          scale=_qscale(data, "FB%")),
                   y=alt.Y("hr_env:Q", title="Home-run environment (park x weather)",
-                          scale=alt.Scale(zero=False)),
+                          scale=_qscale(data, "hr_env")),
                   color=alt.Color("unit:N", title="Unit", scale=_unit_scale()),
                   shape=alt.Shape("impact:N", title="Environment",
                                   scale=alt.Scale(domain=IMPACT_ORDER,
                                                   range=[IMPACT_SHAPES[i]
                                                          for i in IMPACT_ORDER]),
                                   sort=IMPACT_ORDER),
-                  size=alt.Size("BIP:Q", title="Balls in play",
-                                scale=alt.Scale(range=[60, 500])),
+                  size=_size_channel(data, "BIP", (60, 500), "Balls in play")[0],
                   tooltip=[alt.Tooltip("name:N", title="Staff"),
                            alt.Tooltip("team:N", title="Team"),
                            alt.Tooltip("game:N", title="Game"),
@@ -1033,7 +1202,9 @@ def hr_exposure_scatter(frame, league_fb=25.0, height=470):
                            alt.Tooltip("temp:Q", title="Temp F", format=".0f"),
                            alt.Tooltip("wind:N", title="Wind"),
                            alt.Tooltip("hr_leverage:Q", title="Exposure", format="+.1f")]))
-    return _styled(neutral_fb + neutral_env + points, height)
+    labels = _label_layers(data, "FB%:Q", "hr_env:Q", data["FB%"] - league_fb,
+                           name_column="name")
+    return _styled(_over(neutral_fb + neutral_env + points, labels), height, zoom=True)
 
 
 def hr_impact_arrows(frame, top=16, height=None):
@@ -1101,19 +1272,20 @@ def defense_park_scatter(frame, x="GB+LD%", park_column="park_2b", height=460):
         return None
     neutral_at = 1.0 if park_column == "park_hr" else 100.0
     neutral = alt.Chart(pd.DataFrame({"y": [neutral_at]})).mark_rule(
-        color=RULE_GREY, strokeDash=[4, 4]).encode(y="y:Q")
+        color=RULE_GREY, strokeDash=[4, 4]).encode(
+            y=alt.Y("y:Q", scale=_qscale(data, park_column)))
     # Hits saved swings both ways around zero, so the size channel cannot carry it — a
     # negative radius is meaningless. Colour takes the sign; the value stays on hover.
-    plot = data.assign(defence=np.where(
+    plot = scales.carry(data.assign(defence=np.where(
         pd.to_numeric(data.get("hits_saved"), errors="coerce").fillna(0) >= 0,
-        "saves hits", "costs hits"))
+        "saves hits", "costs hits")), data)
     points = (alt.Chart(plot).mark_point(filled=True, size=150, opacity=0.85,
                                          stroke="#fcfcfb", strokeWidth=1.1)
               .encode(
-                  x=alt.X(f"{x}:Q", title=f"{x} allowed", scale=alt.Scale(zero=False)),
+                  x=alt.X(f"{x}:Q", title=f"{x} allowed", scale=_qscale(plot, x)),
                   y=alt.Y(f"{park_column}:Q",
                           title=PARK_AXES.get(park_column, park_column),
-                          scale=alt.Scale(zero=False)),
+                          scale=_qscale(plot, park_column)),
                   color=alt.Color("defence:N", title="Defence behind them",
                                   scale=alt.Scale(domain=["saves hits", "costs hits"],
                                                   range=["#2a78d6", "#c96a1e"])),
@@ -1129,7 +1301,9 @@ def defense_park_scatter(frame, x="GB+LD%", park_column="park_2b", height=460):
                            alt.Tooltip("hits_saved:Q", title="Hits saved/g",
                                        format="+.2f"),
                            alt.Tooltip("defense_grade:N", title="Defence")]))
-    return _styled(neutral + points, height)
+    labels = _label_layers(plot, f"{x}:Q", f"{park_column}:Q",
+                           plot[park_column] - neutral_at, name_column="name")
+    return _styled(_over(neutral + points, labels), height, zoom=True)
 
 
 # ===================================================================================
@@ -1167,23 +1341,21 @@ def arsenal_vs_allowed_scatter(frame, baseline="Arsenal OPS", height=470, teams=
     if data.empty:
         return None
 
-    low = float(min(data[baseline].min(), data["Allowed OPS"].min())) - 0.05
-    high = float(max(data[baseline].max(), data["Allowed OPS"].max())) + 0.05
-    domain = [max(low, 0.0), high]
+    domain = _same_unit_domain(data, [baseline, "Allowed OPS"], floor=0.0)
 
     parity = (alt.Chart(pd.DataFrame({"v": domain}))
               .mark_line(color=RULE_GREY, strokeDash=[5, 4], strokeWidth=1.5)
-              .encode(x=alt.X("v:Q", scale=alt.Scale(domain=domain)),
-                      y=alt.Y("v:Q", scale=alt.Scale(domain=domain))))
+              .encode(x=alt.X("v:Q", scale=alt.Scale(domain=domain, clamp=True)),
+                      y=alt.Y("v:Q", scale=alt.Scale(domain=domain, clamp=True))))
 
     plot = data.assign(sample=np.where(
         data.get("Arsenal AB", pd.Series(0, index=data.index)).fillna(0) >= ARSENAL_AB_SOLID,
         f"{ARSENAL_AB_SOLID}+ AB", f"under {ARSENAL_AB_SOLID} AB"))
     points = (alt.Chart(plot).mark_point(opacity=0.88, strokeWidth=1.6)
               .encode(
-                  x=alt.X("Allowed OPS:Q", scale=alt.Scale(domain=domain),
+                  x=alt.X("Allowed OPS:Q", scale=alt.Scale(domain=domain, clamp=True),
                           title="OPS this arm surrenders to his side"),
-                  y=alt.Y(f"{baseline}:Q", scale=alt.Scale(domain=domain),
+                  y=alt.Y(f"{baseline}:Q", scale=alt.Scale(domain=domain, clamp=True),
                           title=f"His {baseline.replace(' OPS', '').lower()} OPS"),
                   color=(_team_color(teams) if teams else
                          alt.Color("Signal:N", title="Signal", scale=_signal_scale(),
@@ -1193,8 +1365,7 @@ def arsenal_vs_allowed_scatter(frame, baseline="Arsenal OPS", height=470, teams=
                                     domain=[f"{ARSENAL_AB_SOLID}+ AB",
                                             f"under {ARSENAL_AB_SOLID} AB"],
                                     range=["#5b8def", "transparent"])),
-                  size=alt.Size("Arsenal AB:Q", title="AB vs arsenal",
-                                scale=alt.Scale(range=[50, 420])),
+                  size=_size_channel(data, "Arsenal AB", (50, 420), "AB vs arsenal")[0],
                   tooltip=[alt.Tooltip("Name:N"), alt.Tooltip("Team:N"),
                            alt.Tooltip("Bats:N", title="Bats"),
                            alt.Tooltip("Effective Side:N", title="Bats tonight"),
@@ -1204,8 +1375,13 @@ def arsenal_vs_allowed_scatter(frame, baseline="Arsenal OPS", height=470, teams=
                            alt.Tooltip("Allowed OPS:Q", title="Arm allows", format=".3f"),
                            alt.Tooltip("Allowed PA:Q", title="On PA", format=".0f"),
                            alt.Tooltip("Arsenal AB:Q", title="His AB", format=".0f"),
-                           alt.Tooltip("Split Tag:N", title="Arm's split")]))
-    return _styled(parity + points, height)
+                           alt.Tooltip("Split Tag:N", title="Arm's split")] +
+                          HITTER_OPS_TOOLTIP))
+    labels = _label_layers(scales.carry(plot, data), "Allowed OPS:Q", f"{baseline}:Q",
+                           plot[baseline] - plot["Allowed OPS"],
+                           *(("Team:N", alt.Scale(domain=teams, range=team_colors(teams)))
+                             if teams else (None, alt.Undefined)), team=bool(teams))
+    return _styled(_over(parity + points, labels), height, zoom=True)
 
 
 def edge_bars(frame, column="Arsenal Edge", top=20, min_ab=10, height=None,
@@ -1242,7 +1418,8 @@ def edge_bars(frame, column="Arsenal Edge", top=20, min_ab=10, height=None,
                          alt.Tooltip("Arsenal OPS:Q", format=".3f"),
                          alt.Tooltip("Allowed OPS:Q", title="Arm allows", format=".3f"),
                          alt.Tooltip(f"{column}:Q", format="+.3f"),
-                         alt.Tooltip("Arsenal AB:Q", title="His AB", format=".0f")]))
+                         alt.Tooltip("Arsenal AB:Q", title="His AB", format=".0f")] +
+                        HITTER_OPS_TOOLTIP))
     zero = (alt.Chart(pd.DataFrame({"x": [0.0]}))
             .mark_rule(color=RULE_GREY, strokeWidth=1).encode(x="x:Q"))
     return _styled(zero + bars, height)
@@ -1267,8 +1444,10 @@ def basis_scatter(frame, basis="Season OPS", basis_label=None, grid=None, height
     if data is None:
         return None
 
-    mid_x = float(data["Composite"].median())
-    mid_y = float(data[basis].median())
+    ref_x = scales.reference(data, "Composite")
+    ref_y = scales.reference(data, basis)
+    mid_x = float(ref_x if ref_x is not None else data["Composite"].median())
+    mid_y = float(ref_y if ref_y is not None else data[basis].median())
     median_x = (alt.Chart(pd.DataFrame({"x": [mid_x]}))
                 .mark_rule(color=RULE_GREY, strokeDash=[4, 4]).encode(x="x:Q"))
     median_y = (alt.Chart(pd.DataFrame({"y": [mid_y]}))
@@ -1279,7 +1458,7 @@ def basis_scatter(frame, basis="Season OPS", basis_label=None, grid=None, height
                alt.Tooltip("Bats:N", title="Bats"),
                alt.Tooltip("Composite:Q", format=".1f"),
                alt.Tooltip(f"{basis}:Q", title=label, format=".3f"),
-               alt.Tooltip("Signal:N")]
+               alt.Tooltip("Signal:N")] + HITTER_OPS_TOOLTIP
     for extra, fmt in (("Salary", "$,.0f"), ("Ceiling", ".1f"), ("Season AB", ".0f")):
         if extra in data.columns:
             tooltip.append(alt.Tooltip(f"{extra}:Q", title=extra, format=fmt))
@@ -1287,8 +1466,9 @@ def basis_scatter(frame, basis="Season OPS", basis_label=None, grid=None, height
     size, _ = _size_channel(data, size_by if size_by in data.columns else "Season AB")
     points = (alt.Chart(data).mark_circle(opacity=0.85, stroke="#fcfcfb", strokeWidth=1.1)
               .encode(
-                  x=alt.X("Composite:Q", title="Composite matchup score"),
-                  y=alt.Y(f"{basis}:Q", title=label, scale=alt.Scale(zero=False)),
+                  x=alt.X("Composite:Q", title="Composite matchup score",
+                          scale=_qscale(data, "Composite")),
+                  y=alt.Y(f"{basis}:Q", title=label, scale=_qscale(data, basis)),
                   color=alt.Color("Signal:N", title="Signal", scale=_signal_scale(),
                                   sort=SIGNAL_ORDER),
                   size=size, tooltip=tooltip))
@@ -1299,7 +1479,9 @@ def basis_scatter(frame, basis="Season OPS", basis_label=None, grid=None, height
     composed = layers[0]
     for layer in layers[1:]:
         composed = composed + layer
-    return _styled(composed, height)
+    names = _label_layers(data, "Composite:Q", f"{basis}:Q", data["Composite"] - mid_x,
+                          team=True)
+    return _styled(_over(composed, names), height, zoom=True)
 
 
 # ===================================================================================
@@ -1429,14 +1611,14 @@ def team_domain(frame, column="Team"):
     return sorted(str(t) for t in frame[column].dropna().unique())
 
 
-def _team_color(domain):
+def _team_color(domain, legend=alt.Undefined):
     """Each club in its own identity colour, over a fixed domain.
 
     An explicit `range` rather than a scheme, because the point of colouring by team is
     recognition — a club has to keep the colour a reader already associates with it, which
     no generated palette can do.
     """
-    return alt.Color("Team:N", title="Team",
+    return alt.Color("Team:N", title="Team", legend=legend,
                      scale=alt.Scale(domain=domain, range=team_colors(domain)),
                      sort=domain)
 
@@ -1459,7 +1641,7 @@ def team_signal_scatter(frame, x, y, x_title=None, y_title=None, grid=None,
         alt.Tooltip("Name:N"), alt.Tooltip("Team:N"), alt.Tooltip("Signal:N"),
         alt.Tooltip(f"{x}:Q", title=x_title or x, format=",.2f"),
         alt.Tooltip(f"{y}:Q", title=y_title or y, format=",.2f"),
-    ]
+    ] + HITTER_OPS_TOOLTIP
     for extra, fmt in (("Salary", "$,.0f"), ("Proj", ".1f"), ("Ceiling", ".1f"),
                        ("Composite", ".1f"), ("Slot", ".0f")):
         if extra in data.columns and extra not in (x, y):
@@ -1468,17 +1650,23 @@ def team_signal_scatter(frame, x, y, x_title=None, y_title=None, grid=None,
     points = (alt.Chart(data).mark_point(filled=True, opacity=0.85,
                                          stroke="#fcfcfb", strokeWidth=1.1)
               .encode(
-                  x=alt.X(f"{x}:Q", title=x_title or x, scale=alt.Scale(zero=False),
+                  x=alt.X(f"{x}:Q", title=x_title or x, scale=_qscale(data, x),
                           axis=axis),
-                  y=alt.Y(f"{y}:Q", title=y_title or y, scale=alt.Scale(zero=False)),
+                  y=alt.Y(f"{y}:Q", title=y_title or y, scale=_qscale(data, y)),
                   color=_team_color(domain),
                   shape=alt.Shape("Signal:N", title="Signal", scale=_signal_shape_scale(),
                                   sort=SIGNAL_ORDER),
                   size=_size_channel(data, size_by, (50, 480))[0],
                   tooltip=tips))
 
+    # Names carry the club too. This is the panel where colour is admittedly only good for
+    # spotting a cluster, so the thing a zoom has to deliver is the club, not just the bat.
+    labels = _label_layers(data, f"{x}:Q", f"{y}:Q", data[y] - data[y].median(),
+                           "Team:N", alt.Scale(domain=domain, range=team_colors(domain)),
+                           team=True)
     background = hit_background(grid, x_title or x, y_title or y)
-    return _styled(points if background is None else background + points, height)
+    return _styled(_over(points if background is None else background + points, labels),
+                   height, zoom=True)
 
 
 # ===================================================================================
@@ -1526,25 +1714,25 @@ def pitcher_vs_lineup_scatter(frame, view="Overall", height=480):
     if data.empty:
         return None
 
-    low = float(min(data[x].min(), data[y].min())) - 0.04
-    high = float(max(data[x].max(), data[y].max())) + 0.04
-    domain = [max(low, 0.0), high]
+    domain = _same_unit_domain(data, [x, y], floor=0.0)
 
     parity = (alt.Chart(pd.DataFrame({"v": domain}))
               .mark_line(color=RULE_GREY, strokeDash=[5, 4], strokeWidth=1.5)
-              .encode(x=alt.X("v:Q", scale=alt.Scale(domain=domain)),
-                      y=alt.Y("v:Q", scale=alt.Scale(domain=domain))))
+              .encode(x=alt.X("v:Q", scale=alt.Scale(domain=domain, clamp=True)),
+                      y=alt.Y("v:Q", scale=alt.Scale(domain=domain, clamp=True))))
 
     points = (alt.Chart(data).mark_point(filled=True, opacity=0.85,
                                          stroke="#fcfcfb", strokeWidth=1.2)
               .encode(
-                  x=alt.X(f"{x}:Q", title=x_title, scale=alt.Scale(domain=domain)),
-                  y=alt.Y(f"{y}:Q", title=y_title, scale=alt.Scale(domain=domain)),
+                  x=alt.X(f"{x}:Q", title=x_title,
+                          scale=alt.Scale(domain=domain, clamp=True)),
+                  y=alt.Y(f"{y}:Q", title=y_title,
+                          scale=alt.Scale(domain=domain, clamp=True)),
                   color=alt.Color("throws:N", title="Throws",
                                   scale=alt.Scale(domain=list(THROWS_COLORS),
                                                   range=list(THROWS_COLORS.values()))),
-                  size=alt.Size(f"{size_column}:Q", title="Bats it applies to",
-                                scale=alt.Scale(range=[60, 600])),
+                  size=_size_channel(data, size_column, (60, 600),
+                                     "Bats it applies to")[0],
                   tooltip=[alt.Tooltip("pitcher:N", title="Starter"),
                            alt.Tooltip("throws:N", title="Throws"),
                            alt.Tooltip("faces:N", title="Faces"),
@@ -1558,7 +1746,9 @@ def pitcher_vs_lineup_scatter(frame, view="Overall", height=480):
                                        format=".0f"),
                            alt.Tooltip("Allowed PA vs R:Q", title="His PA vs R",
                                        format=".0f")]))
-    return _styled(parity + points, height)
+    labels = _label_layers(data, f"{x}:Q", f"{y}:Q", data[y] - data[x],
+                           name_column="pitcher")
+    return _styled(_over(parity + points, labels), height, zoom=True)
 
 
 def platoon_exposure_bars(frame, height=None):
@@ -1613,17 +1803,38 @@ def platoon_exposure_bars(frame, height=None):
 #
 # **Where a club's primary collides with a division rival's, the secondary is used instead.**
 # MLB primaries are heavily navy and heavily red: eight clubs sit within a few ΔE of navy and
-# six near the same red, and a scatter cannot distinguish them. So the map below is the
-# club's *recognisable* colour rather than strictly its first one — Boston keeps red while
+# six near the same red, and a scatter cannot distinguish them. So `TEAM_IDENTITY` below is
+# the club's *recognisable* colour rather than strictly its first one — Boston keeps red while
 # the Angels take their secondary, the Yankees keep navy while Milwaukee takes gold. Each
 # substitution is a colour the club genuinely wears.
 #
-# This deliberately does not pretend to be a validated categorical palette. Thirty series is
-# far beyond what any palette can separate; the caption on each page says colour is for
-# spotting a *cluster*, and the tooltip names the club.
+# **Substitution was not nearly enough, and `TEAM_COLORS` is what the charts actually use.**
+# Measured in OKLab, the closest pair in the identity map sits 0.006 apart — the Mets and the
+# Giants wear, to a scatter, the same orange — and five more pairs sit under 0.03. At that
+# distance two clubs are not similar, they are indistinguishable, and the panel is lying about
+# having thirty series on it.
+#
+# So the palette below spends **lightness** on separation and spends nothing else. Each club
+# keeps its own hue to within a degree — a red club is red, a navy club is navy, which is all
+# the recognition a colour was ever carrying here — and within each hue family the clubs are
+# spread across a lightness band by the rank their identity colour already had. The Yankees
+# stay the darkest blue; Tampa Bay stays the palest. Chroma is then taken to just under the
+# most sRGB can show at that lightness and hue, because a washed-out mark is a third way to
+# lose a club.
+#
+# That moves the closest pair from 0.006 to 0.057 and the fifth-closest from 0.028 to 0.061 —
+# roughly a ninefold gain on the worst case. The band is 0.42–0.84, chosen so nothing goes
+# black on the dark theme or vanishes into white on the light one.
+#
+# It still does not pretend to be a validated categorical palette, because none exists at this
+# cardinality: thirty series is far beyond what colour separates. What it now delivers is that
+# no two clubs read as *the same*. The caption on each page still says colour is for spotting
+# a cluster, the tooltip still names the club, and zooming in now names it on the chart.
 # ===================================================================================
 
-TEAM_COLORS = {
+#: What each club actually wears — the recognition anchor, and the hue every entry in
+#: `TEAM_COLORS` is derived from. Kept separate so the derivation stays inspectable.
+TEAM_IDENTITY = {
     "ARI": "#A71930",   # Sedona red
     "ATH": "#003831",   # Athletics green
     "ATL": "#CE1141",   # Atlanta red
@@ -1656,9 +1867,46 @@ TEAM_COLORS = {
     "WSH": "#AB0003",   # Nationals red
 }
 
+#: The drawing palette: `TEAM_IDENTITY` with lightness spread within each hue family. See the
+#: block comment above for why, and `tests/test_dashboard_filters.py` for the separation this
+#: is required to hold.
+TEAM_COLORS = {
+    "ARI": "#A30429",   # from #A71930, lightness 0.47 -> 0.45
+    "ATH": "#015A50",   # from #003831, lightness 0.31 -> 0.42
+    "ATL": "#FB0F50",   # from #CE1141, lightness 0.54 -> 0.63
+    "BAL": "#FD6939",   # from #DF4601, lightness 0.61 -> 0.70
+    "BOS": "#EA0D35",   # from #BD3039, lightness 0.53 -> 0.59
+    "CHC": "#5188FD",   # from #0E3386, lightness 0.36 -> 0.65
+    "CIN": "#C70821",   # from #C6011F, lightness 0.52 -> 0.52
+    "CLE": "#077EC6",   # from #00385D, lightness 0.33 -> 0.57
+    "COL": "#5B05BB",   # from #33006F, lightness 0.29 -> 0.42
+    "CWS": "#025F84",   # from #27251F, lightness 0.26 -> 0.46 (hue from their silver)
+    "DET": "#FE7F61",   # from #FA4616, lightness 0.65 -> 0.74
+    "HOU": "#FE955F",   # from #EB6E1F, lightness 0.68 -> 0.77
+    "KC": "#479CFD",    # from #004687, lightness 0.40 -> 0.69
+    "LAA": "#B50621",   # from #BA0021, lightness 0.50 -> 0.49
+    "LAD": "#72B8FE",   # from #005A9C, lightness 0.46 -> 0.76
+    "MIA": "#6BCAFE",   # from #00A3E0, lightness 0.67 -> 0.80
+    "MIL": "#FCC015",   # from #FFC52F, lightness 0.85 -> 0.84
+    "MIN": "#0360BD",   # from #002B5C, lightness 0.29 -> 0.50
+    "NYM": "#FEB7A0",   # from #FF5910, lightness 0.68 -> 0.84
+    "NYY": "#004B97",   # from #0C2340, lightness 0.26 -> 0.42
+    "PHI": "#FD4847",   # from #E81828, lightness 0.59 -> 0.66
+    "PIT": "#B27F08",   # from #FDB827, lightness 0.83 -> 0.63
+    "SD": "#624900",    # from #2F241D, lightness 0.27 -> 0.42 (hue from their gold)
+    "SEA": "#0468D5",   # from #0C2C56, lightness 0.30 -> 0.53
+    "SF": "#FEA68A",    # from #FD5A1E, lightness 0.68 -> 0.81
+    "STL": "#D80A3B",   # from #C41E3A, lightness 0.53 -> 0.56
+    "TB": "#9FD0FE",    # from #8FBCE6, lightness 0.78 -> 0.84
+    "TEX": "#257DFD",   # from #003278, lightness 0.34 -> 0.61
+    "TOR": "#69A8FD",   # from #134A8E, lightness 0.41 -> 0.73
+    "WSH": "#940304",   # from #AB0003, lightness 0.47 -> 0.42
+}
+
 #: Anything the map does not know — an abbreviation that changed, a spring-training club.
 #: Grey rather than a generated hue, so an unmapped club is visibly unmapped instead of
-#: quietly borrowing somebody else's identity.
+#: quietly borrowing somebody else's identity. It is also the one entry with no chroma at
+#: all, which is what keeps "we do not know this club" from reading as a thirty-first club.
 UNKNOWN_TEAM_COLOR = "#9aa0a6"
 
 
@@ -1720,23 +1968,23 @@ def stack_scatter(frame, x="Top5 Salary", y="Top5 Ceiling", size_by="Team Runs",
         tips.append(alt.Tooltip("park:N", title="Park"))
 
     base = alt.Chart(data).encode(
-        x=alt.X(f"{x}:Q", title=STACK_AXES.get(x, x), scale=alt.Scale(zero=False),
+        x=alt.X(f"{x}:Q", title=STACK_AXES.get(x, x), scale=_qscale(data, x),
                 axis=alt.Axis(format="$,.0f") if "Salary" in x else alt.Undefined),
-        y=alt.Y(f"{y}:Q", title=STACK_AXES.get(y, y), scale=alt.Scale(zero=False)),
+        y=alt.Y(f"{y}:Q", title=STACK_AXES.get(y, y), scale=_qscale(data, y)),
         tooltip=tips)
 
     points = base.mark_point(filled=True, opacity=0.9, stroke="#fcfcfb",
                              strokeWidth=1.2).encode(
-        color=_team_color(domain),
+        color=_team_color(domain, legend=None),
         size=_size_channel(data, size_by, (110, 700))[0])
 
     if not labels:
-        return _styled(points, height)
+        return _styled(points, height, zoom=True)
     # Offset so the label sits clear of its own mark rather than on top of it.
     text = base.mark_text(align="left", dx=9, dy=-9, fontSize=11,
                           fontWeight="bold").encode(
-        text="Team:N", color=_team_color(domain))
-    return _styled(points + text, height)
+        text="Team:N", color=_team_color(domain, legend=None))
+    return _styled(points + text, height, zoom=True)
 
 
 def stack_bars(frame, column="Stack Score", top=None, height=None):
@@ -1798,7 +2046,8 @@ def stack_member_bars(frame, height=None):
                      alt.Tooltip("Salary:Q", format="$,.0f"),
                      alt.Tooltip("Proj:Q", format=".2f"),
                      alt.Tooltip("Ceiling:Q", format=".2f"),
-                     alt.Tooltip("PA:Q", title="Expected PA", format=".2f")]),
+                     alt.Tooltip("PA:Q", title="Expected PA", format=".2f")] +
+                    HITTER_OPS_TOOLTIP),
         height)
 
 
@@ -1879,7 +2128,8 @@ def k_lineup_bars(frame, league=22.5, height=340):
     if data is None:
         return None
     ordered = data.sort_values("K%", ascending=False)
-    tooltip = [alt.Tooltip("Name:N", title="Hitter"), alt.Tooltip("K%:Q", format=".1f")]
+    tooltip = ([alt.Tooltip("Name:N", title="Hitter"),
+                alt.Tooltip("K%:Q", format=".1f")] + HITTER_OPS_TOOLTIP)
     for column, title in (("K% vs Hand", "K% vs this hand"), ("K Edge", "K edge"),
                           ("Whiff%", "Whiff%"), ("PA", "PA vs arsenal")):
         if column in ordered.columns:

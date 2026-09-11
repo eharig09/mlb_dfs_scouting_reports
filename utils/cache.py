@@ -7,6 +7,8 @@ from pathlib import Path
 import requests
 from requests.adapters import HTTPAdapter
 
+from artifacts import atomic_write_json, atomic_write_pickle
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CACHE_ROOT = PROJECT_ROOT / ".cache"
@@ -59,8 +61,7 @@ def cached_json_request(url, params=None, namespace="api", force=False, cache_ke
 
     if cache_enabled():
         path = _path(namespace, key, "json", create=True)
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(data, f)
+        atomic_write_json(path, data)
 
     return data
 
@@ -82,7 +83,6 @@ def cached_dataframe_call(namespace, func, *args, force=False, **kwargs):
 
     if cache_enabled():
         path = _path(namespace, key, "pkl", create=True)
-        with path.open("wb") as f:
-            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        atomic_write_pickle(path, data)
 
     return data

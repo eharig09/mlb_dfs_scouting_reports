@@ -52,7 +52,7 @@ CONTEXT_COLUMNS = ["Opp SP Hand", "Allowed OPS", "Lineup OPS", "park", "hr_env",
 
 
 @st.cache_data(max_entries=8, show_spinner="Building stacks…")
-def team_stacks(date, cache_dir=data.CACHE_DIR):
+def _team_stacks(date, cache_dir, fingerprint):
     """One row per club: its top-five unit, its price, and the conditions it plays in.
 
     Everything here is the pipeline's own — the stack definition from `dfs.slate`, the
@@ -77,6 +77,11 @@ def team_stacks(date, cache_dir=data.CACHE_DIR):
     stacks = stacks.merge(_matchup_context(date, cache_dir), on="Team", how="left")
     stacks = stacks.merge(_conditions_context(date, cache_dir), on="Team", how="left")
     return stacks
+
+
+def team_stacks(date, cache_dir=data.CACHE_DIR):
+    """File-aware wrapper around the cached `build_stacks` / `_with_salary` path."""
+    return _team_stacks(str(date), cache_dir, data._fingerprint(cache_dir, date))
 
 
 def _with_salary(projected, date):

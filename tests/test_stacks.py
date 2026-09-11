@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from dashboards import charts, stacks
+from dashboards import charts, scales, stacks
 
 
 def _projected(n_teams=3):
@@ -114,6 +114,7 @@ class TestStackCharts:
         spec = charts.stack_scatter(self._stacks()).to_dict()
         marks = [layer["mark"]["type"] for layer in spec["layer"]]
         assert "text" in marks
+        assert spec["layer"][0]["encoding"]["color"]["legend"] is None
 
     def test_labels_can_be_turned_off_without_breaking_the_chart(self):
         assert charts.stack_scatter(self._stacks(), labels=False).to_dict()
@@ -122,6 +123,20 @@ class TestStackCharts:
         spec = charts.stack_scatter(self._stacks()).to_dict()
         scale = spec["layer"][0]["encoding"]["color"]["scale"]
         assert scale["range"] == [charts.TEAM_COLORS[t] for t in scale["domain"]]
+
+    def test_focus_spends_the_salary_axis_on_real_stack_costs(self):
+        frame = self._stacks()
+        frame.loc[0, "Top5 Salary"] = 0  # missing salary join, not a free stack
+        anchored = scales.anchor(frame, frame, domains=scales.STACK_FOCUS_DOMAINS)
+        spec = charts.stack_scatter(anchored).to_dict()
+        assert spec["layer"][0]["encoding"]["x"]["scale"]["domain"] == [15000.0, 27000.0]
+
+    def test_full_salary_range_ignores_the_missing_price_sentinel(self):
+        frame = self._stacks()
+        frame.loc[0, "Top5 Salary"] = 0
+        anchored = scales.anchor(frame, frame, mode="full",
+                                 domains=scales.STACK_FOCUS_DOMAINS)
+        assert scales.of(anchored, "Top5 Salary")[0] > 0
 
     def test_the_ranked_bars_build_for_each_measure(self):
         for column in ("Stack Score", "Top5 Ceiling", "Stack Value", "Team Runs"):

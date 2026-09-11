@@ -221,20 +221,31 @@ def _relabel_salary_strays(strays, date):
 def template_slate(path, date):
     """Which slate an upload template belongs to, from the clubs it prices.
 
-    Matched against the DK salary exports for the date, which already carry slate labels --
-    so a template and the board built from the same contest end up filed under the same
-    name. A date alone cannot separate an early template from a main one, and filing both
-    as `DKTemplate_<date>` means the second collides with the first and the wrong one is
-    silently kept.
+    A slate already typed into the filename wins, exactly as it does for a salary export:
+    renaming a file is an explicit decision and this only ever resolves guesses. It is
+    honoured only when the night has an export under that label, so a name that resolves to
+    nothing still falls through to the contents.
+
+    Otherwise matched against the DK salary exports for the date, which already carry slate
+    labels -- so a template and the board built from the same contest end up filed under the
+    same name. A date alone cannot separate an early template from a main one, and filing
+    both as `DKTemplate_<date>` means the second collides with the first and the wrong one
+    is silently kept. Contents cannot separate two exports pricing the same games either:
+    when a night's turbo and late block are the same six games, every template matches both
+    and whichever export sorted first would claim the lot.
     """
-    from .naming import UNKNOWN_SLATE, slate_for
+    from .naming import UNKNOWN_SLATE, slate_for, slug_from_template_name
     from .upload import template_teams_for
+
+    exports = list_salary_files(date)
+    named = slug_from_template_name(os.path.basename(path), date)
+    if named and named in set(label_slates(exports, date).values()):
+        return named
 
     priced = template_teams_for(path)
     if not priced:
         return UNKNOWN_SLATE
 
-    exports = list_salary_files(date)
     best, best_overlap = None, 0
     for info in exports:
         teams = set()

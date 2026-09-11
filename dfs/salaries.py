@@ -321,11 +321,28 @@ def slate_date(path):
     return max(set(dates), key=dates.count)
 
 
+def _side(value):
+    """'P' for a pitching slot, 'H' for a hitting one, None when it says nothing."""
+    text = str(value or "").strip().upper()
+    if not text:
+        return None
+    if text in ("P", "H"):
+        return text
+    return "P" if set(re.split(r"[/\s]+", text)) & {"P", "SP", "RP"} else "H"
+
+
 def attach_salaries(projections, salaries):
     """Join salaries onto projections and compute value. Unmatched rows keep a blank salary.
 
     Matching goes name+team, then name, then initial+surname+team -- team is checked first
     because DK slates routinely carry two players with the same common name.
+
+    The bare-name fallback only fires for a player whose team the export actually prices.
+    It exists for abbreviation drift (ATH/OAK) and mid-season trades, not for reaching
+    across the slate boundary: on 2026-08-25 it priced the Dodgers' Max Muncy off the
+    Athletics' Max Muncy, and gave a Cardinals infielder the salary of a Cleveland
+    reliever named Jose Fermin. Both then survived the "DK priced it, so it is playable"
+    filter and put teams on the board that were not in the contest at all.
     """
     frame = projections.copy()
     frame["_key"] = frame["Name"].map(normalize_name)
@@ -343,6 +360,8 @@ def attach_salaries(projections, salaries):
     by_short_team = {(r["_short"], r["DK Team"]): r for _, r in salaries.iterrows()}
     name_counts = salaries["_key"].value_counts()
     by_name = {r["_key"]: r for _, r in salaries.iterrows() if name_counts.get(r["_key"], 0) == 1}
+    # The clubs this export prices: the slate's own definition of who is playable.
+    priced_teams = {t for t in salaries["DK Team"].map(canon_team) if t}
 
     # Collected into lists and assigned as whole columns. Pre-creating the columns with
     # `= None` made them float64, which silently swallowed every string written per-cell
@@ -352,10 +371,14 @@ def attach_salaries(projections, salaries):
         # Explicit None checks: the candidates are pandas rows, and `or` on a Series
         # raises rather than falling through.
         match = by_name_team.get((row["_key"], row["_team"]))
-        if match is None:
+        if match is None and row["_team"] in priced_teams:
             match = by_name.get(row["_key"])
         if match is None:
             match = by_short_team.get((row["_short"], row["_team"]))
+        # A hitter never carries a pitcher's price. Same-name pairs inside one export are
+        # already excluded above; this catches the pair that spans a name and a position.
+        if match is not None and _side(row.get("Type")) not in (None, _side(match["DK Pos"])):
+            match = None
 
         if match is None:
             for column in columns:

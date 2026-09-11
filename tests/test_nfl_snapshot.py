@@ -38,6 +38,98 @@ class TestReadFallsBackQuietly:
     def test_an_empty_frame_is_not_written(self, tmp_path):
         assert snapshot._write(pd.DataFrame(), "receivers", 2025, root=str(tmp_path)) is None
 
+    def test_a_manifest_does_not_serve_an_unlisted_stale_file(self, tmp_path):
+        root = str(tmp_path)
+        snapshot._write(pd.DataFrame({"value": [1]}), "receivers", 2025, root=root)
+        with open(os.path.join(root, snapshot.MANIFEST), "w", encoding="utf-8") as handle:
+            json.dump({"files": []}, handle)
+        assert snapshot.read("receivers", 2025, root=root) is None
+
+    def test_a_checksum_mismatch_is_not_served(self, tmp_path):
+        root = str(tmp_path)
+        path = snapshot._write(pd.DataFrame({"value": [1]}), "receivers", 2025, root=root)
+        name = os.path.basename(path)
+        with open(os.path.join(root, snapshot.MANIFEST), "w", encoding="utf-8") as handle:
+            json.dump({"files": [name], "sha256": {name: "not-the-real-digest"}}, handle)
+        assert snapshot.read("receivers", 2025, root=root) is None
+
+    def test_a_generation_pointer_selects_only_that_release(self, tmp_path):
+        root = str(tmp_path)
+        release = os.path.join(root, snapshot.RELEASES, "generation-2")
+        snapshot._write(pd.DataFrame({"value": [2]}), "receivers", 2025, root=release)
+        with open(os.path.join(release, snapshot.MANIFEST), "w", encoding="utf-8") as handle:
+            json.dump({
+                "format_version": snapshot.FORMAT_VERSION,
+                "generation": "generation-2",
+                "files": ["receivers_2025.parquet"],
+            }, handle)
+        with open(os.path.join(root, snapshot.CURRENT), "w", encoding="utf-8") as handle:
+            json.dump({"generation": "generation-2"}, handle)
+
+        assert snapshot.read("receivers", 2025, root=root)["value"].tolist() == [2]
+
+    def test_a_generation_without_a_valid_manifest_is_not_served(self, tmp_path):
+        root = str(tmp_path)
+        release = os.path.join(root, snapshot.RELEASES, "generation-2")
+        snapshot._write(pd.DataFrame({"value": [2]}), "receivers", 2025, root=release)
+        with open(os.path.join(root, snapshot.CURRENT), "w", encoding="utf-8") as handle:
+            json.dump({"generation": "generation-2"}, handle)
+
+        assert snapshot.read("receivers", 2025, root=root) is None
+
+    def test_a_broken_generation_pointer_does_not_fall_back_to_flat_files(self, tmp_path):
+        root = str(tmp_path)
+        snapshot._write(pd.DataFrame({"value": [1]}), "receivers", 2025, root=root)
+        with open(os.path.join(root, snapshot.CURRENT), "w", encoding="utf-8") as handle:
+            json.dump({"generation": "../legacy"}, handle)
+
+        assert snapshot.read("receivers", 2025, root=root) is None
+
+
+def _stub_snapshot_build(monkeypatch):
+    from dashboards import nfl_league, nfl_pff, nfl_slates
+    from nfl import pffdata
+
+    frame = lambda *args, **kwargs: pd.DataFrame({"value": [1]})
+    catalog = pd.DataFrame([
+        {"family": family, "usable": True, "season": 2025}
+        for family in ("receiving_summary", "rushing_summary", "defense_coverage_scheme",
+                       "slot_coverage", "receiving_scheme", "passing_depth",
+                       "offense_blocking", "fantasy-stats-receiving")
+    ])
+    monkeypatch.setattr(pffdata, "catalog", lambda: catalog)
+    for name in ("receivers", "rushers", "high_value", "target_distribution",
+                 "defense_scheme", "defense_slot", "receiver_scheme", "quarterbacks"):
+        monkeypatch.setattr(nfl_pff, name, frame)
+    monkeypatch.setattr(nfl_pff, "lines", lambda season: (frame(), frame()))
+    for name in ("defense_allowed", "team_offense", "team_results", "team_summary"):
+        monkeypatch.setattr(nfl_league, name, frame)
+    monkeypatch.setattr(nfl_slates, "projections", lambda: (frame(), "test"))
+    return nfl_slates
+
+
+class TestGenerationPublication:
+    def test_a_complete_build_is_published_as_one_generation(self, tmp_path, monkeypatch):
+        _stub_snapshot_build(monkeypatch)
+        state = snapshot.build(seasons=[2025], root=str(tmp_path), report=lambda message: None)
+
+        pointer = json.loads((tmp_path / snapshot.CURRENT).read_text(encoding="utf-8"))
+        assert pointer["generation"] == state["generation"]
+        assert state["format_version"] == snapshot.FORMAT_VERSION
+        assert state["sha256"]
+        assert snapshot.read("receivers", 2025, root=str(tmp_path)) is not None
+
+    def test_a_failed_build_does_not_replace_the_current_generation(self, tmp_path,
+                                                                    monkeypatch):
+        nfl_slates = _stub_snapshot_build(monkeypatch)
+        first = snapshot.build(seasons=[2025], root=str(tmp_path), report=lambda message: None)
+        monkeypatch.setattr(nfl_slates, "projections", lambda: (pd.DataFrame(), "missing"))
+
+        with pytest.raises(snapshot.SnapshotBuildError, match="projections.parquet"):
+            snapshot.build(seasons=[2025], root=str(tmp_path), report=lambda message: None)
+
+        assert snapshot.manifest(str(tmp_path))["generation"] == first["generation"]
+
 
 class TestAvailableSeasons:
     def test_no_snapshot_returns_none_not_empty(self, tmp_path):

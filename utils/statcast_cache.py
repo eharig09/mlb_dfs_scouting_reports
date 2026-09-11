@@ -34,6 +34,8 @@ from datetime import date, datetime, timedelta
 
 import pandas as pd
 
+from artifacts import atomic_write_pickle
+
 # Chunks are stored under their own namespace so the legacy monolithic pickles in
 # .cache/statcast stay readable (and seedable) rather than being shadowed.
 CHUNK_NAMESPACE = "statcast_chunk"
@@ -124,8 +126,7 @@ def _fetch(fetcher, start, end, force=False):
         too_recent = (date.today() - _to_date(end)).days < _EMPTY_CHUNK_MIN_AGE_DAYS
         if not (empty and too_recent):
             path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("wb") as f:
-                pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+            atomic_write_pickle(path, data)
     return data
 
 
@@ -166,14 +167,12 @@ def _rollup_month(fetcher, m_start, m_end):
 
 def _write_chunk(fetcher, start, end, frame):
     """Persist an already-assembled frame under a chunk key (no network)."""
-    import pickle
     import utils.cache as uc
     if not uc.cache_enabled():
         return
     path = _chunk_path(fetcher, start, end)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("wb") as f:
-        pickle.dump(frame, f, protocol=pickle.HIGHEST_PROTOCOL)
+    atomic_write_pickle(path, frame)
 
 
 def load_statcast_range(start_date, end_date, fetcher=None, force=False, verbose=False):

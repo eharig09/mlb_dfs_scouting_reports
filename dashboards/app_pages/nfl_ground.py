@@ -13,7 +13,7 @@ not forecasting. Volume (+0.67 carries, +0.77 targets) is the half that predicts
 
 import streamlit as st
 
-from dashboards import nfl_charts, nfl_pff
+from dashboards import nfl_charts, nfl_pff, scales
 
 st.header("Ground game", anchor=False)
 st.caption("Carries, receiving work, and the red-zone touches that carry the scoring.")
@@ -38,10 +38,14 @@ if frame.empty:
     st.warning("Nothing clears that carry threshold for those seasons.")
     st.stop()
 
+pool = frame
 frame = nfl_pff.scope_sidebar(frame, "nflrun", positions=("RB", "QB", "WR"))
 if frame.empty:
     st.warning("Every player was filtered out.")
     st.stop()
+# Anchored to the whole carry-qualified pool: a position or club filter changes who is drawn,
+# never where they land.
+frame = scales.anchor(frame, pool, mode=scales.selected_mode(st.session_state))
 
 with st.container(horizontal=True):
     st.metric("Backs", len(frame), border=True)

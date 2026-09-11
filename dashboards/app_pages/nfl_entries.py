@@ -64,7 +64,8 @@ if unique < total:
                f"stake, not the number of outcomes you are exposed to.",
                icon=":material/content_copy:")
 
-tabs = st.tabs(["Exposure", "Lineups", "Stacks entered", "Contests"])
+tabs = st.tabs(["Exposure", "Lineups", "Built vs entered", "Stacks entered",
+                "Contests"])
 
 with tabs[0]:
     columns = [c for c in ("Name", "Slots", "Team", "Opp", "DK Pos", "Salary", "Band",
@@ -109,6 +110,72 @@ with tabs[1]:
                    f"spend ${one['Salary'].sum():,.0f} of $50,000")
 
 with tabs[2]:
+    st.markdown("**What the optimizer built against what you actually entered**")
+    st.caption("The two diverge constantly and only one of them is at risk. This reads "
+               "`nfl_boards/<date>/lineups_<slate>.csv` — the generated set — and compares "
+               "it with the entries file above.")
+
+    from dashboards import nfl_boards
+
+    dates = nfl_boards.list_dates()
+    if not dates:
+        st.info("Nothing in `nfl_boards/` yet — run `nfl.optimize` to generate a set.")
+    else:
+        with st.container(horizontal=True):
+            built_date = st.selectbox("Date", dates, key="nflent_bdate",
+                                      persist_state="session")
+            built_slates = nfl_boards.list_slates(built_date)
+            built_slate = st.selectbox("Slate", built_slates, key="nflent_bslate",
+                                       persist_state="session") if built_slates else None
+        built = nfl_boards.read("lineups", built_date, built_slate) if built_slate else None
+        if built is None or built.empty:
+            st.warning("No generated lineups for that date and slate.")
+        else:
+            summary = nfl_boards.lineup_summary(built)
+            with st.container(horizontal=True):
+                st.metric("Built", len(summary), border=True)
+                st.metric("Entered", total, border=True)
+                st.metric("Distinct entered", unique, border=True)
+
+            built_players = set(built["Name"].dropna())
+            entered_players = set(entries["Name"].dropna())
+            both = built_players & entered_players
+            st.markdown(f"**{len(both)} players appear in both**, "
+                        f"{len(entered_players - built_players)} were entered but never "
+                        f"built, {len(built_players - entered_players)} were built but "
+                        f"never entered.")
+
+            only_entered = sorted(entered_players - built_players)
+            if only_entered:
+                st.info("Entered without the optimizer ever proposing them: "
+                        + ", ".join(only_entered[:12])
+                        + (" …" if len(only_entered) > 12 else ""),
+                        icon=":material/person_add:")
+
+            # Exposure side by side: the number that says whether the set you entered is
+            # the set you designed.
+            built_exposure = (built.groupby("Name")["Lineup"].nunique()
+                              / max(built["Lineup"].nunique(), 1) * 100)
+            side = exposure[["Name", "Exposure%"]].rename(
+                columns={"Exposure%": "Entered%"}).copy()
+            side["Built%"] = side["Name"].map(built_exposure)
+            side["Gap"] = side["Entered%"] - side["Built%"].fillna(0)
+            st.markdown("**Exposure gap** — entered minus built")
+            st.dataframe(
+                nfl_charts.round_display(side.sort_values("Gap", ascending=False)),
+                hide_index=True, width="stretch",
+                column_config={
+                    "Entered%": st.column_config.ProgressColumn(
+                        "Entered%", min_value=0, max_value=100, format="%.0f%%"),
+                    "Built%": st.column_config.ProgressColumn(
+                        "Built%", min_value=0, max_value=100, format="%.0f%%"),
+                })
+
+            st.markdown("**The generated set**")
+            st.dataframe(nfl_charts.round_display(summary), hide_index=True,
+                         width="stretch")
+
+with tabs[3]:
     if players is None:
         st.info("Pick a slate in the sidebar to resolve clubs and see the stacks entered.")
     else:
@@ -131,7 +198,7 @@ with tabs[2]:
             st.caption("A running back never counts toward his own club's stack: a rushing "
                        "touchdown is a drive that did not end in a passing touchdown.")
 
-with tabs[3]:
+with tabs[4]:
     by_contest = (entries.groupby("Contest", as_index=False)
                   .agg(Entries=("Entry", "nunique"),
                        Fee=("Entry fee", lambda s: s.iloc[0] if len(s) else "")))

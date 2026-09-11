@@ -535,3 +535,30 @@ after splitting on `-`, so `"5-3,5-2"` was accepted and quietly reinterpreted as
 Shape diversity is a generation-side concern. The portfolio's `stack_coverage` weight and
 `max_stack_exposure` both key on `primary_stack` — the team — and only *report*
 `distinct_stack_shapes`. Nothing downstream will recover a shape the pool never contained.
+
+## 9. Artifact publication
+
+Shared file writes now go through `artifacts`, which writes beside the destination and uses
+an atomic replace. API caches, Statcast chunks, report-data caches, calibrated slate caches,
+and NFL snapshot Parquet files therefore never expose a partially written replacement to a
+dashboard process.
+
+NFL snapshots add a generation boundary:
+
+```text
+nfl/snapshot/
+  current.json                    # the only live pointer
+  releases/<generation>/
+    manifest.json                 # version, inventory, rows, checksums, build issues
+    *.parquet
+```
+
+The builder stages and reads back every output, refuses publication when a required frame is
+missing, records SHA-256 checksums, and replaces `current.json` only after validation. A
+reader therefore sees either the complete prior generation or the complete next generation.
+Malformed pointers, manifests, unlisted files, and checksum mismatches fail closed so the
+page can use its existing live-data fallback.
+
+The committed flat layout remains readable when `current.json` is absent. The next explicit
+`python -m nfl.snapshot --build` opts the checkout into format version 2; deployment must
+include `current.json` and its referenced `releases/<generation>/` directory together.

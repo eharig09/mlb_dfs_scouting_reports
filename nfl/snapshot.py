@@ -31,13 +31,26 @@ want to be able to drop in and see immediately without a rebuild.
 import argparse
 import json
 import os
+import re
+import shutil
 import sys
+import uuid
 from datetime import datetime, timezone
 
 import pandas as pd
 
+from artifacts import atomic_write_json, atomic_write_parquet, file_sha256
+
 SNAPSHOT_DIR = os.path.join("nfl", "snapshot")
 MANIFEST = "manifest.json"
+CURRENT = "current.json"
+RELEASES = "releases"
+FORMAT_VERSION = 2
+_GENERATION_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+class SnapshotBuildError(RuntimeError):
+    pass
 
 # Frames the dashboard reads, and how to build each one. Keyed by the name the reader asks
 # for; the builder is resolved lazily so importing this module never pulls in the world.
@@ -64,9 +77,41 @@ def available_seasons(family, root=SNAPSHOT_DIR):
     return state.get("families", {}).get(family, [])
 
 
-def path_for(name, season=None, root=SNAPSHOT_DIR):
+def _active_root(root):
+    """Resolved published generation, or the root for a legacy flat snapshot.
+
+    An invalid pointer returns ``None`` instead of falling back to old flat files. Once a
+    publisher has opted into generations, silently serving a previous layout would hide a
+    broken deployment.
+    """
+    pointer_path = os.path.join(root, CURRENT)
+    if not os.path.exists(pointer_path):
+        return root
+    try:
+        with open(pointer_path, "r", encoding="utf-8") as handle:
+            pointer = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(pointer, dict):
+        return None
+    generation = str(pointer.get("generation") or "")
+    if not _GENERATION_RE.fullmatch(generation):
+        return None
+    candidate = os.path.abspath(os.path.join(root, RELEASES, generation))
+    releases = os.path.abspath(os.path.join(root, RELEASES))
+    if os.path.commonpath([candidate, releases]) != releases or not os.path.isdir(candidate):
+        return None
+    return candidate
+
+
+def _path_for_root(name, season, root):
     stem = f"{name}_{season}" if season is not None else name
     return os.path.join(root, f"{stem}.parquet")
+
+
+def path_for(name, season=None, root=SNAPSHOT_DIR):
+    base = _active_root(root)
+    return _path_for_root(name, season, base or root)
 
 
 def read(name, season=None, root=SNAPSHOT_DIR):
@@ -76,12 +121,29 @@ def read(name, season=None, root=SNAPSHOT_DIR):
     the frame live, so a missing snapshot degrades to "slower locally" instead of "broken in
     production". The manifest is where you find out the snapshot is stale.
     """
-    path = path_for(name, season, root)
+    base = _active_root(root)
+    if base is None:
+        return None
+    state = manifest(root)
+    generated = os.path.exists(os.path.join(root, CURRENT))
+    if generated and not state:
+        return None
+    path = _path_for_root(name, season, base)
     if not os.path.exists(path):
         return None
+    relative = os.path.relpath(path, base).replace("\\", "/")
+    listed = state.get("files") if state else None
+    if listed is not None and not isinstance(listed, list):
+        return None
+    if listed is not None and relative not in listed:
+        return None
+    digests = state.get("sha256") if state else None
+    expected = digests.get(relative) if isinstance(digests, dict) else None
     try:
+        if expected and file_sha256(path) != expected:
+            return None
         return pd.read_parquet(path)
-    except Exception:
+    except (OSError, ValueError, TypeError):
         return None
 
 
@@ -93,16 +155,33 @@ def _write(frame, name, season=None, root=SNAPSHOT_DIR):
     # Column names come from the pages and carry spaces, percent signs and slashes.
     # Parquet is fine with all of them; the index is not, so it is dropped rather than
     # written as a column nobody reads back.
-    frame.reset_index(drop=True).to_parquet(path, index=False)
+    atomic_write_parquet(path, frame.reset_index(drop=True), index=False)
     return path
 
 
 def manifest(root=SNAPSHOT_DIR):
-    path = os.path.join(root, MANIFEST)
+    base = _active_root(root)
+    if base is None:
+        return {}
+    path = os.path.join(base, MANIFEST)
     if not os.path.exists(path):
         return {}
-    with open(path, "r", encoding="utf-8") as handle:
-        return json.load(handle)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            state = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(state, dict):
+        return {}
+    if os.path.exists(os.path.join(root, CURRENT)):
+        generation = os.path.basename(base)
+        if (
+            state.get("format_version") != FORMAT_VERSION
+            or state.get("generation") != generation
+            or not isinstance(state.get("files"), list)
+        ):
+            return {}
+    return state
 
 
 def build(seasons=None, line_season=None, root=SNAPSHOT_DIR, report=print):
@@ -127,7 +206,12 @@ def build(seasons=None, line_season=None, root=SNAPSHOT_DIR, report=print):
     if not seasons:
         raise SystemExit("no PFF exports found — nothing to snapshot")
 
-    written, rows = [], {}
+    generation = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") \
+        + f"-{uuid.uuid4().hex[:8]}"
+    release_root = os.path.join(root, RELEASES, generation)
+    os.makedirs(release_root, exist_ok=False)
+
+    written, rows, issues = [], {}, []
     # **Which seasons exist per family has to be recorded, not rediscovered.** The pages ask
     # `available_seasons()`, which reads `pffdata.catalog()` -- and on a host with no raw
     # exports the catalog tries to re-fingerprint, which needs nflverse rosters, which needs
@@ -142,9 +226,9 @@ def build(seasons=None, line_season=None, root=SNAPSHOT_DIR, report=print):
             families[family] = []
 
     def keep(frame, name, season=None):
-        path = _write(frame, name, season, root)
+        path = _write(frame, name, season, release_root)
         if path:
-            written.append(os.path.relpath(path, root))
+            written.append(os.path.relpath(path, release_root).replace("\\", "/"))
             rows[os.path.basename(path)] = int(len(frame))
 
     # **Every builder is guarded, not just some of them.** The PFF families cover different
@@ -167,6 +251,8 @@ def build(seasons=None, line_season=None, root=SNAPSHOT_DIR, report=print):
             try:
                 keep(builder(season), name, season)
             except Exception as error:
+                issues.append({"frame": name, "season": season,
+                               "error": f"{error.__class__.__name__}: {error}"})
                 report(f"    [skip] {name} {season}: "
                        f"{error.__class__.__name__}: {str(error)[:70]}")
 
@@ -178,6 +264,8 @@ def build(seasons=None, line_season=None, root=SNAPSHOT_DIR, report=print):
         keep(nfl_league.team_results(league_seasons), "team_results")
         keep(nfl_league.team_summary(league_seasons), "team_summary")
     except Exception as error:
+        issues.append({"frame": "league", "season": None,
+                       "error": f"{error.__class__.__name__}: {error}"})
         report(f"    [skip] league frames: {error}")
 
     report("  projections...")
@@ -186,6 +274,8 @@ def build(seasons=None, line_season=None, root=SNAPSHOT_DIR, report=print):
         projected, source = nfl_slates.projections()
         keep(projected, "projections")
     except Exception as error:
+        issues.append({"frame": "projections", "season": None,
+                       "error": f"{error.__class__.__name__}: {error}"})
         report(f"    [skip] projections: {error.__class__.__name__}")
 
     line_season = int(line_season or max(seasons) + 1)
@@ -195,9 +285,47 @@ def build(seasons=None, line_season=None, root=SNAPSHOT_DIR, report=print):
         keep(players, "line_players")
         keep(units, "line_units")
     except Exception as error:
+        issues.append({"frame": "offensive_lines", "season": line_season,
+                       "error": f"{error.__class__.__name__}: {error}"})
         report(f"    [skip] lines {line_season}: {error}")
 
+    newest = max(seasons)
+    required = {
+        f"receivers_{newest}.parquet",
+        f"target_distribution_{newest}.parquet",
+        f"defense_scheme_{newest}.parquet",
+        "defense_allowed.parquet",
+        "team_summary.parquet",
+        "projections.parquet",
+    }
+    missing = sorted(required - set(written))
+    if missing:
+        shutil.rmtree(release_root, ignore_errors=True)
+        raise SnapshotBuildError(
+            "snapshot was not published; required frames are missing: " + ", ".join(missing)
+        )
+
+    # Reading every output before publication catches truncated files, writer/schema errors,
+    # and dependencies that emitted something other than a frame. The live pointer remains
+    # untouched until all validation succeeds.
+    for relative in written:
+        path = os.path.join(release_root, relative)
+        try:
+            pd.read_parquet(path)
+        except Exception as error:
+            shutil.rmtree(release_root, ignore_errors=True)
+            raise SnapshotBuildError(
+                f"snapshot was not published; {relative} failed validation: {error}"
+            ) from error
+
+    checksums = {
+        relative: file_sha256(os.path.join(release_root, relative))
+        for relative in written
+    }
+
     written_manifest = {
+        "format_version": FORMAT_VERSION,
+        "generation": generation,
         "built": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "seasons": seasons,
         "families": families,
@@ -205,11 +333,16 @@ def build(seasons=None, line_season=None, root=SNAPSHOT_DIR, report=print):
         "line_season": line_season,
         "files": sorted(written),
         "rows": rows,
+        "sha256": checksums,
+        "issues": issues,
         "pandas": pd.__version__,
     }
-    os.makedirs(root, exist_ok=True)
-    with open(os.path.join(root, MANIFEST), "w", encoding="utf-8") as handle:
-        json.dump(written_manifest, handle, indent=1, sort_keys=True)
+    atomic_write_json(os.path.join(release_root, MANIFEST), written_manifest,
+                      indent=1, sort_keys=True)
+    # This small same-directory replace is the publication transaction. Every reader sees
+    # either the complete previous generation or the complete new one.
+    atomic_write_json(os.path.join(root, CURRENT), {"generation": generation},
+                      indent=1, sort_keys=True)
     return written_manifest
 
 
@@ -219,9 +352,10 @@ def describe(root=SNAPSHOT_DIR):
     if not state:
         return {"present": False, "files": 0, "built": None, "age_days": None,
                 "bytes": 0, "seasons": []}
+    base = _active_root(root)
     total = 0
     for name in state.get("files", []):
-        path = os.path.join(root, name)
+        path = os.path.join(base, name)
         if os.path.exists(path):
             total += os.path.getsize(path)
     age = None

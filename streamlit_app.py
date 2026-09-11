@@ -20,8 +20,18 @@ import streamlit as st
 # directory streamlit was launched from.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from dashboards import scales  # noqa: E402 - project root is inserted immediately above
+
 st.set_page_config(page_title="Scouting dashboard", page_icon=":material/query_stats:",
                    layout="wide")
+
+with st.sidebar:
+    st.segmented_control(
+        "Axis range", ["Focus", "Full"], default="Focus", key=scales.SESSION_KEY,
+        help="Focus uses stable comparison windows and keeps extremes on the boundary. "
+             "Full expands to every value on the unfiltered board.",
+        persist_state="session",
+    )
 
 mlb_pages = [
     st.Page("dashboards/app_pages/matchup.py", title="Matchup",
@@ -73,4 +83,13 @@ nfl_pages = [
             icon=":material/grid_view:"),
 ]
 
-st.navigation({"MLB": mlb_pages, "NFL": nfl_pages}).run()
+# The report explorer covers both sports, so it sits outside either section. An empty key
+# puts it above the grouped pages, which is where a "start here" page belongs.
+shared_pages = [
+    st.Page("dashboards/app_pages/reports.py", title="Reports",
+            icon=":material/description:"),
+    st.Page("dashboards/app_pages/changes.py", title="Changes",
+            icon=":material/difference:"),
+]
+
+st.navigation({"": shared_pages, "MLB": mlb_pages, "NFL": nfl_pages}).run()

@@ -3714,6 +3714,8 @@ def _report_data_cache_path(date, away_team, home_team, dh_game=None):
 
 def save_report_data_cache(date, away_team, home_team, report_args, advanced_context,
                            dh_game=None):
+    from artifacts import atomic_write_pickle
+
     os.makedirs(REPORT_DATA_CACHE_DIR, exist_ok=True)
     path = _report_data_cache_path(date, away_team, home_team, dh_game)
     try:
@@ -3723,12 +3725,11 @@ def save_report_data_cache(date, away_team, home_team, report_args, advanced_con
             "feature_version": summary.get("Calibration Feature Version"),
             "created_at": summary.get("Calibration Created At"),
         }
-        with open(path, "wb") as f:
-            pickle.dump({
-                "report_args": report_args,
-                "advanced_context": advanced_context,
-                "model_calibration": calibration,
-            }, f)
+        atomic_write_pickle(path, {
+            "report_args": report_args,
+            "advanced_context": advanced_context,
+            "model_calibration": calibration,
+        })
     except Exception as e:
         print(f"⚠️ Could not cache report data: {e}")
     return path
@@ -3862,6 +3863,10 @@ def refresh_cached_lineups(payload, date, away_team, home_team, dh_game=None, fo
         home_team, away_pitcher, splits_source, game_date=date)
     away_hotcold, away_lineup, away_splits = generate_team_hitter_report(
         away_team, home_pitcher, splits_source, game_date=date)
+    # The workbook's hot/cold panel is 14 days, while the dashboard's form metric is
+    # explicitly 28. Keep the two windows separate when a cached lineup is refreshed.
+    home_hotcold28 = generate_hot_cold_hitters(home_team, days=28, end_date=arsenal_end)
+    away_hotcold28 = generate_hot_cold_hitters(away_team, days=28, end_date=arsenal_end)
 
     args[0], args[3], args[25] = home_lineup, home_hotcold, home_splits
     args[7], args[10], args[26] = away_lineup, away_hotcold, away_splits
@@ -3878,7 +3883,7 @@ def refresh_cached_lineups(payload, date, away_team, home_team, dh_game=None, fo
     ], ignore_index=True)
     context["hitter_composite"] = attach_offense_index(
         composite, [away_lineup, home_lineup], league_context,
-        [away_hotcold, home_hotcold],
+        [away_hotcold28, home_hotcold28],
     )
     context["hitter_summary"] = summarize_hitter_composite(context["hitter_composite"])
 
@@ -9147,7 +9152,7 @@ def attach_offense_index(hitter_composite, lineup_frames, league_batter_context,
             for _, r in frame.iterrows():
                 l28[str(r.get("Name"))] = (r.get("OPS"), r.get("xwOBA"))
 
-    szn_vals, l28_vals = [], []
+    szn_vals, l28_vals, l28_ops_vals = [], [], []
     for _, row in hitter_composite.iterrows():
         name = str(row.get("Name"))
         bid = name_to_id.get(name)
@@ -9157,14 +9162,20 @@ def attach_offense_index(hitter_composite, lineup_frames, league_batter_context,
             szn = compute_offense_index(crow.get("OPS_proxy"), crow.get("xwOBA"), lg_ops, lg_xw)
         szn_vals.append(szn)
         l28_val = ""
+        l28_ops = ""
         if name in l28:
             ops_l, xw_l = l28[name]
+            l28_ops = _safe_number(ops_l, "")
             l28_val = compute_offense_index(ops_l, xw_l, lg_ops, lg_xw)
         l28_vals.append(l28_val)
+        l28_ops_vals.append(l28_ops)
 
     out = hitter_composite.copy()
     out["Off Szn"] = szn_vals
     out["Off L28"] = l28_vals
+    # Keep the familiar league-relative form index, but also carry the raw rate a reader
+    # expects beside the season/platoon/arsenal OPS lines in dashboard tooltips.
+    out["L28 OPS"] = l28_ops_vals
     return out
 
 
@@ -14968,6 +14979,37 @@ def get_available_games(date):
     return games
 
 
+_STARTED_GAME_STATUSES = {
+    "final",
+    "game over",
+    "in progress",
+    "completed early",
+    "postponed",
+    "suspended",
+    "cancelled",
+}
+
+
+def _game_status(game):
+    """Return a normalized MLB schedule status from either StatsAPI response shape."""
+    status = game.get("status", "")
+    if isinstance(status, dict):
+        status = status.get("detailedState") or status.get("abstractGameState") or ""
+    return str(status).strip().casefold()
+
+
+def _upcoming_games(games):
+    """Keep games whose schedule status says they have not started."""
+    return [game for game in games if _game_status(game) not in _STARTED_GAME_STATUSES]
+
+
+def _scheduled_game_key(game):
+    """Identity shared by live schedule rows and report-cache filenames."""
+    away = get_team_abbreviation(game.get("away_team", "")) or game.get("away_team", "")
+    home = get_team_abbreviation(game.get("home_team", "")) or game.get("home_team", "")
+    return str(away).upper(), str(home).upper(), int(game.get("game_num") or 1)
+
+
 def _extract_boxscore_lineup(box, side):
     players = box.get(side, {}).get("players", {}) if isinstance(box, dict) else {}
     lineup = []
@@ -16799,9 +16841,8 @@ def generate_all_scouting_reports_for_date(
         return []
 
     if upcoming_only:
-        started = {"Final", "Game Over", "In Progress", "Completed Early", "Postponed", "Suspended", "Cancelled"}
         before = len(games)
-        games = [g for g in games if str(g.get("status", "")).strip() not in started]
+        games = _upcoming_games(games)
         print(f"--upcoming-only: {len(games)} of {before} games have not started yet.")
         if not games:
             print(f"No upcoming (not-yet-started) games remain for {date}.")
@@ -17218,16 +17259,28 @@ def main():
         if args.format == "both":
             formats = ("pdf", "xlsx")
         if args.all_games:
-            games = [
-                (a, h) for _, a, h in
-                __import__("dfs.slate", fromlist=["cached_games"]).cached_games(args.date)
-            ]
+            slate_module = __import__("dfs.slate", fromlist=["cached_games", "game_number"])
+            cached = slate_module.cached_games(args.date)
+            games = [(a, h, slate_module.game_number(path)) for path, a, h in cached]
+            if args.upcoming_only:
+                schedule = get_available_games(args.date)
+                upcoming_keys = {_scheduled_game_key(game) for game in _upcoming_games(schedule)}
+                before = len(games)
+                games = [
+                    (away, home, dh_game)
+                    for away, home, dh_game in games
+                    if (str(away).upper(), str(home).upper(), int(dh_game or 1))
+                    in upcoming_keys
+                ]
+                print(f"--upcoming-only: {len(games)} of {before} cached games have not started yet.")
+                if not games:
+                    print(f"No upcoming (not-yet-started) cached games remain for {args.date}.")
         elif args.away_team and args.home_team:
-            games = [(args.away_team, args.home_team)]
+            games = [(args.away_team, args.home_team, args.dh_game)]
         else:
             raise SystemExit("--from-cache needs --away-team/--home-team or --all-games.")
         blocked = []
-        for away, home in games:
+        for away, home, dh_game in games:
             try:
                 for path in render_report_from_cache(
                     args.date, away, home,
@@ -17235,6 +17288,7 @@ def main():
                     formats=formats, dfs_highlight=not args.no_dfs_highlight,
                     fast=args.fast, refresh_lineups=args.refresh_lineups,
                     force_lineup_refresh=args.force_lineup_refresh,
+                    dh_game=dh_game,
                     dfs_slate=args.dfs_slate,
                 ):
                     print(f"  -> {path}")

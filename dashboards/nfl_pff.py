@@ -325,6 +325,11 @@ def scheme_matchup(season, slate_path=None, min_routes=50):
 DEPTH_BUCKETS = ("behind_los", "short", "medium", "deep")
 DEPTH_LABELS = {"behind_los": "Behind LOS", "short": "Short", "medium": "Medium",
                 "deep": "Deep"}
+# **Charts must order these by field depth, not by name.** Vega sorts a categorical channel
+# alphabetically unless told otherwise, which reads Behind LOS, Deep, Medium, Short -- deep
+# balls stacked between screens and intermediate throws. A `sort=` on the colour scale fixes
+# the legend and leaves the stacking order alone, so a numeric rank travels with the data.
+DEPTH_RANK = {label: i for i, label in enumerate(DEPTH_LABELS[b] for b in DEPTH_BUCKETS)}
 
 
 @st.cache_data(ttl="1h", max_entries=8, show_spinner="Reading QB depth profiles…")
@@ -392,9 +397,80 @@ def quarterback_depth_long(frame):
         label = DEPTH_LABELS[bucket]
         part = pd.DataFrame({
             "Name": frame["Name"], "Team": frame["Team"], "Depth": label,
+            "Depth rank": DEPTH_RANK[label],
             "Att%": frame[f"{label} att%"], "Attempts": frame[f"{label} att"],
             "YPA": frame[f"{label} YPA"], "Grade": frame[f"{label} grade"],
             "Comp%": frame[f"{label} comp%"], "TD": frame[f"{label} TD"],
         })
         rows.append(part)
     return pd.concat(rows, ignore_index=True)
+
+
+@st.cache_data(ttl="1h", max_entries=8, show_spinner="Reading slot splits…")
+def receiver_slot(season, min_routes=40):
+    """Per-receiver slot and screen splits, from the `receiving_concept` export.
+
+    Ninety exports arrived and this family was the last one still unread. It carries the
+    offensive half of the slot question -- how much of a receiver's work comes from inside,
+    and what he does there -- which until now only existed as `slot_rate` on the summary,
+    a deployment number with no production attached to it.
+
+    `Slot share` is a share of *routes*, not of snaps: a receiver who lines up inside on
+    third down and outside on first is a slot receiver for the plays that matter, and the
+    snap count flattens that.
+    """
+    frame = pffdata.load("receiving_concept", int(season))
+    number = lambda c: pd.to_numeric(frame.reindex(columns=[c])[c], errors="coerce")
+
+    slot_routes, screen_routes = number("slot_routes"), number("screen_routes")
+    out = pd.DataFrame({
+        "Name": frame["player"], "Team": frame["team"], "Pos": frame["pos"],
+        "G": number("player_game_count"),
+        "Slot routes": slot_routes,
+        "Slot targets": number("slot_targets"),
+        "Slot YPRR": number("slot_yprr"),
+        "Slot yards": number("slot_yards"),
+        "Slot rec": number("slot_receptions"),
+        "Slot aDOT": number("slot_avg_depth_of_target"),
+        "Slot catch%": number("slot_caught_percent"),
+        "Slot grade": number("slot_grades_pass_route"),
+        "Slot TD": number("slot_touchdowns"),
+        "Screen routes": screen_routes,
+        "Screen YPRR": number("screen_yprr"),
+    })
+    out = out[out["Slot routes"] >= min_routes]
+    out["Slot TPRR"] = _ratio(out["Slot targets"], out["Slot routes"])
+    out["Slot yards/G"] = _ratio(out["Slot yards"], out["G"])
+    out["Slot routes/G"] = _ratio(out["Slot routes"], out["G"])
+    return out.reset_index(drop=True)
+
+
+@st.cache_data(ttl="1h", max_entries=8, show_spinner="Pairing slot work with slot defence…")
+def slot_matchup(season, slate_path=None, min_routes=40):
+    """Each slot receiver set against what the defence he draws allows in the slot.
+
+    The two halves of the slot question in one row. **Read the vertical axis, not the
+    horizontal one**: what a receiver does from the slot is his own (route grade and YPRR
+    persist around 0.6), while slot yards allowed self-correlates at **+0.10** year over
+    year and slot touchdown rate at **+0.01**. The defence column is a record of the
+    season, not a forecast, and the page says so where it is drawn.
+    """
+    receivers_frame = receiver_slot(int(season), min_routes=min_routes)
+    if receivers_frame.empty:
+        return pd.DataFrame()
+    defence = defense_slot(int(season)).set_index("Team")
+
+    out = receivers_frame.copy()
+    if slate_path:
+        from dashboards import nfl_slates
+
+        players, _ = nfl_slates.slate_players(slate_path)
+        opponents = (players.dropna(subset=["Team", "Opp"])
+                     .drop_duplicates("Team").set_index("Team")["Opp"])
+        out["Opp"] = out["Team"].map(opponents)
+        out = out[out["Opp"].notna()]
+        for column, label in (("Slot YPT", "Opp slot YPT"),
+                              ("Slot Y/snap", "Opp slot Y/snap"),
+                              ("Slot TD%", "Opp slot TD%")):
+            out[label] = out["Opp"].map(defence[column])
+    return out.reset_index(drop=True)
