@@ -14,7 +14,7 @@ about 0.6, and defensive allowed-rates at under 0.11.
 import pandas as pd
 import streamlit as st
 
-from dashboards import nfl_charts, nfl_pff
+from dashboards import nfl_charts, nfl_pff, scales
 
 st.header("Receivers", anchor=False)
 st.caption("PFF deployment profiles. Alignment, depth and route volume are the most stable "
@@ -46,10 +46,14 @@ if frame.empty:
     st.warning("Nothing clears that route threshold for those seasons.")
     st.stop()
 
+pool = frame
 frame = nfl_pff.scope_sidebar(frame, "nflrec")
 if frame.empty:
     st.warning("Every player was filtered out.")
     st.stop()
+# Axes measured against everyone who cleared the route threshold, not against whoever the
+# scope filters left, so narrowing to one team moves the points and not the plane.
+frame = scales.anchor(frame, pool, mode=scales.selected_mode(st.session_state))
 
 with st.container(horizontal=True):
     st.metric("Players", len(frame), border=True)
@@ -67,8 +71,8 @@ if chart is None:
     st.warning(f"No player has both {x} and {y} on this scope.")
 else:
     st.altair_chart(chart, width="stretch")
-    st.caption(f"Dashed rule is the median **{y}** of the players drawn, so it moves with "
-               f"the filters — it is a reading aid, not a league constant. "
+    st.caption(f"Dashed rule is the median **{y}** of the full route-qualified pool, so "
+               f"filters do not move it — it is a reading aid, not a league constant. "
                f"Colour is where he lines up most.")
 
 st.subheader("The board", anchor=False)

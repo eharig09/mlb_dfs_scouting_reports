@@ -3,11 +3,12 @@
 import glob
 import os
 import pickle
-import tempfile
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+
+from artifacts import atomic_write_pickle
 
 from .naming import UNKNOWN_SLATE, slate_for
 from .ownership import attach_actual_ownership, estimate_ownership
@@ -63,17 +64,7 @@ def _load(path):
 
 def _persist_payload(path, payload):
     """Atomically replace a report cache after a local-only calibration refresh."""
-    directory = os.path.dirname(os.path.abspath(path)) or "."
-    handle, temporary = tempfile.mkstemp(
-        prefix=f".{os.path.basename(path)}.", suffix=".calibration.tmp", dir=directory
-    )
-    try:
-        with os.fdopen(handle, "wb") as stream:
-            pickle.dump(payload, stream, protocol=pickle.HIGHEST_PROTOCOL)
-        os.replace(temporary, path)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+    atomic_write_pickle(path, payload)
 
 
 def refresh_game_calibration(payload, path):
@@ -478,6 +469,12 @@ def build_slate(date, salary_path=None, data_dir=REPORT_DATA_DIR, slate=None, ch
         # The salary file is the slate definition: anything DK didn't price isn't playable.
         players = players[salary_values.notna()].copy()
         salary_values = pd.to_numeric(players["Salary"], errors="coerce")
+        # ...and that goes for the game list too. `games` starts as every game cached for
+        # the date, which is the whole schedule, so a 6-game contest was announcing itself
+        # as "15 games" on the board and in the run line while pricing six.
+        if "Game" in players.columns:
+            on_slate = set(players["Game"].dropna())
+            meta["games"] = [g for g in meta["games"] if g in on_slate]
         players["Value"] = (pd.to_numeric(players["Proj"]) / (salary_values / 1000)).round(2)
         players["Ceil Value"] = (pd.to_numeric(players["Ceiling"]) / (salary_values / 1000)).round(2)
         players["Floor Value"] = (pd.to_numeric(players["Floor"]) / (salary_values / 1000)).round(2)

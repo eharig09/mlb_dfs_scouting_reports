@@ -8,7 +8,8 @@ scouting one.
 
 import streamlit as st
 
-from dashboards import charts, data, drill, drill_ui, filters, outcomes, salaries, tables
+from dashboards import charts, data, drill, drill_ui, filters, outcomes, salaries
+from dashboards import scales, tables
 from dashboards import stacks as stacks_module
 
 st.header("Stacks", anchor=False)
@@ -28,7 +29,11 @@ if table.empty:
     st.warning("No club on this date has enough priced hitters to form a stack.")
     st.stop()
 
-board = salaries.attach_salary(data.hitters_for_date(date), date)
+hitters = data.hitters_for_date(date)
+load_warning = data.load_error_message(hitters)
+if load_warning:
+    st.warning(load_warning)
+board = salaries.attach_salary(hitters, date)
 table = stacks_module.add_composite(table, board)
 
 dropped = filters.off_slate_teams(table, date)
@@ -66,6 +71,14 @@ if chosen_teams:
 if view.empty:
     st.warning("No club matches those filters.")
     st.stop()
+
+# Every stack on the slate, not the clubs left after the filter. Narrowing to two clubs is how
+# a reader compares them, and that is exactly when the axes must not move under them.
+view = scales.anchor(view, table, mode=scales.selected_mode(st.session_state),
+                     domains=scales.STACK_FOCUS_DOMAINS)
+axis_note = scales.overflow_note(view, (x, y))
+if axis_note:
+    st.caption(axis_note)
 
 if dropped and only_slate:
     st.info(f"Excluded {', '.join(dropped)} — on no DraftKings slate for {date}.",
@@ -109,7 +122,8 @@ with st.container(border=True):
         st.altair_chart(chart)
     st.caption("Clubs are named on the chart rather than in a legend — thirty is past what "
                "a legend resolves but well inside what a chart can label. Colour is the "
-               "club's own, so the palette is recognition rather than decoding.")
+               "club's own hue, lightened clear of its rivals so no two clubs read as the "
+               "same. Scroll to zoom, drag to pan, double-click to reset.")
 
 left, right = st.columns(2)
 with left.container(border=True):

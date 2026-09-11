@@ -8,7 +8,8 @@ of axes silently picks one of them.
 
 import streamlit as st
 
-from dashboards import charts, data, drill, drill_ui, filters, outcomes, salaries, tables
+from dashboards import charts, data, drill, drill_ui, filters, outcomes, salaries
+from dashboards import scales, tables
 
 st.header("Slate", anchor=False)
 st.caption("Every hitter on a date, across all games. Filters apply to every panel here.")
@@ -22,6 +23,9 @@ if games.empty:
 date, slate, _scoped = filters.scope(games)
 
 hitters = data.hitters_for_date(date)
+load_warning = data.load_error_message(hitters)
+if load_warning:
+    st.warning(load_warning)
 if hitters.empty:
     st.warning("No hitter composites cached for that date.")
     st.stop()
@@ -51,6 +55,11 @@ view = filters.sidebar(board, "slate", date=date,
 # Every club on the slate, not the filtered subset: colour has to follow the club, so
 # narrowing the filter must not repaint whoever survives it.
 slate_teams = charts.team_domain(board)
+
+#: Bases that are the same unit, so the Basis control is a like-for-like switch rather than a
+#: re-scale of the plane. Deliberately not every basis: xwOBA and hard-hit rate are different
+#: units on different ranges, and forcing them onto an OPS domain would squash all three.
+OPS_BASES = ("Season OPS", "Platoon OPS", "Arsenal OPS")
 bases = filters.available_bases(board)
 if not bases:
     # `available_bases` needs a column with at least 20 non-null rows, so a thin slate can
@@ -97,6 +106,14 @@ if view.empty:
     st.warning("No hitters match those filters.")
     st.stop()
 
+# Axis bounds come from the unfiltered board for the same reason the colour domain does: a
+# filter changes which bats are drawn, never where they land.
+view = scales.anchor(view, board, share=[OPS_BASES],
+                     mode=scales.selected_mode(st.session_state))
+axis_note = scales.overflow_note(view, ("Composite", basis))
+if axis_note:
+    st.caption(axis_note)
+
 basis_event = None
 grid = None
 if backdrop:
@@ -125,7 +142,10 @@ with st.container(border=True):
             note += (f"With {len(slate_teams)} clubs on the board no palette can name each "
                      "one — read colour as clustering and use the team filter or the "
                      "tooltip to name a club. ")
-        st.caption(note + "Click any point to open that hitter's evidence.")
+        st.caption(note + "Click any point to open that hitter's evidence. Scroll to "
+                   "zoom, drag to pan, double-click to reset — the axes are fixed to the "
+                   "whole board, so the filters move the points and not the plane, and "
+                   "zooming in names the bats it has room for.")
 
 # --- against what the arm actually allows ---------------------------------------------
 allowed = data.hitters_vs_allowed(date)
@@ -133,6 +153,13 @@ if not allowed.empty:
     keys = set(view["Name"])
     matchups = allowed[allowed["Name"].isin(keys)]
     if not matchups.empty:
+        # Anchored to the whole join, and with all four OPS columns on one domain: the measure
+        # radio below swaps which line sits on the y axis, and the diagonal only means
+        # anything if both axes stay on the same scale across that swap.
+        matchups = scales.anchor(matchups, allowed,
+                                 share=[("Arsenal OPS", "Platoon OPS", "Season OPS",
+                                         "Allowed OPS")],
+                                 mode=scales.selected_mode(st.session_state))
         with st.container(border=True):
             st.markdown("**Against what tonight's arm actually allows** — the diagonal is "
                         "what that pitcher surrenders to batters of his side, so above it "

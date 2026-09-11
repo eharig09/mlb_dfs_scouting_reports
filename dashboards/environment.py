@@ -127,7 +127,7 @@ def _batted_row(payload, side, source):
 
 
 @st.cache_data(max_entries=8, show_spinner="Reading cached games…")
-def staff_environment(date, cache_dir=data.CACHE_DIR):
+def _staff_environment(date, cache_dir, fingerprint):
     """One row per pitching staff on a slate: contact profile against its conditions.
 
     Starters and bullpens are both included and labelled, because the question is asked of
@@ -196,6 +196,11 @@ def staff_environment(date, cache_dir=data.CACHE_DIR):
                         errors="coerce").iloc[0],
                 })
     return pd.DataFrame(rows)
+
+
+def staff_environment(date, cache_dir=data.CACHE_DIR):
+    """File-aware wrapper around the cached environment board."""
+    return _staff_environment(str(date), cache_dir, data._fingerprint(cache_dir, date))
 
 
 def conditions_line(row):

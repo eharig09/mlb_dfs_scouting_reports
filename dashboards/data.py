@@ -15,8 +15,9 @@ Two things follow from that and shape this module:
   step is reading many pickles, which is why the slate-level loader is cached separately
   from the single-game one.
 
-Caching follows the project rule for cached game data: a completed game's payload never
-changes, so entries are held rather than expired, and `max_entries` is what bounds memory.
+Lineup refreshes rewrite a game's payload at the same path, so every cache key includes the
+file's nanosecond mtime and size. Entries can still be held without a TTL, but a rewrite is
+visible on the very next rerun rather than after a manual cache clear.
 """
 
 import glob
@@ -51,10 +52,25 @@ def _parse(path):
     }
 
 
-@st.cache_data(ttl="30m", max_entries=4, show_spinner=False)
-def list_games(cache_dir=CACHE_DIR):
-    """Every cached game, newest first. Short TTL so a fresh run shows up without a restart."""
-    rows = [_parse(p) for p in glob.glob(os.path.join(cache_dir, "*.pkl"))]
+def _fingerprint(cache_dir=CACHE_DIR, date=None):
+    """Deterministic file identity for cache keys, including in-place payload rewrites."""
+    found = []
+    for path in sorted(glob.glob(os.path.join(cache_dir, "*.pkl"))):
+        parsed = _parse(path)
+        if not parsed or (date is not None and parsed["date"] != str(date)):
+            continue
+        try:
+            stat = os.stat(path)
+        except OSError:
+            continue
+        found.append((path, int(stat.st_mtime_ns), int(stat.st_size)))
+    return tuple(found)
+
+
+@st.cache_data(max_entries=4, show_spinner=False)
+def _list_games(cache_dir, fingerprint):
+    """Cached parser; `fingerprint` makes additions, removals and rewrites new inputs."""
+    rows = [_parse(path) for path, _mtime, _size in fingerprint]
     rows = [r for r in rows if r]
     if not rows:
         return pd.DataFrame(columns=["path", "date", "away", "home", "game", "label"])
@@ -62,11 +78,22 @@ def list_games(cache_dir=CACHE_DIR):
             .reset_index(drop=True))
 
 
+def list_games(cache_dir=CACHE_DIR):
+    """Every cached game, newest first, refreshed as soon as the directory changes."""
+    return _list_games(cache_dir, _fingerprint(cache_dir))
+
+
 @st.cache_data(max_entries=64, show_spinner=False)
-def load_payload(path):
-    """One game's payload. A completed game never changes, so this is held, not expired."""
+def _load_payload(path, fingerprint):
+    """Cached pickle read; the stat tuple is present solely to version the cache key."""
     with open(path, "rb") as handle:
         return pickle.load(handle)
+
+
+def load_payload(path):
+    """One game's payload, invalidated when a lineup refresh rewrites its file."""
+    stat = os.stat(path)
+    return _load_payload(path, (int(stat.st_mtime_ns), int(stat.st_size)))
 
 
 def _numeric(frame, column):
@@ -83,7 +110,8 @@ def _numeric(frame, column):
 NUMERIC_COMPOSITE = ["Season AB", "Season OPS", "Season HR", "Platoon AB", "Platoon OPS",
                      "Platoon HR", "Arsenal AB", "Arsenal OPS", "Arsenal HR",
                      "Similar AB", "Similar OPS", "Similar HR", "BvP AB", "BvP OPS",
-                     "BvP HR", "Composite", "Off Szn", "Off L28"]
+                     "BvP HR", "Composite", "Off Szn", "Off L28", "L28 OPS"]
+HITTER_OPS_COLUMNS = ["Season OPS", "L28 OPS", "Platoon OPS", "Arsenal OPS"]
 
 
 def hitters(payload, meta):
@@ -102,8 +130,28 @@ def hitters(payload, meta):
     return rounded(out)
 
 
+def attach_hitter_ops(frame, payload, meta):
+    """Attach the four dashboard hover lines to another player-level frame by name."""
+    if frame is None or frame.empty or "Name" not in frame.columns:
+        return frame
+    from dashboards import salaries
+
+    source = hitters(payload, meta)
+    if source.empty:
+        return frame
+    available = [column for column in HITTER_OPS_COLUMNS if column in source.columns
+                 and column not in frame.columns]
+    if not available:
+        return frame
+    lookup = source.assign(_key=source["Name"].map(salaries.name_key))
+    lookup = lookup[["_key", *available]].drop_duplicates("_key")
+    out = frame.copy()
+    out["_key"] = out["Name"].map(salaries.name_key)
+    return out.merge(lookup, on="_key", how="left").drop(columns="_key")
+
+
 @st.cache_data(max_entries=8, show_spinner="Reading cached games…")
-def hitters_for_date(date, cache_dir=CACHE_DIR):
+def _hitters_for_date(date, cache_dir, fingerprint):
     """Every hitter on a date's slate, one row per player-game.
 
     Reading a whole slate is ~15 pickles, which is why it is cached apart from the
@@ -113,15 +161,41 @@ def hitters_for_date(date, cache_dir=CACHE_DIR):
     games = list_games(cache_dir)
     games = games[games["date"] == date]
     frames = []
+    errors = []
     for meta in games.to_dict("records"):
         try:
             payload = load_payload(meta["path"])
             board = attach_arsenal_measures(hitters(payload, meta), payload, meta)
             frames.append(attach_card_measures(board, payload, meta))
-        except Exception:
+        except Exception as error:  # noqa: BLE001 - surfaced by `load_errors`
+            errors.append({"path": meta["path"], "game": meta["label"],
+                           "error": str(error)})
             continue
     frames = [f for f in frames if not f.empty]
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    out.attrs["load_errors"] = errors
+    return out
+
+
+def hitters_for_date(date, cache_dir=CACHE_DIR):
+    """Every hitter on a date, invalidated by an added, removed or rewritten game."""
+    return _hitters_for_date(str(date), cache_dir, _fingerprint(cache_dir, date))
+
+
+def load_errors(frame):
+    """Payload reads omitted from an aggregate frame, suitable for a visible page warning."""
+    return list((getattr(frame, "attrs", {}) or {}).get("load_errors") or [])
+
+
+def load_error_message(frame):
+    """Human-readable disclosure for an aggregate that had to omit unreadable games."""
+    errors = load_errors(frame)
+    if not errors:
+        return ""
+    games = ", ".join(dict.fromkeys(str(item.get("game") or item.get("path"))
+                                    for item in errors))
+    return (f"Omitted {len(errors)} cached game{'s' if len(errors) != 1 else ''} that "
+            f"could not be read: {games}. Refresh or rebuild those report payloads.")
 
 
 def scorecard(payload):
@@ -428,7 +502,7 @@ def _opponent_lineup_ops(payload, meta):
 
 
 @st.cache_data(max_entries=8, show_spinner="Reading cached games…")
-def starters_for_date(date, cache_dir=CACHE_DIR):
+def _starters_for_date(date, cache_dir, fingerprint):
     """Every starting pitcher on a date, with the lineup strength he faces attached."""
     games = list_games(cache_dir)
     games = games[games["date"] == date]
@@ -447,8 +521,12 @@ def starters_for_date(date, cache_dir=CACHE_DIR):
     return rounded(pd.concat(frames, ignore_index=True)) if frames else pd.DataFrame()
 
 
+def starters_for_date(date, cache_dir=CACHE_DIR):
+    return _starters_for_date(str(date), cache_dir, _fingerprint(cache_dir, date))
+
+
 @st.cache_data(max_entries=8, show_spinner="Reading cached games…")
-def bullpens_for_date(date, cache_dir=CACHE_DIR):
+def _bullpens_for_date(date, cache_dir, fingerprint):
     """Every rostered reliever on a date, graded for availability."""
     from dashboards import bullpen as bullpen_module
 
@@ -472,8 +550,12 @@ def bullpens_for_date(date, cache_dir=CACHE_DIR):
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
+def bullpens_for_date(date, cache_dir=CACHE_DIR):
+    return _bullpens_for_date(str(date), cache_dir, _fingerprint(cache_dir, date))
+
+
 @st.cache_data(max_entries=8, show_spinner="Projecting the slate…")
-def projections_for_date(date, cache_dir=CACHE_DIR):
+def _projections_for_date(date, cache_dir, fingerprint):
     """DK point projections for a whole date, from the same cached payloads.
 
     `dfs.projections.project_game` reads a payload and touches nothing else, so the real
@@ -504,6 +586,10 @@ def projections_for_date(date, cache_dir=CACHE_DIR):
         if column in frame.columns:
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
     return frame
+
+
+def projections_for_date(date, cache_dir=CACHE_DIR):
+    return _projections_for_date(str(date), cache_dir, _fingerprint(cache_dir, date))
 
 
 def attach_projection(hitters_frame, date, cache_dir=CACHE_DIR):
@@ -551,7 +637,7 @@ def effective_side(bats, throws):
     return {"R": "L", "L": "R"}.get(str(throws or "").strip().upper(), "")
 
 @st.cache_data(max_entries=8, show_spinner="Reading cached games…")
-def hitters_vs_allowed(date, cache_dir=CACHE_DIR):
+def _hitters_vs_allowed(date, cache_dir, fingerprint):
     """Every hitter on a slate, with what tonight's arm actually allows to his side.
 
     Why this baseline and not season OPS
@@ -646,6 +732,12 @@ def hitters_vs_allowed(date, cache_dir=CACHE_DIR):
     return board
 
 
+def hitters_vs_allowed(date, cache_dir=CACHE_DIR):
+    # The cached implementation still keys handedness by `_salaries.name_key(pitcher)`, not
+    # by club; this wrapper adds only the file version to the cache key.
+    return _hitters_vs_allowed(str(date), cache_dir, _fingerprint(cache_dir, date))
+
+
 #: Per-hitter measures the pipeline records in `*_batter_arsenal` but the composite table
 #: does not carry. These are what let a view be re-based onto something other than OPS.
 ARSENAL_MEASURES = ["xwOBA", "SLG", "HardHit%", "Whiff%", "K% vs Hand", "K Edge",
@@ -735,7 +827,7 @@ def attach_arsenal_measures(frame, payload, meta):
 
 
 @st.cache_data(max_entries=8, show_spinner="Reading cached games…")
-def pitcher_vs_lineup(date, cache_dir=CACHE_DIR):
+def _pitcher_vs_lineup(date, cache_dir, fingerprint):
     """Each starter's surrendered OPS against the OPS of the lineup he faces.
 
     Two lines that the workbook keeps in different tables and never puts on the same scale:
@@ -812,6 +904,10 @@ def pitcher_vs_lineup(date, cache_dir=CACHE_DIR):
                                           - entry[f"Allowed {label}"])
             rows.append(entry)
     return rounded(pd.DataFrame(rows))
+
+
+def pitcher_vs_lineup(date, cache_dir=CACHE_DIR):
+    return _pitcher_vs_lineup(str(date), cache_dir, _fingerprint(cache_dir, date))
 
 
 def _starter_hand_from_projection(payload, side, meta, team):

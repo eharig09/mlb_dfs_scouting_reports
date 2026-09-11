@@ -285,3 +285,82 @@ class TestStacks:
     def test_every_team_with_enough_hitters_appears(self, slate):
         stacks = build_stacks(slate, has_salary=True)
         assert len(stacks) == slate[slate["Type"] == "H"]["Team"].nunique()
+
+
+class TestSalariesNeverCrossTheSlateBoundary:
+    """2026-08-25: a six-game contest put Dodgers and Cardinals hitters on the board.
+
+    `attach_salaries` falls back to a bare-name match when name+team misses, which is what
+    carries a player through an abbreviation change or a trade. But the fallback did not
+    ask whether the export priced that player's team at all, so a projection for the
+    Dodgers' Max Muncy took the salary of the Athletics' Max Muncy, and a Cardinals
+    infielder named Jose Fermin took the salary of a Cleveland reliever. Both then passed
+    the "DK priced it, so it is playable" filter and became draftable.
+    """
+
+    import pandas as pd
+
+    SLATE_TEAMS = ["ATH", "CLE", "MIN", "LAA"]
+
+    @staticmethod
+    def _salaries(rows):
+        import pandas as pd
+        from dfs.salaries import _short_key, normalize_name
+        frame = pd.DataFrame(rows)
+        frame["_key"] = frame["Name"].map(normalize_name)
+        frame["_short"] = frame["Name"].map(_short_key)
+        frame["DK Name"] = frame["Name"]
+        frame["DK Avg"] = 0.0
+        frame["DK ID"] = range(len(frame))
+        return frame
+
+    @pytest.fixture
+    def salaries(self):
+        return self._salaries([
+            {"Name": "Max Muncy", "DK Team": "ATH", "DK Pos": "3B", "Salary": 3100},
+            {"Name": "Jose Fermin", "DK Team": "LAA", "DK Pos": "P", "Salary": 4000},
+            {"Name": "Steven Kwan", "DK Team": "CLE", "DK Pos": "OF", "Salary": 4600},
+        ])
+
+    @staticmethod
+    def _projections(rows):
+        import pandas as pd
+        return pd.DataFrame(rows)
+
+    def test_an_off_slate_namesake_is_left_unpriced(self, salaries):
+        from dfs.salaries import attach_salaries
+        players = self._projections([
+            {"Name": "Max Muncy", "Team": "LAD", "Type": "H"},
+            {"Name": "Max Muncy", "Team": "ATH", "Type": "H"},
+        ])
+        priced = attach_salaries(players, salaries)
+        assert priced.loc[priced["Team"] == "ATH", "Salary"].iloc[0] == 3100
+        assert priced.loc[priced["Team"] == "LAD", "Salary"].isna().all()
+
+    def test_a_hitter_never_takes_a_pitchers_price(self, salaries):
+        """The Fermin case: same name, different team, and different side of the ball."""
+        from dfs.salaries import attach_salaries
+        players = self._projections([{"Name": "Jose Fermin", "Team": "STL", "Type": "H"}])
+        assert attach_salaries(players, salaries)["Salary"].isna().all()
+
+    def test_a_hitter_on_a_slate_team_still_cannot_take_a_pitchers_price(self, salaries):
+        from dfs.salaries import attach_salaries
+        players = self._projections([{"Name": "Jose Fermin", "Team": "LAA", "Type": "H"}])
+        assert attach_salaries(players, salaries)["Salary"].isna().all()
+
+    def test_the_fallback_still_carries_an_abbreviation_change(self, salaries):
+        """Why the bare-name path exists: DK says OAK where the report says ATH."""
+        from dfs.salaries import attach_salaries
+        players = self._projections([{"Name": "Max Muncy", "Team": "OAK", "Type": "H"}])
+        assert attach_salaries(players, salaries)["Salary"].iloc[0] == 3100
+
+    def test_a_pitcher_on_a_slate_team_still_matches(self, salaries):
+        from dfs.salaries import attach_salaries
+        players = self._projections([{"Name": "Jose Fermin", "Team": "LAA", "Type": "P"}])
+        assert attach_salaries(players, salaries)["Salary"].iloc[0] == 4000
+
+    def test_a_projection_with_no_type_is_not_rejected(self, salaries):
+        """`Type` is the board's column; nothing else should have to supply it."""
+        from dfs.salaries import attach_salaries
+        players = self._projections([{"Name": "Steven Kwan", "Team": "CLE"}])
+        assert attach_salaries(players, salaries)["Salary"].iloc[0] == 4600

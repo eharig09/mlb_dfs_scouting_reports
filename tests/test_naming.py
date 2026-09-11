@@ -205,3 +205,82 @@ class TestTwoSlatesOfTheSameKind:
         chosen = next(e for e in exports if e["name"].endswith("_turbo.csv"))
         assert slate_for(chosen, requested="Turbo Night", date="2026-08-18",
                          peers=exports) == "turbo-night"
+
+
+class TestATemplateKeepsTheNameItWasGiven:
+    """2026-08-25 priced one six-game block and it got downloaded twice.
+
+    The night ended up with `DKSalaries_2026-08-25_late.csv` and `..._turbo.csv` holding
+    byte-identical exports. `template_slate` read only the clubs a template priced, so both
+    exports matched every template exactly and the first one sorted -- "late" -- claimed
+    them all. A template the user had already named `DKTemplate_2026-08-25_turbo.csv` was
+    then filed as the late slate's, and collided with the late template already there.
+    """
+
+    DATE = "2026-08-25"
+    GAMES = ["CHC@ARI", "CIN@SF", "CLE@LAA", "MIN@ATH", "PHI@SEA", "PIT@SD"]
+
+    @pytest.fixture
+    def night(self, monkeypatch):
+        """The duplicated night: one main export, and one block filed under two labels."""
+        from dfs import adopt as adopt_module
+        exports = [
+            {"path": f"d/DKSalaries_{self.DATE}_main.csv",
+             "name": f"DKSalaries_{self.DATE}_main.csv",
+             "games": self.GAMES + [f"A{i}@B{i}" for i in range(6)],
+             "first": 19 * 60 + 5, "last": 21 * 60 + 45, "players": 1106},
+        ] + [
+            {"path": f"d/DKSalaries_{self.DATE}_{label}.csv",
+             "name": f"DKSalaries_{self.DATE}_{label}.csv",
+             "games": list(self.GAMES),
+             "first": 21 * 60 + 38, "last": 21 * 60 + 45, "players": 555}
+            for label in ("late", "turbo")
+        ]
+        monkeypatch.setattr(adopt_module, "list_salary_files", lambda date: exports)
+        monkeypatch.setattr("dfs.upload.template_teams_for",
+                            lambda path: {"ARI", "ATH", "CHC", "CIN", "CLE", "LAA",
+                                          "MIN", "PHI", "PIT", "SD", "SEA", "SF"})
+        return exports
+
+    @pytest.mark.parametrize("name", ["DKTemplate_2026-08-25_turbo.csv",
+                                      "DKTemplate_2026-08-25_turbo_entries.csv"])
+    def test_the_filename_decides_when_two_exports_price_the_same_games(self, night, name):
+        from dfs.adopt import template_slate
+        assert template_slate(f"dk_lineups/{name}", self.DATE) == "turbo"
+
+    def test_a_template_named_for_the_other_block_still_gets_it(self, night):
+        from dfs.adopt import template_slate
+        assert template_slate(f"dk_lineups/DKTemplate_{self.DATE}_late_entries.csv",
+                              self.DATE) == "late"
+
+    def test_an_unnamed_template_still_falls_back_to_what_it_prices(self, night):
+        """The name is honoured, not required -- a raw download is matched as before."""
+        from dfs.adopt import template_slate
+        assert template_slate("dk_lineups/DKEntries (2).csv", self.DATE) in {"late", "turbo"}
+
+    def test_a_label_no_export_carries_is_not_invented(self, night):
+        """Only a label the night actually has is trusted; anything else re-derives."""
+        from dfs.adopt import template_slate
+        assert template_slate(f"dk_lineups/DKTemplate_{self.DATE}_early_entries.csv",
+                              self.DATE) in {"late", "turbo"}
+
+
+class TestTemplateFilenameSlate:
+    @pytest.mark.parametrize("name,expected", [
+        ("DKTemplate_2026-08-25_turbo.csv", "turbo"),
+        ("DKTemplate_2026-08-25_turbo_entries.csv", "turbo"),
+        ("DKTemplate_2026-07-30_main_bulk.csv", "main"),
+        ("DKTemplate_2026-08-25_showdown-chcari_entries.csv", "showdown-chcari"),
+        # 'unknown' is the placeholder for "could not tell", so it is not a name to keep.
+        ("DKTemplate_2026-08-25_unknown_entries.csv", ""),
+        ("DKTemplate_2026-08-25_entries.csv", ""),
+        ("DKTemplate_2026-08-25.csv", ""),
+        ("DKTemplate (2).csv", ""),
+        # Not our convention: whatever DK called it says nothing about the slate.
+        ("DKEntries.csv", ""),
+        ("DKEntries (13).csv", ""),
+        ("", ""),
+    ])
+    def test_only_a_slate_somebody_typed_comes_back(self, name, expected):
+        from dfs.naming import slug_from_template_name
+        assert slug_from_template_name(name, "2026-08-25") == expected

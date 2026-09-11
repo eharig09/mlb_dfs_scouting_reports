@@ -1,6 +1,7 @@
 import streamlit as st
 
-from dashboards import charts, data, drill, drill_ui, filters, outcomes, salaries, tables
+from dashboards import charts, data, drill, drill_ui, filters, outcomes, salaries
+from dashboards import scales, tables
 
 st.header("Value", anchor=False)
 st.caption("Each hitter measured against his own price bracket. Salary and composite "
@@ -24,6 +25,9 @@ if not usable:
 date, slate, _scoped = filters.scope(games, dates=usable)
 
 hitters = data.hitters_for_date(date)
+load_warning = data.load_error_message(hitters)
+if load_warning:
+    st.warning(load_warning)
 if hitters.empty:
     st.warning("No hitter composites cached for that date.")
     st.stop()
@@ -64,6 +68,15 @@ with st.sidebar:
         price = st.slider("Salary", low, high, (low, high), step=100, key="value_price",
                           persist_state="session")
 view = view[view["Salary"].between(*price)]
+
+# Bounds from the whole priced board rather than from what the sliders left, so narrowing the
+# salary range zooms the *selection* and not the axis. Projection, ceiling and floor share a
+# domain because the "Size points by" control swaps one for another on the same y axis.
+view = scales.anchor(view, priced, share=[("Proj", "Ceiling", "Floor")],
+                     mode=scales.selected_mode(st.session_state))
+axis_note = scales.overflow_note(view, ("Salary", "Composite"))
+if axis_note:
+    st.caption(axis_note)
 
 best = priced.nlargest(1, "surplus").iloc[0]
 worst = priced.nsmallest(1, "surplus").iloc[0]
@@ -118,7 +131,10 @@ with st.container(border=True):
                  else charts.salary_scatter(view))
     salary_event = drill_ui.chart_with_drilldown(chart, view, date, "value_salary_pick")
     note = "Colour is the club, shape is the signal. " if colour_by == "Team" else ""
-    st.caption(note + "Click any point to open that hitter's evidence.")
+    st.caption(note + "Click any point to open that hitter's evidence. Scroll to zoom, drag "
+               "to pan, double-click to reset — the axes are fixed to the whole priced "
+               "board, so the salary slider narrows the selection rather than re-scaling "
+               "the chart, and zooming in names the bats it has room for.")
 
 with st.container(border=True):
     st.markdown("**Projection against price** — salary and composite already correlate at "

@@ -6,7 +6,7 @@ read is, and it is only visible when they share a plane.
 
 import streamlit as st
 
-from dashboards import charts, data, drill_ui, environment as env, filters, tables
+from dashboards import charts, data, drill_ui, environment as env, filters, scales, tables
 
 st.header("Conditions", anchor=False)
 st.caption("Where a batted ball ends up is decided by the park, the air and the defence. "
@@ -59,6 +59,13 @@ if view.empty:
     st.warning("No staffs match those filters.")
     st.stop()
 
+# Anchored to every staff on the date, so dropping the bullpens or a club does not re-scale
+# the panels the remaining ones are read on. Each contact measure has its own stable window:
+# GB+LD, GB and LD share a unit but occupy very different natural bands, and unioning them is
+# what flattened the combined-contact view.
+view = scales.anchor(view, staffs, mode=scales.selected_mode(st.session_state),
+                     domains=scales.CONDITIONS_FOCUS_DOMAINS)
+
 if off_slate and only_slate:
     st.info(f"Excluded {', '.join(off_slate)} — on no DraftKings slate for {date}.",
             icon=":material/filter_alt:")
@@ -87,7 +94,12 @@ with st.container(border=True):
     chart = charts.hr_exposure_scatter(view)
     exposure_event = drill_ui.chart_with_drilldown(chart, view, date,
                                                    "cond_exposure_pick", kind="staff")
-    st.caption("Click any point to open that staff.")
+    exposure_note = scales.overflow_note(view, ("FB%", "hr_env"))
+    if exposure_note:
+        st.caption(exposure_note)
+    st.caption("Click any point to open that staff. Scroll to zoom, drag to pan, "
+               "double-click to reset — the axes stay fixed to every staff on the date, so "
+               "the filters move the points and not the plane.")
     st.caption("Point size is balls in play. A bullpen's rate is measured over several "
                "hundred and a starter's over a few dozen, and the two are not equally "
                "known.")
@@ -124,6 +136,9 @@ with st.container(border=True):
     else:
         defense_event = drill_ui.chart_with_drilldown(chart, view, date,
                                                       "cond_defense_pick", kind="staff")
+    defense_note = scales.overflow_note(view, (contact, factor))
+    if defense_note:
+        st.caption(defense_note)
     st.caption("Colour is the sign of hits saved per game by the defence behind that staff "
                "— it swings both ways around zero, so it cannot be a point size.")
 

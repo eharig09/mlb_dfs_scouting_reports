@@ -140,7 +140,10 @@ class TestPitchingCharts:
 
     def test_batted_ball_builds_and_carries_the_league_cross(self):
         spec = charts.batted_ball_scatter(self._batted()).to_dict()
-        assert "layer" in spec and len(spec["layer"]) == 3   # two rules plus the points
+        # Two rules, the points, and the named outliers on top of them.
+        assert "layer" in spec and len(spec["layer"]) >= 3
+        marks = [(l.get("mark") or {}).get("type") for l in spec["layer"]]
+        assert marks[:3] == ["rule", "rule", "circle"]
 
     def test_availability_colour_uses_its_own_reserved_scale(self):
         spec = charts.batted_ball_scatter(self._batted()).to_dict()
@@ -163,7 +166,9 @@ class TestPitchingCharts:
         """FIP is lower-is-better; an un-reversed axis reads backwards beside every other
         chart in the app."""
         spec = charts.slate_pitcher_scatter(self._slate()).to_dict()
-        assert spec["encoding"]["y"]["scale"]["reverse"] is True
+        points = next(l for l in spec.get("layer", [spec])
+                      if (l.get("mark") or {}).get("type") == "circle")
+        assert points["encoding"]["y"]["scale"]["reverse"] is True
 
     @pytest.mark.parametrize("builder", [
         charts.batted_ball_scatter, charts.bullpen_workload_scatter,

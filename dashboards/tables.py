@@ -208,12 +208,14 @@ def style(frame, rules):
 HIGHER_IS_BETTER = {
     "Composite", "Proj", "Ceiling", "Floor", "surplus", "per_1k", "Stack Score",
     "Stack Value", "Top5 Proj", "Top5 Ceiling", "Season OPS", "Platoon OPS", "Arsenal OPS",
-    "Off L28", "Off Szn", "PA", "Lineup OPS", "hr_leverage", "hr_env", "K%",
+    "L28 OPS", "Off L28", "Off Szn", "PA", "Lineup OPS", "hr_leverage", "hr_env",
+    "K%", "K-BB", "K-BB%", "Whiff%",
 }
 
 #: ... and where a smaller one is.
 LOWER_IS_BETTER = {
-    "ERA", "FIP", "WHIP", "Bust%", "Salary", "Own%", "Allowed OPS", "opp_ops", "Slot",
+    "ERA", "FIP", "WHIP", "BB%", "Bust%", "Salary", "Own%", "Allowed OPS", "opp_ops",
+    "Slot", "HH%", "Brl%", "HardHit%", "xwOBA", "RV/100",
 }
 
 

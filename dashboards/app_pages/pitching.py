@@ -57,6 +57,8 @@ for column, (_, row) in zip((left, right), starters.iterrows()):
                         (tables.by_value, {"column": "Split Tag",
                                            "tints": tables.SPLIT_TAG_TINTS}),
                         (tables.ranked, {"column": "OPS", "best": "low"}),
+                        (tables.ranked, {"column": "xwOBA", "best": "low"}),
+                        (tables.ranked, {"column": "K%", "best": "high"}),
                     ]),
                     hide_index=True)
             arsenal = data.context_frame(payload, f"{side}_arsenal_matchup")
@@ -72,13 +74,16 @@ for column, (_, row) in zip((left, right), starters.iterrows()):
                         # mid-band number is left alone rather than dressed up as a read.
                         (tables.signed, {"column": "RV/100", "good_when_negative": True,
                                          "threshold": tables.RV_EDGE_THRESHOLD}),
+                        (tables.ranked, {"column": "xwOBA", "best": "low"}),
+                        (tables.ranked, {"column": "Whiff%", "best": "high"}),
                     ]),
                     hide_index=True)
             rest = data.context_frame(payload, f"{side}_sp_rest_splits")
             if not rest.empty:
                 st.caption("By days of rest — his best and worst bucket marked")
                 st.dataframe(
-                    tables.style(rest, [(tables.ranked, {"column": "ERA", "best": "low"})]),
+                    tables.highlight(rest, columns={"ERA", "FIP", "WHIP", "K%", "BB%",
+                                                    "K-BB", "K-BB%"}),
                     hide_index=True)
             if st.button(f"Open {row['pitcher']}", key=f"open_sp_{side}",
                          width="stretch",
@@ -146,7 +151,8 @@ for _, row in starters.iterrows():
             else:
                 st.caption("No hand splits cached for him.")
 
-        lineup_k = strikeouts.lineup_k(payload, opposing)
+        lineup_k = data.attach_hitter_ops(strikeouts.lineup_k(payload, opposing),
+                                          payload, meta)
         if not lineup_k.empty:
             chart = charts.k_lineup_bars(lineup_k, league=strikeouts.LEAGUE_K)
             if chart is not None:
@@ -154,7 +160,9 @@ for _, row in starters.iterrows():
             st.dataframe(
                 tables.style(lineup_k.round(1), [
                     (tables.ranked, {"column": "K%", "best": "high"}),
+                    (tables.ranked, {"column": "K% vs Hand", "best": "high"}),
                     (tables.signed, {"column": "K Edge"}),
+                    (tables.ranked, {"column": "Whiff%", "best": "high"}),
                 ]),
                 hide_index=True,
                 column_config={
@@ -275,6 +283,8 @@ for side in ("away", "home"):
             tables.style(shown, [
                 (tables.by_value, {"column": "Status", "tints": tables.AVAIL_TINTS}),
                 (tables.by_value, {"column": "Avail", "tints": tables.AVAIL_TINTS}),
+                (tables.ranked, {"column": "ERA", "best": "low"}),
+                (tables.ranked, {"column": "K-BB", "best": "high"}),
             ]),
             hide_index=True,
             column_config={

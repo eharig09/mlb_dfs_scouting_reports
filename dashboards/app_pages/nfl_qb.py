@@ -85,7 +85,8 @@ with tabs[0]:
         x=alt.X("Att%:Q", title="Share of attempts (%)", stack="normalize"),
         color=alt.Color("Depth:N", title="Depth", sort=DEPTH_ORDER,
                         scale=alt.Scale(scheme="viridis")),
-        order=alt.Order("Depth:N", sort="ascending"),
+        # By field depth. Alphabetical put Deep between Behind LOS and Medium.
+        order=alt.Order("Depth rank:Q", sort="ascending"),
         tooltip=[alt.Tooltip("Name:N"), alt.Tooltip("Team:N"), alt.Tooltip("Depth:N"),
                  alt.Tooltip("Att%:Q", format=".1f"),
                  alt.Tooltip("Attempts:Q", format=".0f"),
@@ -120,6 +121,7 @@ with tabs[1]:
             color=alt.Color("Depth:N", title="Depth", sort=DEPTH_ORDER,
                             scale=alt.Scale(scheme="viridis")),
             xOffset=alt.XOffset("Depth:N", sort=DEPTH_ORDER),
+            order=alt.Order("Depth rank:Q", sort="ascending"),
             tooltip=[alt.Tooltip("Name:N"), alt.Tooltip("Depth:N"),
                      alt.Tooltip(f"{measure}:Q", format=".2f"),
                      alt.Tooltip("Attempts:Q", format=".0f")])

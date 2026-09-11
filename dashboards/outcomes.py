@@ -365,7 +365,8 @@ def player_history(frame, name):
 #: reading the controlled panel exists to prevent.
 DRILL_COLUMNS = ["date", "slate", "game", "Team", "Name", "Bats", "Slot", "PA", "Salary",
                  "Composite", "surplus", "Proj", "Ceiling", "own", "fpts", "pts_per_1k",
-                 "hit", "Signal", "Season OPS", "Platoon OPS", "Arsenal OPS", "Off L28"]
+                 "hit", "Signal", "Season OPS", "L28 OPS", "Platoon OPS", "Arsenal OPS",
+                 "Off L28"]
 
 
 def drill_frame(frame):
